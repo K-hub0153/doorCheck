@@ -7,7 +7,7 @@ from ..utils.logger import logger
 
 
 class ConfigServer:
-    def __init__(self, host: str, port: int, mqtt_broker: str, mqtt_port: int, secret_key: str, on_device_config_callback=None, broker_mode: str = 'local'):
+    def __init__(self, host: str, port: int, mqtt_broker: str, mqtt_port: int, secret_key: str, on_device_config_callback=None, broker_mode: str = 'local', mqtt_username: str = "", mqtt_password: str = ""):
         self.app = Flask(__name__)
         self.host = host
         self.port = port
@@ -16,6 +16,10 @@ class ConfigServer:
         self.secret_key = secret_key
         self.broker_mode = broker_mode  # 新增：broker模式（local/remote）
         self.on_device_config_callback = on_device_config_callback  # 回调函数：(sn, product_id) -> None
+        # 下发给设备的MQTT凭据（门锁固件要求非空，且需为base64(AES-128-ECB)加密后的值）。
+        # 音箱工具不传，保持默认空串，行为与从前一致。
+        self.mqtt_username = mqtt_username
+        self.mqtt_password = mqtt_password
         self.server = None
         self.server_thread = None
         self._setup_routes()
@@ -70,8 +74,8 @@ class ConfigServer:
                     "mqtt": {
                         "broker": broker_ip,
                         "port": self.mqtt_port,
-                        "username": "",
-                        "password": "",
+                        "username": self.mqtt_username,
+                        "password": self.mqtt_password,
                         "clientId": f"device_{sn}",
                         "keepAlive": 60,
                         "cleanSession": True,
@@ -89,7 +93,8 @@ class ConfigServer:
                     "heartbeatInterval": 30
                 }
             }
-            logger.info(f"返回MQTT配置: broker={broker_ip}:{self.mqtt_port}, topics使用product_id={product_id}")
+            cred_state = "凭据已下发" if self.mqtt_username else "无凭据(匿名)"
+            logger.info(f"返回MQTT配置: broker={broker_ip}:{self.mqtt_port}, topics使用product_id={product_id}, {cred_state}")
 
             # 通知主窗口更新设备的 product_id
             if self.on_device_config_callback:

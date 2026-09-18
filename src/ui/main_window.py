@@ -21,6 +21,7 @@ from src.hardware.universal_printer import UniversalPrinter
 from ..network.http_server import ConfigServer
 from ..network.mqtt_broker import MQTTBrokerManager
 from ..core.protocol import DiscoverMessage, QueryStatusMessage
+from ..core.crypto import encrypt_mqtt_credential, mask_credential
 from ..network.tftp_server import TFTPServer
 from ..data.test_record_storage import TestRecordStorage
 from ..utils.config import Config
@@ -1112,7 +1113,15 @@ class MainWindow(QMainWindow):
                 mqtt_broker=local_broker_ip,
                 mqtt_port=self.config.mqtt_port,
                 secret_key=self.config.device_psk,
-                broker_mode='local'  # 门控工具默认使用本地模式
+                broker_mode='local',  # 门控工具默认使用本地模式
+                # 门锁固件(v1.1.7+)要求username/password非空，且需为base64(AES-128-ECB)密文，
+                # 留空会让设备在HTTP解析阶段就失败并陷入复重试循环
+                mqtt_username=encrypt_mqtt_credential(self.config.device_psk),
+                mqtt_password=encrypt_mqtt_credential(self.config.device_psk)
+            )
+            logger.info(
+                f"MQTT凭据下发: username={mask_credential(self.config_server.mqtt_username)}, "
+                f"password={mask_credential(self.config_server.mqtt_password)}"
             )
             self.http_thread = threading.Thread(
                 target=self.config_server.start,

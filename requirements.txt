@@ -11,4 +11,5 @@ reportlab>=4.0.0
 imageio-ffmpeg>=0.6.0
 pyserial>=3.5
 pywin32>=306; sys_platform == "win32"
+pycryptodome>=3.20.0
 pyinstaller>=6.0.0

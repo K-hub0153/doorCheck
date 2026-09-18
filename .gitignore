@@ -135,3 +135,7 @@ Thumbs.db
 
 # Project specific
 *.pyc
+
+# 测试记录数据库（运行时生成：门控在根目录，音箱在 data/ 下）
+test_records.db
+data/
