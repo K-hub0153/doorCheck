@@ -58,6 +58,15 @@ def main():
         if mode == 'door':
             logger.info("启动智能门控产测工具")
             window = MainWindow()
+        elif mode == 'master_control':
+            from src.master_control.bootstrap import _install_crash_handlers
+            from src.master_control.gui.main_window import MainWindow as MasterControlWindow
+
+            logger.info("启动主控设备产测工具")
+            _install_crash_handlers()
+            app.setApplicationName("MC Checker")
+            app.setOrganizationName("Weidian")
+            window = MasterControlWindow()
         elif mode == 'speaker_indoor':
             logger.info("启动智能室内音箱产测工具")
             window = SpeakerTestWindow(speaker_type='indoor')

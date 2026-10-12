@@ -21,7 +21,7 @@ class StartupDialog(QDialog):
 
     def init_ui(self):
         self.setWindowTitle('智能设备产测工具 - 选择模式')
-        self.setFixedSize(450, 350)  # 增加高度以容纳3个按钮
+        self.setFixedSize(450, 450)
 
         # 设置窗口图标
         icon_path = self._get_icon_path()
@@ -67,6 +67,14 @@ class StartupDialog(QDialog):
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet('color: #757575; margin-bottom: 15px;')
         layout.addWidget(subtitle)
+
+        # 主控按钮，与门控和音箱入口保持相同图标风格
+        master_btn = QPushButton('🖥️  主控设备产测工具')
+        master_btn.setFont(QFont('Microsoft YaHei', 13))
+        master_btn.setMinimumHeight(60)
+        master_btn.setCursor(Qt.PointingHandCursor)
+        master_btn.clicked.connect(lambda: self.select_mode('master_control'))
+        layout.addWidget(master_btn)
 
         # 门控按钮
         door_btn = QPushButton('🚪  智能门控产测工具')

@@ -1,0 +1,113 @@
+battery:
+  i2c_addr: 0x0b
+  i2c_bus: 0
+chips:
+  hisi:
+    battery_detection: true
+    bt_detection: true
+    chip_model: 310P
+    description: 海思310P芯片 (hisi-xxxxx)
+    fan_detection: true
+    has_hdmi: false
+    nearlink_detection: true
+    poe_count: 14
+    wifi_detection: true
+  wdse:
+    battery_detection: true
+    bt_detection: true
+    chip_model: RK3576
+    description: 瑞芯微RK3576芯片 (wdse-xxxxx)
+    fan_detection: true
+    has_hdmi: true
+    nearlink_detection: true
+    poe_count: 8
+    wifi_detection: true
+database:
+  path: ./mc_checker.db
+network:
+  mdns_service_type: _master._tcp.local.
+  poe_subnet: 198.19.0.0/24
+  scan_subnet: 192.168.1.0/24
+printer:
+  dpi: 203
+  enabled: true
+  paper_height: 30
+  paper_height_mm: 30
+  paper_width: 50
+  paper_width_mm: 50
+  printer_ip: null
+  printer_name: ZDesigner ZD888-203dpi ZPL
+  printer_port: null
+  protocol: zpl
+  require_all_passed: true
+  confirm_poe_unplugged: true
+  cleanup_after_print: true
+  tspl_layout:
+    border:
+      thickness: 2
+      x1: 2
+      x2: 398
+      y1: 2
+      y2: 238
+    date:
+      font: '1'
+      rotation: 0
+      x: 120
+      x_scale: 1
+      y: 124
+      y_scale: 1
+    disk_size:
+      align: center
+      font: '1'
+      rotation: 0
+      width: 145
+      x: 280
+      x_scale: 1
+      y: 220
+      y_scale: 1
+    qrcode:
+      cell_width: 5
+      x: 245
+      y: 69
+    sn:
+      font: '1'
+      max_width: 206
+      rotation: 0
+      x: 34
+      x_scale: 1
+      y: 205
+      y_scale: 1
+  zpl_layout:
+    date:
+      bold_width: 1
+      font_size: 50
+      x: 370
+      y: 412
+    disk_size:
+      bold_width: 2
+      font_size: 65
+      x: 897
+      y: 620
+    font_path: assets/fonts/label.ttf
+    qrcode:
+      error_correction: M
+      size_mm: 14
+      x: 830
+      y: 270
+    render_mode: bitmap
+    sn:
+      bold_width: 1
+      font_size: 50
+      x: 150
+      y: 580
+ssh:
+  password: 8Tz299^#6Jxw
+  timeout: 10
+  username: root
+test:
+  lte_signal_quality_threshold: 80
+  timeout: 10
+  wifi_signal_threshold: -40
+upload:
+  retry_delay: 2.0
+  retry_times: 2

@@ -1,219 +1,92 @@
 # 智能设备产测工具
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![PyQt5](https://img.shields.io/badge/PyQt5-5.15+-green.svg)](https://pypi.org/project/PyQt5/)
-[![License](https://img.shields.io/badge/License-Proprietary-red.svg)]()
+统一入口，依次提供主控设备、智能门控、智能室内音箱和智能室外音箱产测。
 
-统一的智能设备产测平台，支持智能门控和智能音箱两种产测模式。
+| 工具 | 主要功能 |
+| --- | --- |
+| 主控 | 设备发现、SSH、多设备检测、芯片差异化测试、MAC 写入、标签打印、记录导出与上传 |
+| 门控 | 设备发现、MAC 写入、遥控器配对、应急开关、无线检测、OTA、标签打印 |
+| 音箱 | 多窗口测试、MAC 写入、音麦与无线检测、红外／微波检测、固件升级、室外 RTSP 视频 |
 
----
+## 启动与打包
 
-## 🎯 核心特性
-
-### 🚪 智能门控产测
-- 设备自动发现（mDNS + 网络扫描）
-- MAC地址烧写
-- 遥控器配对测试
-- 应急开关测试
-- 无线检测（WiFi/BLE/SLE）
-- OTA固件升级
-- 标签打印
-- 测试记录管理
-
-### 🔊 智能音箱产测
-- 4窗口并行测试
-- 室内/室外音箱类型切换
-- MAC地址烧录
-- 音麦测试
-- 无线检测（WiFi/蓝牙/星闪）
-- 红外/微波测试
-- RTSP视频流显示（室外音箱）
-- 固件升级
-- 测试日志管理
-
-## 📦 项目结构
-
-```
-doorCheck/
-├── main.py                         # 统一启动入口
-├── build.py                        # 打包编译脚本
-├── config/
-│   └── config.yaml                 # 配置文件
-├── certs/                          # SSL证书目录
-├── assets/
-│   └── fonts/                      # 字体资源
-├── src/
-│   ├── ui/                         # UI界面模块
-│   │   ├── startup_dialog.py       # 启动模式选择对话框
-│   │   ├── main_window.py          # 门控测试主窗口
-│   │   ├── speaker_test_window.py  # 音箱测试主窗口
-│   │   ├── device_list_panel.py    # 设备列表面板
-│   │   ├── device_detail_panel.py  # 设备详情面板
-│   │   ├── test_record_panel.py    # 测试记录面板
-│   │   ├── test_logs_window.py     # 测试日志窗口
-│   │   ├── test_results_window.py  # 测试结果窗口
-│   │   ├── firmware_upgrade_dialog.py  # 固件升级对话框
-│   │   ├── printer_config_dialog.py    # 打印机配置对话框
-│   │   ├── broker_config_dialog.py     # MQTT Broker配置对话框
-│   │   └── app_version_dialog.py       # 应用版本信息对话框
-│   ├── core/                       # 核心测试引擎
-│   │   ├── test_engine.py          # 门控测试引擎
-│   │   ├── test_result.py          # 门控测试结果
-│   │   ├── speaker_test_engine.py  # 音箱测试引擎
-│   │   ├── speaker_test_result.py  # 音箱测试结果
-│   │   ├── protocol.py             # 设备协议
-│   │   ├── protocol_message.py     # 协议消息
-│   │   └── crypto.py               # 加密工具
-│   ├── network/                    # 网络通信模块
-│   │   ├── mdns_discovery.py       # mDNS设备发现
-│   │   ├── ip_scanner.py           # IP网络扫描
-│   │   ├── mqtt_broker.py          # MQTT Broker服务
-│   │   ├── mqtt_client.py          # MQTT客户端
-│   │   ├── speaker_mqtt_datetime_sync.py  # 音箱时间同步
-│   │   ├── http_server.py          # HTTP服务器
-│   │   ├── speaker_http_client.py  # 音箱HTTP客户端
-│   │   ├── tftp_server.py          # TFTP固件服务器
-│   │   ├── firmware_server.py      # 固件升级服务器
-│   │   └── device_info.py          # 设备信息模型
-│   ├── hardware/                   # 硬件控制模块
-│   │   ├── universal_printer.py    # 通用标签打印机（ZPL/TSPL）
-│   │   ├── label_printer.py        # 门控标签打印
-│   │   └── speaker_label_printer.py # 音箱标签打印
-│   ├── data/                       # 数据存储模块
-│   │   ├── test_record_storage.py  # 门控测试记录存储
-│   │   └── speaker_test_database.py # 音箱测试数据库
-│   └── utils/                      # 工具类模块
-│       ├── config.py               # 配置管理
-│       ├── logger.py               # 日志管理
-│       ├── paths.py                # 路径工具
-│       ├── mac_allocator.py        # MAC地址分配
-│       ├── serial_reader.py        # 串口读取
-│       ├── test_log_capture.py     # 测试日志捕获
-│       └── upload_service.py       # 数据上传服务
-├── tools/                          # 开发调试工具
-│   ├── doortest.py                 # 门控测试工具
-│   ├── door_ctl.py                 # 门控控制工具
-│   ├── door_ctl2.py                # 门控控制工具v2
-│   ├── door_stress.py              # 门控压力测试
-│   ├── test_printer_detection.py   # 打印机检测测试
-│   └── simulator/
-│       └── simulated_door_lock.py  # 门控模拟器
-├── data/                           # 数据文件目录（运行时生成）
-├── logs/                           # 日志文件目录（运行时生成）
-├── requirements.txt                # Python依赖列表
-└── README.md                       # 项目说明文档
-```
-
-## 🛠️ 技术架构
-
-| 技术栈 | 说明 |
-|--------|------|
-| **UI框架** | PyQt5 - 跨平台图形界面 |
-| **设备发现** | mDNS (Zeroconf) + IP扫描 |
-| **通信协议** | MQTT + HTTP + TFTP |
-| **数据存储** | SQLite - 本地测试记录 |
-| **日志管理** | Python logging - 分级日志 |
-| **标签打印** | ZPL/TSPL - 支持Zebra/Xprinter |
-| **固件升级** | TFTP - 固件传输服务 |
-| **打包工具** | PyInstaller - 单文件可执行程序 |
-
-## 📋 依赖项
-
-- PyQt5 >= 5.15.0
-- paho-mqtt >= 1.6.0
-- amqtt >= 0.11.0
-- zeroconf >= 0.131.0
-- requests >= 2.32.0
-- PyYAML >= 6.0
-- Flask >= 3.0.0
-- Pillow >= 11.0.0
-- qrcode >= 7.0
-- reportlab >= 4.0.0
-- imageio-ffmpeg >= 0.6.0
-- pyserial >= 3.5
-- pywin32 >= 306 (仅Windows)
-- pyinstaller >= 6.0.0
-
-## 💻 系统要求
-
-- **Python版本**: 3.8 或更高
-- **操作系统**: Windows / macOS / Linux
-- **内存**: 建议 4GB 以上
-- **网络**: 与测试设备在同一局域网
-- **权限**: Windows需管理员权限（用于网络服务）
-
-## 🚀 快速开始
-
-### 开发环境运行
+在工程根目录执行：
 
 ```bash
-# 1. 克隆项目
-git clone <repository-url>
-cd doorCheck
-
-# 2. 安装依赖
 pip install -r requirements.txt
-
-# 3. 运行程序
 python main.py
 ```
 
-### 打包编译
+所有工具统一使用本工程的打包脚本，在目标操作系统上执行：
 
 ```bash
-# 执行打包脚本
 python build.py
-
-# 打包产物在 dist/ 目录
-# Windows: 智能设备产测工具_<版本号>.exe
-# 需要同时包含 config/ 和 certs/ 目录
 ```
 
-### 启动使用
+产物位于 `dist/`，名称为 `智能设备产测工具_<版本号>`（Windows 为 `.exe`，macOS 同时生成 `.app`）。`config/`、`certs/` 随程序分发；共享字体嵌入程序。脚本支持重复打包，覆盖同版本产物。
 
-1. **选择测试模式**: 启动后选择"门控产测"或"音箱产测"
-2. **门控模式**: 选择设备 → 自动测试 → 打印标签
-3. **音箱产测**: 配置参数 → 开始测试 → 查看结果
+## 项目结构
 
-## 📝 开发说明
+```text
+doorCheck/
+├── main.py                         # 四种产测模式的统一入口
+├── build.py                        # 统一打包脚本
+├── requirements.txt                # Python 依赖
+├── config/
+│   ├── config.yaml                 # 门控、音箱配置及应用版本
+│   └── master_control/
+│       ├── config.yaml             # 主控独立配置
+│       ├── blescan.sh              # 主控蓝牙检测脚本
+│       └── slescan.sh              # 主控星闪检测脚本
+├── assets/fonts/label.ttf          # 各工具共用标签字体
+├── certs/                          # SSL 证书
+├── src/
+│   ├── ui/                         # 模式选择、门控及音箱界面，含 icon/
+│   ├── core/                       # 门控及音箱测试引擎、协议
+│   ├── network/                    # mDNS、MQTT、HTTP、TFTP 等通信
+│   ├── hardware/                   # 门控及音箱标签打印
+│   ├── data/                       # 门控及音箱数据存储代码
+│   ├── utils/                      # 配置、日志、路径、串口等工具
+│   └── master_control/             # 主控独立模块
+│       ├── bootstrap.py            # 崩溃捕获
+│       ├── gui/                    # 主控界面
+│       ├── core/                   # 发现、SSH、芯片配置、检测及数据库
+│       └── utils/                  # 主控配置、打印、导出及上传
+├── tools/
+│   ├── test_master_control_integration.py  # 合并回归验证
+│   ├── master_control/             # 主控冒烟测试、打印及发现调试
+│   ├── simulator/                  # 门控模拟器
+│   ├── sle/                        # 星闪调试脚本
+│   └── …                           # 门控控制、压力测试及打印调试
+├── mac_pool.csv                    # 门控、音箱 MAC 池
+├── test_records.db                 # 门控数据库（运行时生成）
+├── data/                           # 音箱数据库（运行时生成）
+├── logs/                           # 统一日志及主控运行数据
+│   ├── smart_YYYYMMDD.log          # 门控、音箱日志
+│   ├── mcCheck_YYYYMMDD.log        # 主控日志
+│   ├── crash.log                   # 主控崩溃日志
+│   ├── mc_checker.db               # 主控数据库
+│   ├── mac_pool.csv                # 可选的主控专用 MAC 池
+│   └── reports/                    # 主控打印输出（按需生成）
+└── dist/                           # 打包产物（构建时生成）
+```
 
-### 配置文件
+## 配置与数据
 
-配置文件位于 `config/config.yaml`，包含以下配置项：
-- **app**: 应用基本信息（名称、版本）
-- **device**: 设备通信参数
-- **mqtt**: MQTT服务配置
-- **printer**: 标签打印机配置
-- **speaker**: 音箱测试参数
+门控、音箱使用 `config/config.yaml`；主控使用 `config/master_control/config.yaml`，支持配置热加载。各工具保持独立的业务模块、打印配置和数据库，字体与日志目录共用。
 
-### 日志管理
+所有工具的应用版本号及打包版本统一在 `config/config.yaml` 的 `app.version` 中维护。
 
-- 日志文件位于 `logs/` 目录
-- 文件命名格式: `smart_YYYYMMDD.log`
-- 日志级别: DEBUG / INFO / WARNING / ERROR
-- 自动按天切分
+打包后，运行数据位于程序旁；macOS 的 `.app` 与同目录可执行文件共用外置配置和 `logs/`。沿用旧主控历史记录时，关闭程序后将 `mc_checker.db` 复制到 `logs/mc_checker.db`。主控离线 MAC 池使用 `logs/mac_pool.csv`，与门控、音箱的池文件分开。
 
-### 测试数据
+## 离线验证
 
-- 门控测试记录: `test_records.db` (SQLite)
-- 音箱测试数据: `data/speaker_tests.db` (SQLite)
-- 支持历史查询和导出
+```bash
+python tools/test_master_control_integration.py
+python tools/master_control/smoke_clear_and_version.py
+python tools/master_control/smoke_scan_entry.py
+```
 
-## 🤝 开发团队
+上述验证不连接真实设备、不打印。设备检测、MAC 写入、上传和物理打印需在产线实机验收。
 
-- **项目负责人**: 微店IoT团队
-- **项目合并**: 2026-07-14
-- **基础项目**: doorCheck (门控产测工具)
-- **集成项目**: hornCheck (音箱产测工具)
-
-## 📄 许可证
-
-本项目为专有软件，版权归属微店IoT团队。未经授权不得复制、修改或分发。
-
-## 🙏 致谢
-
-感谢所有参与门控产测工具和音箱产测工具开发的团队成员。
-
----
-
-**注意**: 本工具用于生产环境设备测试，请确保在授权的网络环境中使用。
+本项目为微店 IoT 团队专有软件，未经授权不得复制、修改或分发。

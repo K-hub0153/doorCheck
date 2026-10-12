@@ -7,10 +7,7 @@ from .paths import get_app_dir
 
 def get_resource_path(relative_path):
     """获取资源文件的绝对路径，兼容PyInstaller打包"""
-    if getattr(sys, 'frozen', False):
-        base_path = os.path.dirname(sys.executable)
-    else:
-        base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    base_path = get_app_dir()
 
     external_path = os.path.join(base_path, relative_path)
     if os.path.exists(external_path):

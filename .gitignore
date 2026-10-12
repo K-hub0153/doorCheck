@@ -139,3 +139,6 @@ Thumbs.db
 # 测试记录数据库（运行时生成：门控在根目录，音箱在 data/ 下）
 test_records.db
 data/
+
+# 统一运行数据目录（日志、主控数据库、MAC 池及报告）
+/logs/

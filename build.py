@@ -34,6 +34,9 @@ class BuildScript:
             "flask",
             "PIL",
             "qrcode",
+            "paramiko",
+            "psutil",
+            "openpyxl",
         ]
 
         # 需要复制到 dist 目录的外部资源（不再打包进 exe）
@@ -57,7 +60,14 @@ class BuildScript:
             "flask",
             "PIL",
             "qrcode",
+            "paramiko",
+            "psutil",
+            "openpyxl",
         ]
+
+        if self.system == "Windows":
+            self.required_modules.append("win32print")
+            self.hidden_imports.extend(["win32print", "win32ui", "win32con"])
 
         # 定义需要收集所有依赖的包
         self.collect_all = [
@@ -173,6 +183,17 @@ class BuildScript:
         else:
             self.print_success("配置文件: config/config.yaml")
 
+        # 主控配置和远端检测脚本随统一 config 目录发布
+        for name in ("config.yaml", "blescan.sh", "slescan.sh"):
+            resource = self.project_root / "config" / "master_control" / name
+            if not resource.is_file():
+                self.print_error(f"主控资源不存在: {resource}")
+                all_exist = False
+        master_font = self.project_root / "assets" / "fonts" / "label.ttf"
+        if not master_font.is_file():
+            self.print_error(f"共享标签字体不存在: {master_font}")
+            all_exist = False
+
         # 检查证书文件
         certs_dir = self.project_root / "certs"
         if not certs_dir.exists():
@@ -196,6 +217,7 @@ class BuildScript:
 
         cmd = [
             sys.executable, "-m", "PyInstaller",
+            "--noconfirm",
             "--onefile",
             "--windowed",
             "--name", app_name_with_version,
