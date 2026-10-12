@@ -51,20 +51,20 @@ class Logger:
         self._logger.addHandler(file_handler)
         self._logger.addHandler(console_handler)
 
-    def debug(self, msg):
-        self._logger.debug(msg)
+    def debug(self, msg, *args, **kwargs):
+        self._logger.debug(msg, *args, **kwargs)
 
-    def info(self, msg):
-        self._logger.info(msg)
+    def info(self, msg, *args, **kwargs):
+        self._logger.info(msg, *args, **kwargs)
 
-    def warning(self, msg):
-        self._logger.warning(msg)
+    def warning(self, msg, *args, **kwargs):
+        self._logger.warning(msg, *args, **kwargs)
 
-    def error(self, msg):
-        self._logger.error(msg)
+    def error(self, msg, *args, **kwargs):
+        self._logger.error(msg, *args, **kwargs)
 
-    def critical(self, msg):
-        self._logger.critical(msg)
+    def critical(self, msg, *args, **kwargs):
+        self._logger.critical(msg, *args, **kwargs)
 
 
 logger = Logger()
