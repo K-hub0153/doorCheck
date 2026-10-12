@@ -422,7 +422,7 @@ class MainWindow(QMainWindow):
         # self.start_mdns_discovery()
     
     def init_ui(self):
-        self.setWindowTitle(f"主控设备产测工具 - {AppConfig().app_version}")
+        self.setWindowTitle(f"智能设备产测工具 - 主控模式 v{AppConfig().app_version}")
         self.setGeometry(100, 100, 1400, 800)
         
         # 创建菜单栏

@@ -54,7 +54,7 @@ class IntegrationTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     windows[0].windowTitle(),
-                    f'主控设备产测工具 - MC Checker v{DeviceConfig().app_version}',
+                    f'智能设备产测工具 - 主控模式 v{DeviceConfig().app_version}',
                 )
                 self.assertEqual(windows[2].current_speaker_type, 'indoor')
                 self.assertEqual(windows[3].current_speaker_type, 'outdoor')
