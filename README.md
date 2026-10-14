@@ -53,7 +53,6 @@ doorCheck/
 │       ├── core/                   # 发现、SSH、芯片配置、检测及数据库
 │       └── utils/                  # 主控配置、打印、导出及上传
 ├── tools/
-│   ├── test_master_control_integration.py  # 合并回归验证
 │   ├── master_control/             # 主控冒烟测试、打印及发现调试
 │   ├── simulator/                  # 门控模拟器
 │   ├── sle/                        # 星闪调试脚本
@@ -88,5 +87,3 @@ python tools/master_control/smoke_scan_entry.py
 ```
 
 上述验证不连接真实设备、不打印。设备检测、MAC 写入、上传和物理打印需在产线实机验收。
-
-本项目为微店 IoT 团队专有软件，未经授权不得复制、修改或分发。
