@@ -299,6 +299,15 @@ class BuildScript:
                 shutil.rmtree(dst_path)
 
             shutil.copytree(src_path, dst_path)
+            # 使用字节读写，避免 Windows 文本模式重新引入 CRLF。
+            for script_path in dst_path.rglob("*.sh"):
+                if not script_path.is_file():
+                    continue
+                original = script_path.read_bytes()
+                normalized = original.replace(b"\r\n", b"\n")
+                if normalized != original:
+                    script_path.write_bytes(normalized)
+                    self.print_success(f"已转换脚本换行格式为 LF: {script_path.relative_to(self.dist_dir)}")
             self.print_success(f"已复制: {src}/ -> dist/{dst}/")
 
         return True
