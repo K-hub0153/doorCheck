@@ -2277,6 +2277,10 @@ class SpeakerTestWindow(QMainWindow):
         self.selected_device = None
         # 从启动参数获取音箱类型，不再从配置读取，且不可切换
         self.current_speaker_type = speaker_type
+        self.speaker_device_type = {
+            'indoor': DEVICE_TYPE_SMART_HORN,
+            'outdoor': DEVICE_TYPE_OUTDOOR_SMART_HORN,
+        }[speaker_type]
         self.mac_allocator = MACAllocator()
         self.label_printer = LabelPrinter(self.config)
         self.test_db = TestRecordDB()
@@ -3199,17 +3203,14 @@ class SpeakerTestWindow(QMainWindow):
             self.master_mdns.register()
             
             logger.info(f"开始监听 mDNS 服务类型: {self.config.mdns_service_type}")
-            # 只接受音箱设备（室内+室外）
+            # 只接受当前产测模式对应的音箱类型
             self.listener = DeviceDiscoveryListener(
                 on_device_found=self.on_device_found,
                 on_device_removed=self.on_device_removed,
-                device_types=[
-                    DEVICE_TYPE_SMART_HORN,           # 室内音箱
-                    DEVICE_TYPE_OUTDOOR_SMART_HORN    # 室外音箱
-                ]  # 设备类型过滤
+                device_types=[self.speaker_device_type]
             )
             self.browser = ServiceBrowser(self.zeroconf, self.config.mdns_service_type, self.listener)
-            logger.info(f"mDNS设备发现服务已启动 (监听类型: {self.config.mdns_service_type}, 过滤：仅室内/室外音箱)")
+            logger.info(f"mDNS设备发现服务已启动 (监听类型: {self.config.mdns_service_type}, 设备类型: {self.speaker_device_type})")
             
             debug_listener = DebugServiceListener()
             common_service_types = [
@@ -3682,6 +3683,10 @@ class SpeakerTestWindow(QMainWindow):
     
     def _on_device_found_main_thread(self, device: DeviceInfo):
         """设备发现后更新列表（手动分配窗口）"""
+        if device.type != self.speaker_device_type:
+            logger.debug(f"忽略非当前音箱模式设备: sn={device.sn}, type={device.type}")
+            return
+
         # 优先根据IP地址去重（同一IP视为同一设备）
         existing_by_ip = next((d for d in self.devices if d.ip == device.ip), None)
 
