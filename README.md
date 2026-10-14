@@ -81,7 +81,6 @@ doorCheck/
 ## 离线验证
 
 ```bash
-python tools/test_master_control_integration.py
 python tools/master_control/smoke_clear_and_version.py
 python tools/master_control/smoke_scan_entry.py
 ```
