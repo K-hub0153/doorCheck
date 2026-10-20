@@ -5,10 +5,25 @@ import json
 import hashlib
 import secrets
 import re
+import threading
+import time
 from ..utils.logger import logger
 
 
 class SpeakerHTTPClient:
+    _response_times = {}
+    _response_lock = threading.Lock()
+
+    @classmethod
+    def last_response_time(cls, ip):
+        """任何接口的有效HTTP响应都是在线证据，使用单调时钟比较。"""
+        with cls._response_lock:
+            return cls._response_times.get(ip, 0)
+
+    def _record_response(self):
+        with self._response_lock:
+            self._response_times[self.ip] = time.monotonic()
+
     def __init__(self, ip: str, port: int = 8080, username: str = "admin", password: str = "weidian_24h"):
         self.ip = ip
         self.port = port
@@ -114,6 +129,7 @@ class SpeakerHTTPClient:
                     return None
             
             logger.debug(f"HTTP响应状态码: {response.status_code}")
+            self._record_response()
             logger.debug(f"HTTP响应头: {dict(response.headers)}")
 
             # 确保完整读取响应内容
@@ -313,6 +329,7 @@ class SpeakerHTTPClient:
                     return None
             
             logger.debug(f"HTTP响应状态码: {response.status_code}")
+            self._record_response()
             logger.debug(f"HTTP响应头: {dict(response.headers)}")
 
             # 确保完整读取响应内容

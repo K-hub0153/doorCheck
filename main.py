@@ -18,6 +18,8 @@ def get_icon_path():
 
 
 def main():
+    from src.utils.crash_handler import install_crash_handlers
+    install_crash_handlers()
     logger.info("=" * 50)
     logger.info("智能设备产测工具启动")
     logger.info("=" * 50)

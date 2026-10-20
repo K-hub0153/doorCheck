@@ -963,6 +963,8 @@ class TestWindowPanel(QFrame):
 
     # 信号：线程安全地更新打印按钮状态
     update_print_button_signal = pyqtSignal(bool)
+    test_status_signal = pyqtSignal(str, str)
+    test_finished_signal = pyqtSignal()
 
     def __init__(self, panel_id, main_window, parent=None):
         super().__init__(parent)
@@ -977,10 +979,18 @@ class TestWindowPanel(QFrame):
         self.http_client = None
         self.stop_flag = threading.Event()  # 测试停止标志
         self.log_capture = None  # 当前测试的日志捕获器
+        self._test_lock = threading.Lock()
+        self._test_running = False
+        self._pending_binding = None
+        self._has_pending_binding = False
+        self._test_statuses = {}
+        self._status_lock = threading.Lock()
         self.layout_mode = 4  # 默认4宫格布局
 
         # 连接信号到槽，确保线程安全
         self.update_print_button_signal.connect(self._set_print_button_enabled)
+        self.test_status_signal.connect(self._apply_test_status)
+        self.test_finished_signal.connect(self._on_test_finished)
 
         self.setup_ui()
 
@@ -1338,14 +1348,21 @@ class TestWindowPanel(QFrame):
             self.status_indicators[test_name] = indicator
     
     def update_test_status(self, test_name, status):
-        """更新测试状态"""
+        """线程安全地更新测试状态；实际控件操作统一回到Qt主线程。"""
+        with self._status_lock:
+            self._test_statuses[test_name] = status
+        capture = self.log_capture
+        if capture and status in ('testing', 'passed', 'failed'):
+            status_text = {'testing': '开始', 'passed': '通过 ✅', 'failed': '失败 ❌'}[status]
+            capture.append(f"【{test_name}】{status_text}")
+        self.test_status_signal.emit(test_name, status)
+
+    def _apply_test_status(self, test_name, status):
+        """仅在Qt主线程中修改状态控件和测试记录。"""
+        if self._has_pending_binding or (self._test_running and self.stop_flag.is_set()):
+            return  # 取消后到达的旧结果不能重新点亮已离线设备的状态。
         if test_name in self.status_indicators:
             self.status_indicators[test_name].set_status(status)
-
-        # 记录测试项状态到日志捕获器
-        if self.log_capture and status in ['testing', 'passed', 'failed']:
-            status_text = {'testing': '开始', 'passed': '通过 ✅', 'failed': '失败 ❌'}.get(status, status)
-            self.log_capture.append(f"【{test_name}】{status_text}")
 
         # 保存测试记录到数据库
         if status in ['passed', 'failed'] and self.device:
@@ -1369,10 +1386,7 @@ class TestWindowPanel(QFrame):
             return
 
         # 检查所有测试项状态
-        all_passed = all(
-            indicator.status == "passed"
-            for indicator in self.status_indicators.values()
-        )
+        all_passed = self._all_tests_passed()
 
         # 发射信号，由主线程的槽函数处理
         self.update_print_button_signal.emit(all_passed)
@@ -1380,7 +1394,52 @@ class TestWindowPanel(QFrame):
     def _set_print_button_enabled(self, enabled):
         """槽函数：在主线程中更新打印按钮状态"""
         if '打印' in self.test_buttons:
-            self.test_buttons['打印'].setEnabled(enabled)
+            self.test_buttons['打印'].setEnabled(enabled and not self._test_running and not self.stop_flag.is_set())
+
+    def _all_tests_passed(self):
+        with self._status_lock:
+            return bool(self.status_indicators) and all(
+                self._test_statuses.get(name) == 'passed'
+                for name in self.status_indicators
+            )
+
+    def _start_task(self, target):
+        """各面板独立运行；同一面板避免重复测试覆盖共享结果。"""
+        with self._test_lock:
+            if self._test_running or not self.device or getattr(self.main_window, '_closing', False):
+                logger.info(f"窗口{self.panel_id + 1}已有任务或设备不可用，跳过重复启动")
+                return
+            self._test_running = True
+            self.stop_flag.clear()
+            # 测试开始前发出的探活不能在测试开始后释放新任务的窗口。
+            self.main_window._heartbeat_pending.pop(self.device.sn, None)
+            self.main_window._heartbeat_failures.pop(self.device.sn, None)
+
+        def run():
+            try:
+                target()
+            except Exception:
+                logger.error(f"窗口{self.panel_id + 1}后台任务异常", exc_info=True)
+            finally:
+                # running标记在主线程收尾后清除，确保排队的结果先处理完。
+                self.test_finished_signal.emit()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_test_finished(self):
+        with self._test_lock:
+            self._test_running = False
+        if self._has_pending_binding:
+            device = self._pending_binding
+            self._has_pending_binding = False
+            self._pending_binding = None
+            self.bind_device(device)
+        self._update_print_button_state()
+        pending_layout = getattr(self.main_window, '_pending_layout', None)
+        if (pending_layout is not None and not getattr(self.main_window, '_closing', False)
+                and not any(p._test_running for p in self.main_window.test_panels)):
+            self.main_window._pending_layout = None
+            self.main_window.switch_layout(pending_layout)
 
     def copy_device_sn(self):
         """复制设备SN到剪贴板"""
@@ -1424,6 +1483,23 @@ class TestWindowPanel(QFrame):
 
     def bind_device(self, device):
         """绑定设备到此窗口"""
+        # 保持旧设备和HTTP客户端直到工作线程退出，避免空引用和串测新设备。
+        if self._test_running:
+            self.stop_flag.set()
+            self._pending_binding = device
+            self._has_pending_binding = True
+            # 界面立即响应离线/替换；旧引用仅供在途任务安全收尾。
+            self.device_label.setText(f'窗口 {self.panel_id + 1}: 设备已断开，正在停止测试')
+            self.copy_sn_btn.hide()
+            self.close_window_btn.hide()
+            for button in self.test_buttons.values():
+                button.setEnabled(False)
+            for indicator in self.status_indicators.values():
+                indicator.set_status('untested')
+            if self.video_widget:
+                self.video_widget.stop_stream()
+                self.video_widget.show_default_image()
+            return
         # 如果解绑设备，先通知所有测试线程停止
         if device is None and self.device is not None:
             logger.info(f"窗口{self.panel_id + 1}设备断开，停止所有测试")
@@ -1436,7 +1512,11 @@ class TestWindowPanel(QFrame):
         elif device is not None:
             self.stop_flag.clear()  # 清除停止标志
 
+        with self._status_lock:
+            self._test_statuses.clear()
         self.device = device
+        for indicator in self.status_indicators.values():
+            indicator.set_status('untested')
         if device:
             # 优先使用 mDNS 上报的设备类型，原有逻辑作为兜底
             if device.is_indoor_speaker():
@@ -1506,8 +1586,8 @@ class TestWindowPanel(QFrame):
             self.video_widget.show_default_image()
             
             # 清空所有测试状态
-            for indicator in self.status_indicators.values():
-                indicator.set_status('untested')
+            for test_name in self.status_indicators:
+                self.update_test_status(test_name, 'untested')
     
     def retry_video_stream(self):
         """重试视频流连接"""
@@ -1544,16 +1624,19 @@ class TestWindowPanel(QFrame):
                 self.log_capture = TestLogCapture(self.device.sn, test_type=test_type)
                 self.log_capture.append(f"=== 开始测试[{test_type}]: {self.device.get_display_name()} ===")
                 panel_handler = PanelLogHandler(self.log_capture, f"窗口{self.panel_id + 1}")
-                _logging.getLogger('HornCheck').addHandler(panel_handler)
+                _logging.getLogger('SmartDevice').addHandler(panel_handler)
 
             impl_func()
 
             # 单项测试结果取该测试项指示器状态
             if self.log_capture:
-                indicator = self.status_indicators.get(test_type)
-                if indicator and indicator.status == 'passed':
+                with self._status_lock:
+                    status = self._test_statuses.get(test_type)
+                if self.stop_flag.is_set():
+                    result = "FAIL"
+                elif status == 'passed':
                     result = "PASS"
-                elif indicator and indicator.status == 'failed':
+                elif status == 'failed':
                     result = "FAIL"
                 else:
                     result = "UNKNOWN"
@@ -1566,7 +1649,7 @@ class TestWindowPanel(QFrame):
                 self.log_capture.set_result("FAIL")
         finally:
             if panel_handler:
-                _logging.getLogger('HornCheck').removeHandler(panel_handler)
+                _logging.getLogger('SmartDevice').removeHandler(panel_handler)
             if self.log_capture:
                 try:
                     log_path = self.log_capture.save_to_file()
@@ -1603,7 +1686,7 @@ class TestWindowPanel(QFrame):
     
     def start_auto_test(self):
         """一键检测"""
-        threading.Thread(target=self._run_auto_test, daemon=True).start()
+        self._start_task(self._run_auto_test)
     
     def _run_auto_test(self):
         """执行自动测试 - 并行执行"""
@@ -1616,14 +1699,14 @@ class TestWindowPanel(QFrame):
                 self.log_capture.append(f"=== 开始自动测试: {self.device.get_display_name()} ===")
                 panel_prefix = f"窗口{self.panel_id + 1}"
                 panel_handler = PanelLogHandler(self.log_capture, panel_prefix)
-                _logging.getLogger('HornCheck').addHandler(panel_handler)
+                _logging.getLogger('SmartDevice').addHandler(panel_handler)
 
             logger.info(f"窗口{self.panel_id + 1}开始自动测试: {self.device.get_display_name()}")
 
             # 清空所有测试结果状态
             logger.info(f"窗口{self.panel_id + 1}清空所有测试结果")
-            for test_name, indicator in self.status_indicators.items():
-                indicator.set_status('untested')
+            for test_name in self.status_indicators:
+                self.update_test_status(test_name, 'untested')
 
             # 线程1：烧录、音麦、红外/微波、正式
             thread1 = threading.Thread(target=self._run_test_group1, daemon=True)
@@ -1640,10 +1723,7 @@ class TestWindowPanel(QFrame):
 
             # 判断整体结果并保存日志
             if self.log_capture:
-                all_passed = all(
-                    ind.status == 'passed'
-                    for ind in self.status_indicators.values()
-                )
+                all_passed = not self.stop_flag.is_set() and self._all_tests_passed()
                 overall_result = "PASS" if all_passed else "FAIL"
                 self.log_capture.set_result(overall_result)
                 self.log_capture.append(f"=== 测试完成，整体结果: {overall_result} ===")
@@ -1657,7 +1737,7 @@ class TestWindowPanel(QFrame):
         finally:
             # 移除 handler，无论正常结束还是异常都执行
             if panel_handler:
-                _logging.getLogger('HornCheck').removeHandler(panel_handler)
+                _logging.getLogger('SmartDevice').removeHandler(panel_handler)
 
             # 保存日志文件
             if self.log_capture:
@@ -1694,7 +1774,7 @@ class TestWindowPanel(QFrame):
     
     def test_burn(self):
         """烧录测试 - MAC地址烧录"""
-        threading.Thread(target=lambda: self._run_single_test('烧录', self._test_burn_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('烧录', self._test_burn_impl))
     
     def _test_burn_impl(self):
         try:
@@ -1830,7 +1910,7 @@ class TestWindowPanel(QFrame):
     
     def test_audio_mic(self):
         """音麦测试"""
-        threading.Thread(target=lambda: self._run_single_test('音麦', self._test_audio_mic_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('音麦', self._test_audio_mic_impl))
     
     def _test_audio_mic_impl(self):
         try:
@@ -1867,7 +1947,7 @@ class TestWindowPanel(QFrame):
     
     def test_wifi(self):
         """WiFi测试"""
-        threading.Thread(target=lambda: self._run_single_test('WiFi', self._test_wifi_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('WiFi', self._test_wifi_impl))
     
     def _test_wifi_impl(self):
         try:
@@ -1918,7 +1998,7 @@ class TestWindowPanel(QFrame):
     
     def test_bluetooth(self):
         """蓝牙测试"""
-        threading.Thread(target=lambda: self._run_single_test('蓝牙', self._test_bluetooth_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('蓝牙', self._test_bluetooth_impl))
     
     def _test_bluetooth_impl(self):
         try:
@@ -1954,7 +2034,7 @@ class TestWindowPanel(QFrame):
     
     def test_starflash(self):
         """星闪测试"""
-        threading.Thread(target=lambda: self._run_single_test('星闪', self._test_starflash_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('星闪', self._test_starflash_impl))
     
     def _test_starflash_impl(self):
         try:
@@ -1988,7 +2068,7 @@ class TestWindowPanel(QFrame):
     
     def test_infrared(self):
         """红外测试"""
-        threading.Thread(target=lambda: self._run_single_test('红外', self._test_infrared_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('红外', self._test_infrared_impl))
     
     def _test_infrared_impl(self):
         EXPECTED_IR_SIGNAL = '4bb445'
@@ -2090,7 +2170,7 @@ class TestWindowPanel(QFrame):
     
     def test_microwave(self):
         """微波测试"""
-        threading.Thread(target=lambda: self._run_single_test('微波', self._test_microwave_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('微波', self._test_microwave_impl))
     
     def _test_microwave_impl(self):
         try:
@@ -2198,7 +2278,7 @@ class TestWindowPanel(QFrame):
     
     def test_production(self):
         """正式环境测试"""
-        threading.Thread(target=lambda: self._run_single_test('正式', self._test_production_impl), daemon=True).start()
+        self._start_task(lambda: self._run_single_test('正式', self._test_production_impl))
     
     def _test_production_impl(self):
         try:
@@ -2228,10 +2308,7 @@ class TestWindowPanel(QFrame):
     def print_label(self):
         """打印标签（检查所有测试项通过后才允许打印）"""
         # 检查所有测试项是否全部通过
-        all_passed = all(
-            indicator.status == "passed"
-            for indicator in self.status_indicators.values()
-        )
+        all_passed = self._all_tests_passed()
         if not all_passed:
             QMessageBox.warning(
                 self, '无法打印',
@@ -2239,7 +2316,7 @@ class TestWindowPanel(QFrame):
             )
             return
 
-        threading.Thread(target=self._print_label_impl, daemon=True).start()
+        self._start_task(self._print_label_impl)
     
     def _print_label_impl(self):
         try:
@@ -2267,6 +2344,9 @@ class TestWindowPanel(QFrame):
 class SpeakerTestWindow(QMainWindow):
     device_found_signal = pyqtSignal(object)
     device_removed_signal = pyqtSignal(str)
+    verify_offline_signal = pyqtSignal(str)
+    versions_updated_signal = pyqtSignal()
+    heartbeat_result_signal = pyqtSignal(object)
     batch_print_completed_signal = pyqtSignal(int, int)  # 批量打印完成信号(成功数, 失败数)
 
     def __init__(self, speaker_type='indoor'):
@@ -2330,8 +2410,14 @@ class SpeakerTestWindow(QMainWindow):
         self.datetime_synced_devices: dict = {}  # {sn: timestamp}
         self.datetime_sync_interval = 300  # 5分钟内不重复校时同一设备
 
+        self._heartbeat_pending = {}
+        self._heartbeat_failures = {}
+        self._closing = False
+        self.versions_updated_signal.connect(self.update_device_list)
+        self.heartbeat_result_signal.connect(self._apply_heartbeat_results)
         self.device_found_signal.connect(self._on_device_found_main_thread)
         self.device_removed_signal.connect(self._on_device_removed_main_thread)
+        self.verify_offline_signal.connect(self._verify_device_offline)
         self.batch_print_completed_signal.connect(self._show_batch_print_result)
 
         self.init_ui()
@@ -2929,6 +3015,10 @@ class SpeakerTestWindow(QMainWindow):
         if layout_mode == self.current_layout:
             return
 
+        if any(panel._test_running for panel in self.test_panels):
+            self._pending_layout = layout_mode
+            return
+
         # 9宫格切换前需要用户确认
         if layout_mode == 9:
             reply = QMessageBox.question(
@@ -3413,6 +3503,8 @@ class SpeakerTestWindow(QMainWindow):
 
         # 清空设备列表
         self.devices.clear()
+        self._heartbeat_pending.clear()
+        self._heartbeat_failures.clear()
 
         # 清空版本缓存
         self.device_versions.clear()
@@ -3609,7 +3701,8 @@ class SpeakerTestWindow(QMainWindow):
             )
     
     def refresh_devices(self):
-        if self.listener and self.zeroconf:
+        if self.listener and self.zeroconf and not self._closing and not getattr(self, '_refresh_running', False):
+            self._refresh_running = True
             threading.Thread(target=self._refresh_devices_background, daemon=True).start()
     
     def _refresh_devices_background(self):
@@ -3618,71 +3711,121 @@ class SpeakerTestWindow(QMainWindow):
             self.listener.refresh_all_devices(self.zeroconf, self.config.mdns_service_type)
         except Exception as e:
             logger.error(f"刷新设备列表失败: {e}")
+        finally:
+            self._refresh_running = False
 
-    def _check_device_heartbeat(self):
-        """HTTP心跳检测：定期检查设备是否在线"""
-        import requests
-        current_time = time.time()
-        offline_devices = []
+    def _check_device_heartbeat(self, device_sn=None):
+        """各设备独立探活、独立回传，不因其他设备超时延迟刷新。"""
+        if self._closing:
+            return
+
+        def probe(sn, ip, token, testing):
+            import requests
+            import socket
+            online = False
+            reason = ''
+            started = time.monotonic()
+            try:
+                if testing:
+                    # 测试期间先检查TCP，避免周期性HTTP请求挤占固件测试接口。
+                    try:
+                        with socket.create_connection((ip, 8080), timeout=1):
+                            online = True
+                        return
+                    except OSError:
+                        pass
+                # 服务发现变化和TCP端口状态都不能替代探活接口。
+                # 首次失败立即复查，避免短暂繁忙造成误删；各设备独立执行。
+                for attempt in range(2):
+                    try:
+                        with requests.get(f'http://{ip}:8080/hi', timeout=1) as response:
+                            # /hi允许空响应；恢复原有按HTTP状态判断的语义。
+                            online = 200 <= response.status_code < 400
+                            reason = f'HTTP {response.status_code}, body_bytes={len(response.content)}'
+                    except requests.exceptions.RequestException as exc:
+                        reason = type(exc).__name__
+                    if online:
+                        break
+                    logger.debug(f'设备 {sn} /hi 探活第{attempt + 1}次失败: {reason}')
+                if not online:
+                    # 扫描/录音时固件HTTP处理可能阻塞。接口超时不等于拔电，
+                    # 端口仍可达就保留设备和分配窗口，下一轮继续确认/hi。
+                    try:
+                        with socket.create_connection((ip, 8080), timeout=1):
+                            online = True
+                        logger.debug(f'设备 {sn} /hi暂不可用但端口仍可达，保留窗口: {reason}')
+                    except OSError:
+                        pass
+            finally:
+                self.heartbeat_result_signal.emit((sn, ip, token, online, started))
 
         for device in list(self.devices):
-            sn = device.sn
-
-            # 检查设备是否分配到窗口
-            bound_panel = next((panel for panel in self.test_panels if panel.device and panel.device.sn == sn), None)
-
-            # 检查设备是否正在执行测试（log_capture不为None表示正在测试）
-            is_testing = bound_panel and bound_panel.log_capture is not None
-
-            if is_testing:
-                # 正在测试的设备，更新心跳时间（避免误判离线）
-                self.device_last_seen[sn] = current_time
-                logger.debug(f"设备 {sn} 正在测试，跳过心跳检测")
+            if device_sn is not None and device.sn != device_sn:
                 continue
-
-            last_seen = self.device_last_seen.get(sn, 0)
-
-            # 新发现的设备，记录首次在线时间
-            if last_seen == 0:
-                self.device_last_seen[sn] = current_time
+            if device.sn in self._heartbeat_pending:
                 continue
+            token = object()
+            self._heartbeat_pending[device.sn] = token
+            testing = any(p.device and p.device.sn == device.sn and p._test_running
+                          for p in self.test_panels)
+            threading.Thread(target=probe, args=(device.sn, device.ip, token, testing),
+                             daemon=True).start()
 
-            # 检查是否超时
-            if current_time - last_seen > self.heartbeat_timeout:
-                # TCP连接探活（1秒超时，不解析响应内容）
-                try:
-                    url = f"http://{device.ip}:8080/hi"
-                    response = requests.get(url, timeout=1)
-
-                    # 只要HTTP请求成功（状态码200-399），就认为在线
-                    if response.status_code < 400:
-                        self.device_last_seen[sn] = current_time
-                        logger.debug(f"设备 {sn} ({device.ip}) HTTP探活成功 (status={response.status_code})")
-                    else:
-                        # HTTP状态码错误，判定离线
-                        offline_devices.append(sn)
-                        logger.warning(f"设备 {sn} ({device.ip}) HTTP状态码错误 (status={response.status_code})，判定离线")
-                except requests.exceptions.Timeout:
-                    # 请求超时，判定离线
-                    offline_devices.append(sn)
-                    logger.warning(f"设备 {sn} ({device.ip}) HTTP探活超时，判定离线")
-                except requests.exceptions.RequestException as e:
-                    # 连接失败，判定离线
-                    offline_devices.append(sn)
-                    logger.warning(f"设备 {sn} ({device.ip}) HTTP探活异常: {type(e).__name__}，判定离线")
-
-        # 移除离线设备
-        for device_sn in offline_devices:
-            self.device_removed_signal.emit(device_sn)
+    def _apply_heartbeat_results(self, result):
+        sn, ip, token, online, started = result
+        # 移除/重新发现设备后，丢弃旧探活结果，不覆盖新设备状态。
+        if self._heartbeat_pending.get(sn) is not token:
+            return
+        self._heartbeat_pending.pop(sn, None)
+        if self._closing or not any(d.sn == sn and d.ip == ip for d in self.devices):
+            return
+        last_response = SpeakerHTTPClient.last_response_time(ip)
+        if not online and last_response >= started:
+            logger.debug(f'设备 {sn} 探活期间其他HTTP接口有响应，忽略本轮离线结果')
+            online = True
+        if online:
+            self.device_last_seen[sn] = time.time()
+            self._heartbeat_failures.pop(sn, None)
+        else:
+            # 同一轮紧邻的重试仍可能处于同一个繁忙区间，不能视为多轮离线。
+            now = time.monotonic()
+            previous = self._heartbeat_failures.get(sn)
+            if previous is not None and last_response >= previous[2]:
+                # 两轮失败之间只要测试/版本接口响应过，就不是连续离线。
+                previous = None
+            if previous is None or previous[0] != ip:
+                count, first_failure = 1, now
+            else:
+                count, first_failure = previous[1] + 1, previous[2]
+            self._heartbeat_failures[sn] = (ip, count, first_failure)
+            testing = any(p.device and p.device.sn == sn and p._test_running
+                          for p in self.test_panels)
+            required = 3 if testing else 2
+            if count < required or now - first_failure < self.heartbeat_timeout:
+                logger.warning(
+                    f'设备 {sn} ({ip}) 疑似离线，保留窗口继续确认 '
+                    f'(失败轮数={count}/{required}, 正在测试={testing})')
+                return
+            logger.warning(
+                f'设备 {sn} ({ip}) 连续{count}轮探活及端口检查失败，'
+                f'持续{now - first_failure:.1f}秒，确认离线并释放窗口')
+            self.device_removed_signal.emit(sn)
 
     def on_device_found(self, device: DeviceInfo):
         self.device_found_signal.emit(device)
     
     def on_device_removed(self, device_sn: str):
-        self.device_removed_signal.emit(device_sn)
+        # mDNS服务消失只触发确认，设备仍能响应/hi时保留列表和测试结果。
+        self.verify_offline_signal.emit(device_sn)
+
+    def _verify_device_offline(self, device_sn):
+        logger.debug(f'设备 {device_sn} mDNS服务消失，确认HTTP探活状态')
+        self._check_device_heartbeat(device_sn)
     
     def _on_device_found_main_thread(self, device: DeviceInfo):
         """设备发现后更新列表（手动分配窗口）"""
+        if self._closing:
+            return
         if device.type != self.speaker_device_type:
             logger.debug(f"忽略非当前音箱模式设备: sn={device.sn}, type={device.type}")
             return
@@ -3739,7 +3882,8 @@ class SpeakerTestWindow(QMainWindow):
                     self._query_device_versions(device)
 
         # 更新设备最后在线时间（心跳检测）
-        self.device_last_seen[device.sn] = time.time()
+        # mDNS可能返回缓存，不能用缓存刷新覆盖实际网络探活时间。
+        self.device_last_seen.setdefault(device.sn, time.time())
 
         # 更新设备列表显示
         self.update_device_list()
@@ -3751,6 +3895,8 @@ class SpeakerTestWindow(QMainWindow):
         self.device_versions.pop(device_sn, None)
         # 清理心跳记录
         self.device_last_seen.pop(device_sn, None)
+        self._heartbeat_pending.pop(device_sn, None)
+        self._heartbeat_failures.pop(device_sn, None)
         # 清理校时记录（修复设备重新上下电后不会重新校时的问题）
         self.datetime_synced_devices.pop(device_sn, None)
 
@@ -3847,7 +3993,7 @@ class SpeakerTestWindow(QMainWindow):
                     logger.info(f"[版本查询] 版本已缓存: {device.sn} -> {versions}")
                     # 查询成功，从失败记录中移除（如果存在）
                     self.version_query_failed.discard(device.sn)
-                    QTimer.singleShot(0, self.update_device_list)
+                    self.versions_updated_signal.emit()
 
                     # 室外音箱自动校时
                     if device.type == DEVICE_TYPE_OUTDOOR_SMART_HORN:
@@ -4153,6 +4299,13 @@ class SpeakerTestWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭窗口时清理资源"""
+        self._closing = True
+        if any(panel._test_running for panel in self.test_panels):
+            for panel in self.test_panels:
+                panel.stop_flag.set()
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
         logger.info("音箱测试窗口退出，开始清理资源...")
 
         # 1. 停止所有窗口的视频流
