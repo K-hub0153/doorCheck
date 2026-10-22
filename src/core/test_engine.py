@@ -277,6 +277,22 @@ class TestEngine:
                 self.result.set_failed(fail_message)
                 return self.result
 
+            # 蓝牙检测作为首个测试项，硬件版本前置检查仍保持在最前。
+            self._report_test_item("ble_discover", "testing")
+            t0 = time.time()
+            step_start = len(self.result.steps)
+            ok = self.test_ble_discover()
+            new_steps = self.result.steps[step_start:]
+            detail = new_steps[-1]['message'] if new_steps else ""
+            self._report_test_item("ble_discover", "passed" if ok else "failed", detail)
+            if not ok:
+                failed_tests.append("BLE检测")
+            self.result.sub_results.append({
+                'test_type': 'BLE检测',
+                'status': 'passed' if ok else 'failed',
+                'duration': round(time.time() - t0, 2), 'steps': new_steps,
+            })
+
             # ── 阶段一：控制检测 ─────────────────────────────────────────
             # 注意：遥控器配对测试放在整个流程最后执行（见阶段三）。
             # 它会让门锁保持开启，而后续测试项都不依赖门锁处于关闭状态，
@@ -312,7 +328,6 @@ class TestEngine:
 
             for test_name, test_fn, label in [
                 ("wifi_discover", self.test_wifi_discover, "WiFi检测"),
-                ("ble_discover", self.test_ble_discover, "BLE检测"),
                 ("sle_discover", self.test_sle_discover, "SLE检测"),
             ]:
                 self._report_test_item(test_name, "testing")
