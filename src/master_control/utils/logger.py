@@ -41,6 +41,14 @@ class Logger:
 
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.DEBUG)
+        # 中文 Windows 控制台默认 GBK，日志里出现 ✓ / ✗ / emoji 这类字符时，
+        # 控制台 handler 会抛 UnicodeEncodeError，表现为刷一屏 "--- Logging error ---"。
+        # 文件 handler 是 utf-8 不受影响，这里让控制台退化为替换字符即可。
+        try:
+            console_handler.stream.reconfigure(errors='replace')
+        except Exception:
+            # 打包成窗口程序时 sys.stderr 可能为 None，或 stream 不支持 reconfigure
+            pass
 
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s',

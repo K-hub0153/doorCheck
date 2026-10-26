@@ -1,0 +1,132 @@
+printer:
+  chinese_font: TSS24.BF2
+  design_dpi: 600
+  dpi: 203
+  enabled: true
+  paper_height: 30
+  paper_width: 50
+  printer_name: Xprinter XP-T271U
+  protocol: zpl
+  tspl_layout:
+    border:
+      thickness: 2
+      x1: 2
+      x2: 398
+      y1: 2
+      y2: 238
+    date:
+      font: '1'
+      rotation: 0
+      x: 120
+      x_scale: 1
+      y: 124
+      y_scale: 1
+    qrcode:
+      cell_width: 6
+      x: 245
+      y: 69
+    sn:
+      font: '1'
+      rotation: 0
+      x: 34
+      x_scale: 1
+      y: 178
+      y_scale: 1
+  zpl_dpi: 203
+  zpl_layout:
+    bold_width: 1
+    date:
+      font_size: 49
+      x: 300
+      y: 340
+    font_path: assets/fonts/label.ttf
+    qrcode:
+      error_correction: M
+      size_mm: 13.3
+      x: 750
+      y: 220
+    render_mode: bitmap
+    sn:
+      font_size: 53
+      x: 37
+      y: 472
+qrcode_print:
+  auto_print: false
+  enabled: true
+  print_copies: 1
+  template: default
+  templates:
+    default:
+      background_image: 10.1POS sn码.png
+      description: 默认产品标签
+      fields:
+      - bold: true
+        font: '1'
+        font_size: 16
+        format: '%Y/%m/%d'
+        rotation: 0
+        type: date
+        x: 111
+        y: 128
+      - bold: true
+        font: '1'
+        font_size: 15
+        key: sn
+        label: 'SN:'
+        rotation: 0
+        type: text
+        x: 26
+        y: 185
+      - cell_width: 3
+        key: sn
+        type: qrcode
+        x: 288
+        y: 85
+      paper_height: 30
+      paper_width: 50
+    型号标签:
+      description: 新模板
+      fields:
+      - font: '1'
+        key: sn
+        label: 'SN:'
+        rotation: 0
+        type: text
+        x: 253
+        x_scale: 7
+        y: 478
+        y_scale: 5
+      - font: '1'
+        format: '%Y/%m/%d'
+        rotation: 0
+        type: date
+        x: 361
+        x_scale: 5
+        y: 280
+        y_scale: 4
+      - cell_width: 14
+        key: sn
+        type: qrcode
+        x: 759
+        y: 162
+      - height: 87
+        key: sn
+        narrow: 2
+        type: barcode
+        wide: 4
+        x: 249
+        y: 374
+      - font: '1'
+        rotation: 0
+        type: model
+        value: 型号
+        x: 362
+        x_scale: 4
+        y: 189
+        y_scale: 3
+      paper_height: 30
+      paper_width: 50
+  variables:
+  - default: ''
+    key: model
+    label: 型号

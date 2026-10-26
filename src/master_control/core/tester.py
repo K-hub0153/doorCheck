@@ -8,6 +8,8 @@ from ..utils.paths import config_dir
 from src.master_control.core.ssh_client import SSHClient
 from src.master_control.core.test_result import DeviceTestResults, TestResult
 from src.master_control.core.chip_config import ChipManager, ChipConfig
+from src.master_control.core import lte_signal
+from src.master_control.core import poe_net
 from src.master_control.utils.logger import logger
 from src.master_control.utils.config import config
 from src.master_control.utils.mac_allocator import MACAllocator
@@ -95,11 +97,13 @@ class DeviceTester:
             return False
         return self.ssh.is_alive()
     
+
     def disconnect(self):
         if self.ssh:
             self.ssh.disconnect()
 
     def test_poe_ports(self) -> TestResult:
+        """POE 网口检测：自动获取设备的 POE 网段（eth1）再扫描"""
         logger.info(f"[{self.sn}] 开始检测 POE 网口...")
         result = TestResult()
         result.set_testing()
@@ -114,34 +118,54 @@ class DeviceTester:
                 logger.info(f"[{self.sn}] POE 检测已跳过（配置为0）")
                 return result
 
-            poe_subnet = config.poe_subnet.split('/')[0].rsplit('.', 1)[0]
-            logger.info(f"[{self.sn}] POE网段: {poe_subnet}.x")
+            # 自动识别设备上 POE 网口的网段（默认 eth1，识别不到回落到配置文件）
+            target = poe_net.resolve(self.ssh, iface=config.poe_interface,
+                                    fallback_subnet=config.poe_subnet)
+            logger.info(f"[{self.sn}] POE网段: {target.label}, 来源: {target.source}"
+                       f"{' (' + target.note + ')' if target.note else ''}")
+            detail_lines = [
+                f"扫描网段: {target.label} ({target.source})",
+                f"网口: {target.interface or '未识别'}",
+                f"CIDR: {target.cidr or 'N/A'}",
+            ]
+            if target.note:
+                detail_lines.append(f"备注: {target.note}")
 
-            cmd_clear = "ip neigh flush all"
-            self.ssh.execute_command(cmd_clear)
+            # 清空邻居表
+            cmd_clear = poe_net.build_flush_command(target)
+            self.ssh.execute_command(cmd_clear, timeout=poe_net.PROBE_TIMEOUT)
             logger.info(f"[{self.sn}] 已清空ARP表")
 
-            cmd_ping = f"for i in {{2..254}}; do ping -c 1 -W 1 {poe_subnet}.$i > /dev/null 2>&1 & done; wait"
-            success, stdout, stderr = self.ssh.execute_command(cmd_ping, timeout=30)
+            # 并发 ping 扫描
+            cmd_ping = poe_net.build_ping_command(target)
+            success, stdout, stderr = self.ssh.execute_command(cmd_ping, timeout=poe_net.PING_TIMEOUT)
             logger.info(f"[{self.sn}] 完成网段ping扫描")
 
-            cmd_arp_detail = f"ip neigh show | grep '{poe_subnet}'"
+            # 查看邻居表详情（写日志）
+            cmd_arp_detail = poe_net.build_neigh_detail_command(target)
             success_detail, arp_detail, stderr_detail = self.ssh.execute_command(cmd_arp_detail)
-            if success_detail:
+            if success_detail and arp_detail:
                 logger.info(f"[{self.sn}] ARP表详情:\n{arp_detail}")
 
-            cmd_arp = f"ip neigh show | grep '{poe_subnet}' | grep 'REACHABLE' | wc -l"
+            # 统计 REACHABLE 设备数
+            cmd_arp = poe_net.build_neigh_count_command(target)
             success, stdout, stderr = self.ssh.execute_command(cmd_arp)
 
             if success and stdout:
                 online_count = int(stdout.strip())
                 logger.info(f"[{self.sn}] POE设备检测结果: 发现 {online_count} 个REACHABLE设备，期望 {expected} 个")
 
+                detail_lines.append(f"在线设备: {online_count} / 期望 {expected}")
+                if arp_detail:
+                    detail_lines.append("邻居表:\n" + arp_detail)
+
                 if online_count >= expected:
-                    result.set_passed(f"通过 (检测到 {online_count} 路/目标 {expected} 路)", f"检测到 {online_count} 个POE设备在线")
+                    result.set_passed(f"通过 (检测到 {online_count} 路/目标 {expected} 路)",
+                                     '\n'.join(detail_lines))
                     logger.info(f"[{self.sn}] POE 检测通过: {online_count}/{expected}")
                 else:
-                    result.set_failed(f"失败 (检测到 {online_count} 路/目标 {expected} 路)", f"仅检测到 {online_count} 个POE设备，期望 {expected} 个")
+                    result.set_failed(f"失败 (检测到 {online_count} 路/目标 {expected} 路)",
+                                     '\n'.join(detail_lines))
                     logger.warning(f"[{self.sn}] POE 检测失败: {online_count}/{expected}")
             else:
                 result.set_failed("执行失败", stderr)
@@ -667,121 +691,108 @@ class DeviceTester:
 
         return result
 
-    def _test_4g_qcsq(self) -> TestResult:
-        """统一4G检测: 通过 AT+QENG="servingcell" 命令获取信号质量并按标准判定"""
+    def _exec_at_on_port(self, at_port: str) -> str:
+        """在指定 AT 口下发识别命令（ATI），返回原始响应"""
+        spec = lte_signal.ati_spec(at_port)
+        at_cmd = lte_signal.build_at_command(spec)
+        success, stdout, stderr = self.ssh.execute_command(at_cmd, timeout=15)
+        if not success:
+            logger.warning(f"[{self.sn}] {spec.at_port} 执行 ATI 失败: {stderr}")
+            return ''
+        return stdout
+
+    def _read_signal(self, spec) -> str:
+        """按模组各自的 AT 命令读取信号，返回原始响应"""
+        success, stdout, stderr = self.ssh.execute_command(
+            lte_signal.build_at_command(spec), timeout=15)
+        if not success:
+            logger.warning(f"[{self.sn}] {spec.name} 信号读取失败: {stderr}")
+            return ''
+        return stdout
+
+    def _probe_lte_module(self):
+        """识别 4G 模组厂商并读取信号，返回 (spec, model, parsed, note)
+
+        note 是详情里的识别方式说明：ATI 认出 / 按响应特征兜底 / 识别失败。
+
+        1. `lte.force_module` 指定了厂商就直接用（已知批次可省一次往返）
+        2. 否则在 `lte.at_port` 下发 ATI，按模组表的关键字识别厂商
+        3. ATI 认不出来（串口未握手 / 旧固件不回型号）时按响应格式依次试读。
+           移远的 QENG 直出真实值、龙尚的 CPSI 才需要换算码值，试读能落到
+           正确的解析分支；两个格式都解析不出才判失败，并把各自的原因带上
+        """
+        modules = lte_signal.load_modules(config, at_port=lte_signal.configured_at_port(config))
+        forced = lte_signal.forced_module_name(config)
+        if forced:
+            spec = next((m for m in modules if m.name == forced), None) or modules[0]
+            parsed = lte_signal.decode(spec, self._read_signal(spec))
+            logger.info(f"[{self.sn}] 4G 模组按配置指定为 {spec.name}")
+            return spec, forced, parsed, f'lte.force_module 指定为 {forced}'
+
+        ati_out = self._exec_at_on_port(
+            lte_signal.configured_at_port(config) or lte_signal.DEFAULT_AT_PORT)
+        spec, model = lte_signal.identify_module(ati_out, modules)
+        if spec is not None:
+            logger.info(f"[{self.sn}] 4G 模组识别为 {spec.name} ({model})")
+            parsed = lte_signal.decode(spec, self._read_signal(spec))
+            return spec, model, parsed, 'ATI 型号识别'
+
+        logger.warning(f"[{self.sn}] ATI 未识别出模组厂商，按响应格式依次试读")
+        reasons = []
+        for candidate in modules:
+            parsed = lte_signal.decode(candidate, self._read_signal(candidate))
+            if parsed.ok:
+                logger.info(f"[{self.sn}] 按 {candidate.name} 的响应格式解析成功")
+                return candidate, '', parsed, 'ATI 未识别，按响应格式判定'
+            reasons.append(f'{candidate.name}: {parsed.reason}')
+
+        reason = '模组厂商识别失败（' + '; '.join(reasons) + '）'
+        logger.warning(f"[{self.sn}] {reason}")
+        spec = lte_signal.ModuleSpec(name='未知', at_command='ATI')
+        return spec, '', lte_signal.Outcome(reason=reason), 'ATI 未识别，且无模组的响应格式能解析'
+
+    def test_4g(self) -> TestResult:
+        """4G 检测：识别模组厂商 → 读取信号 → 按统一标准判定
+
+        判定标准与厂商无关（RSRP >= -90 dBm, SINR >= 5 dB, RSRQ >= -13 dB），
+        厂商只决定「怎么读」和「怎么把码值换成真实值」。
+        """
+        logger.info(f"[{self.sn}] 开始检测 4G 模块...")
         result = TestResult()
         try:
-            # AT 指令必须以 \r 结尾，否则模组不响应；用 printf 发送，避免转义问题
-            at_body = 'AT+QENG="servingcell"'
-            # cat 后台读取 ttyUSB2，printf 发送带 \r 的 AT 命令，最后 kill 掉后台 cat 进程
-            at_cmd = (
-                'cat /dev/ttyUSB2 & CATPID=$!; sleep 1; '
-                "printf '" + at_body + "\\r\\n' > /dev/ttyUSB2; "
-                'sleep 1; kill $CATPID 2>/dev/null || true'
-            )
-            logger.info(f"[{self.sn}] 执行 {at_body} 命令...")
-            sig_success, sig_stdout, sig_stderr = self.ssh.execute_command(at_cmd, timeout=15)
+            spec, model, parsed, note = self._probe_lte_module()
+            vendor = lte_signal.vendor_text(spec, model)
 
-            rsrp_val = rsrq_val = sinr_val = None
-            signal_info = []
-            signal_pass = False
+            if not parsed.ok:
+                detail = lte_signal.format_detail(spec, model, identify_note=note,
+                                                  reason=parsed.reason)
+                logger.warning(f"[{self.sn}] 4G 检测失败: {parsed.reason}")
+                result.set_failed(f"4G 检测失败 ({vendor}, {parsed.reason})", detail)
+                return result
 
-            if sig_success and sig_stdout:
-                logger.info(f"[{self.sn}] AT+QENG输出: {sig_stdout.strip()}")
+            metrics = parsed.metrics
+            passed, checks, judge_reason = lte_signal.judge(metrics)
+            # 面板上括号里带字段名与单位；判定不达标的字段带 ✗，一眼看出是哪项拖累判定
+            values = '(' + ' / '.join(lte_signal.summary_tokens(metrics, checks)) + ')'
+            detail = lte_signal.format_detail(spec, model, metrics,
+                                              checks=checks or None,
+                                              identify_note=note,
+                                              reason=judge_reason)
 
-                # 只取 +QENG 的 servingcell 行，例如：
-                # +QENG: "servingcell","NOCONN","LTE","FDD",460,00,1234567,123,1650,3,5,5,1234,-83,-11,-55,18,120
-                qeng_line = next(
-                    (ln.strip() for ln in sig_stdout.splitlines()
-                     if '+QENG:' in ln and 'servingcell' in ln),
-                    None
-                )
-
-                if qeng_line:
-                    head = re.search(
-                        r'\+QENG:\s*"servingcell"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"',
-                        qeng_line
-                    )
-                    state        = head.group(1) if head else ''
-                    network_mode = head.group(2) if head else ''
-                    logger.info(f"[{self.sn}] 网络模式: {network_mode}, 状态: {state}")
-
-                    if network_mode != "LTE":
-                        # WCDMA / GSM 模式没有 RSRP/RSRQ/SINR，暂不判定
-                        logger.warning(f"[{self.sn}] 当前网络模式 {network_mode} 不支持信号质量判定")
-                    elif state not in ("NOCONN", "CONNECT", "CAMPED"):
-                        logger.warning(f"[{self.sn}] 未注册到网络, state={state}")
-                    else:
-                        # 字段索引: 0="servingcell" 1=state 2=LTE 3=is_tdd 4=MCC 5=MNC 6=cellID
-                        #          7=PCI 8=EARFCN 9=band 10=UL_bw 11=DL_bw 12=TAC
-                        #         13=RSRP 14=RSRQ 15=RSSI 16=SINR 17=srxlev
-                        fields = [f.strip().strip('"')
-                                  for f in qeng_line.split('+QENG:', 1)[1].split(',')]
-                        if len(fields) >= 17:
-                            try:
-                                rsrp_val = int(fields[13])
-                                rsrq_val = int(fields[14])
-                                rssi_val = int(fields[15])
-                                sinr_val = int(fields[16])
-
-                                signal_info = [
-                                    f"RSRP:{rsrp_val}dBm",
-                                    f"RSRQ:{rsrq_val}dB",
-                                    f"SINR:{sinr_val}dB",
-                                ]
-                                # 判定标准：RSRP >= -90 dBm, SINR >= 5 dB, RSRQ >= -13 dB
-                                if rsrp_val >= -90 and sinr_val >= 5 and rsrq_val >= -13:
-                                    signal_pass = True
-                                    logger.info(f"[{self.sn}] 4G信号质量达标: " + ", ".join(signal_info))
-                                else:
-                                    logger.warning(
-                                        f"[{self.sn}] 4G信号质量不达标: "
-                                        f"RSRP={rsrp_val}(需>=-90) "
-                                        f"SINR={sinr_val}(需>=5) "
-                                        f"RSRQ={rsrq_val}(需>=-13)"
-                                    )
-                            except (ValueError, IndexError) as e:
-                                logger.warning(f"[{self.sn}] LTE 信号字段解析失败: {e}")
-                        else:
-                            logger.warning(f"[{self.sn}] LTE 响应字段数不足: {len(fields)}")
-                else:
-                    logger.warning(f"[{self.sn}] 未能解析AT+QENG输出: {sig_stdout.strip()}")
-            else:
-                logger.warning(f"[{self.sn}] AT+QENG命令执行失败: {sig_stderr}")
-
-            if signal_pass:
-                message = "4G 正常 (" + ", ".join(signal_info) + ")"
-                detail  = f"RSRP: {rsrp_val} dBm\nSINR: {sinr_val} dB\nRSRQ: {rsrq_val} dB"
-                result.set_passed(message, detail)
+            if passed:
+                message = f"4G 正常 {vendor} {values}"
                 logger.info(f"[{self.sn}] 4G 检测通过: {message}")
+                result.set_passed(message, detail)
             else:
-                if signal_info:
-                    fail_msg    = "4G 信号不达标 (" + ", ".join(signal_info) + ")"
-                    fail_detail = (f"RSRP: {rsrp_val} dBm (需>=-90)\n"
-                                   f"SINR: {sinr_val} dB (需>=5)\n"
-                                   f"RSRQ: {rsrq_val} dB (需>=-13)")
-                else:
-                    fail_msg    = "4G 信号检测失败"
-                    fail_detail = "无法获取信号质量数据"
-                result.set_failed(fail_msg, fail_detail)
-                logger.warning(f"[{self.sn}] 4G 检测失败: {fail_msg}")
+                message = f"4G 信号不达标 {vendor} {values}"
+                logger.warning(f"[{self.sn}] 4G 检测失败: {message} | {judge_reason}")
+                result.set_failed(message, detail)
 
         except Exception as e:
             result.set_failed("异常", str(e))
             logger.error(f"[{self.sn}] 4G 检测异常: {e}")
 
         return result
-
-    def test_4g(self) -> TestResult:
-        logger.info(f"[{self.sn}] 开始检测 4G 模块...")
-        result = TestResult()
-        result.set_testing()
-        # RK3576 和 310P/3576 主控统一使用 AT+QENG="servingcell" 检测
-        return self._test_4g_qcsq()
-
-    def _test_4g_rk3576(self) -> TestResult:
-        """RK3576 芯片 4G 检测（统一使用 AT+QENG="servingcell"）"""
-        return self._test_4g_qcsq()
 
     def test_fan(self) -> TestResult:
         logger.info(f"[{self.sn}] 开始检测风扇...")
@@ -1007,18 +1018,37 @@ class DeviceTester:
 
     # I2C 地址 0x0b 的电量计寄存器（命令集与 SBS 智能电池规范一致）
     # (内部键, 寄存器, 显示名)；列表顺序即读取顺序与展示顺序
+    #
+    # 必读集合：检测结果要展示的字段全部落在这里，任一读失败即该检测项失败
     BATTERY_REGS = [
-        ("relative_soc", "0x0d", "相对电量"),
         ("absolute_soc", "0x0e", "绝对电量"),
-        ("remaining",    "0x0f", "剩余容量"),
-        ("full_charge",  "0x10", "满充容量FCC"),
-        ("design_cap",   "0x18", "设计容量DC"),
+        ("relative_soc", "0x0d", "相对电量"),
         ("temperature",  "0x08", "温度"),
-        ("voltage",      "0x09", "电压"),
+        ("voltage",      "0x09", "电池电压"),
+        ("design_cap",   "0x18", "额定容量"),
+        ("remaining",    "0x0f", "当前容量"),
         ("current",      "0x0a", "电流"),
         ("status",       "0x16", "状态寄存器"),
+    ]
+
+    # 附加信息：读得到就一起展示，读不到只记日志，不影响判定。
+    # 海思310P 的电量计不保证实现这两条命令（产线脚本也没读），
+    # 所以不能算进必读集合，否则会因“多余寄存器读失败”把正常电池判成失败。
+    BATTERY_REGS_OPTIONAL = [
+        ("full_charge",  "0x10", "满充容量FCC"),
         ("cycle_count",  "0x17", "循环次数"),
     ]
+
+    # 电池厂商名：SBS 命令集的 ManufacturerName(0x20)。
+    # 该命令返回的是字符串（第 1 字节是名称长度，后面才是 ASCII 名称），
+    # i2cget 只能按寄存器读一个 16 位字，读不到这种变长字符串，必须用
+    # i2ctransfer 整段读：w1@0x0b 0x20 写 1 字节命令码，r33 一次读回
+    # 1 字节长度 + 32 字节名称（厂商名最长 32 字节，33 字节足够）。
+    #
+    # 总线号与地址和寄存器读取取同一份配置（见 _battery_i2c_bus），
+    # 保证同一个电量计不会读一半走 i2c-2、读一半走 i2c-0。
+    BATTERY_MANUFACTURER_CMD = "i2ctransfer -y {bus} w1@{addr} 0x20 r33"
+    BATTERY_MANUFACTURER_MAX_LEN = 32
 
     # 状态寄存器(0x16)位定义。按 SBS 1.1 BatteryStatus 解读，
     # 注意：实测机台返回 0x00E0，低字节 0xE0 不在标准错误码表内，位定义待核对，
@@ -1039,31 +1069,56 @@ class DeviceTester:
         0x05: "过流",
     }
 
+    def _battery_i2c_bus(self) -> int:
+        """当前芯片的电量计所在 I2C 总线号
+
+        优先取芯片级 battery_i2c_bus（各芯片主板走线不同：RK3576 是 i2c-0，
+        海思310P 是 i2c-2），芯片未配置时回落到全局 battery.i2c_bus。
+        """
+        chip_bus = getattr(self.chip_config, 'battery_i2c_bus', None)
+        if chip_bus is not None:
+            try:
+                return int(chip_bus)
+            except (TypeError, ValueError):
+                logger.warning(f"[{self.sn}] 芯片配置 battery_i2c_bus={chip_bus} 非法，"
+                               f"回落到全局 battery.i2c_bus")
+        return config.battery_i2c_bus
+
     def _read_battery_registers(self) -> tuple:
         """一次性读取全部电池寄存器
 
-        单条 SSH 命令读全部寄存器，并给每个读数打上寄存器号标记：
+        单条 SSH 命令读全部寄存器（必读 + 附加），并给每个读数打上寄存器号标记：
         只走一次往返，且 i2cget 失败时 stderr 也被 2>&1 收进同一行，
         标记后取不到合法的 0x???? 即视为该项失败。
 
-        I2C 总线号与从机地址来自 config.yaml 的 battery 段，默认 0 / 0x0b。
+        I2C 总线号取芯片级配置（见 _battery_i2c_bus），从机地址来自
+        config.yaml 的 battery.i2c_addr，默认 0x0b。
 
         Returns:
-            (readings, errors): readings 为 {key: 原始整数}，errors 为 {key: 失败原因}
+            (readings, errors, optional_readings):
+                readings            必读寄存器 {key: 原始整数}
+                errors              必读失败项 {key: 失败原因}
+                optional_readings   附加寄存器 {key: 原始整数}（读不到就不在字典里）
         """
-        bus = config.battery_i2c_bus
+        bus = self._battery_i2c_bus()
         addr = config.battery_i2c_addr
-        regs = " ".join(reg for _, reg, _ in self.BATTERY_REGS)
+        all_regs = self.BATTERY_REGS + self.BATTERY_REGS_OPTIONAL
+        regs = " ".join(reg for _, reg, _ in all_regs)
         cmd = (f"for r in {regs}; do printf '%s=' \"$r\"; "
                f"i2cget -y {bus} {addr} $r w 2>&1; done")
         success, stdout, stderr = self.ssh.execute_command(cmd, timeout=30)
 
+        required_keys = [key for key, _, _ in self.BATTERY_REGS]
+
         if not success or not stdout:
             reason = stderr.strip() or "命令执行失败"
+            # 把总线和地址带进失败原因：读不到时排查第一步就是确认 i2c-N 是否存在，
+            # 否则现场只看到“命令执行失败”无从下手
+            reason = f"i2c-{bus} {addr} 读取失败: {reason}"
             logger.error(f"[{self.sn}] 电池寄存器读取失败: {reason}")
-            return {}, {key: reason for key, _, _ in self.BATTERY_REGS}
+            return {}, {key: reason for key in required_keys}, {}
 
-        logger.info(f"[{self.sn}] 电池寄存器原始输出:\n{stdout}")
+        logger.info(f"[{self.sn}] 电池寄存器原始输出 (i2c-{bus} {addr}):\n{stdout}")
 
         raw_values = {}
         for line in stdout.splitlines():
@@ -1071,16 +1126,90 @@ class DeviceTester:
             if match:
                 raw_values[match.group(1).lower()] = int(match.group(2), 16)
 
-        readings, errors = {}, {}
+        readings, errors, optional_readings = {}, {}, {}
         for key, reg, label in self.BATTERY_REGS:
             if reg.lower() in raw_values:
                 readings[key] = raw_values[reg.lower()]
             else:
                 errors[key] = f"{label}({reg}) 读数失败"
                 logger.warning(f"[{self.sn}] 电池 {label}({reg}) 读数失败")
-        return readings, errors
+
+        # 附加项读不到只记日志，不计入失败
+        for key, reg, label in self.BATTERY_REGS_OPTIONAL:
+            if reg.lower() in raw_values:
+                optional_readings[key] = raw_values[reg.lower()]
+            else:
+                logger.info(f"[{self.sn}] 电池 {label}({reg}) 无读数，跳过附加信息")
+
+        return readings, errors, optional_readings
+
+    def _read_battery_manufacturer(self) -> tuple:
+        """读取电池厂商名（SBS ManufacturerName 0x20）
+
+        这条命令返回的是变长字符串，i2cget 按寄存器读 16 位的用法读不出来，
+        必须走 i2ctransfer 整段读（命令见 BATTERY_MANUFACTURER_CMD）。
+
+        总线号与从机地址和寄存器读取共用同一份配置，避免同一个电量计
+        寄存器走一条总线、厂商名走另一条。
+
+        Returns:
+            (name, error):
+                name   解析出的厂商名；取不到时为空字符串
+                error  失败原因；成功时为空字符串
+        """
+        bus = self._battery_i2c_bus()
+        addr = config.battery_i2c_addr
+        cmd = self.BATTERY_MANUFACTURER_CMD.format(bus=bus, addr=addr)
+
+        try:
+            success, stdout, stderr = self.ssh.execute_command(cmd, timeout=10)
+        except Exception as e:
+            logger.warning(f"[{self.sn}] 电池厂商读取异常: {e}")
+            return "", f"电池厂商读取异常: {e}"
+
+        if not success:
+            reason = stderr.strip() or "命令执行失败"
+            logger.warning(f"[{self.sn}] 电池厂商读取失败 (i2c-{bus} {addr}): {reason}")
+            return "", f"电池厂商读取失败: {reason}"
+
+        logger.info(f"[{self.sn}] 电池厂商原始输出 (i2c-{bus} {addr}): {stdout.strip()}")
+        name, error = self._decode_battery_manufacturer(stdout)
+        if error:
+            logger.warning(f"[{self.sn}] 电池厂商解析失败: {error}")
+        else:
+            logger.info(f"[{self.sn}] 电池厂商: {name}")
+        return name, error
+
+    def _decode_battery_manufacturer(self, raw: str) -> tuple:
+        """解析 i2ctransfer 读回的厂商名数据
+
+        输出形如 `0x08 0x47 0x72 0x65 0x65 0x6e 0x77 0x61 0x79`：
+        首字节是名称长度（0x08），其后按 ASCII 解码。
+
+        数据不完整时必须显式报错，不能按现有字节硬解：机台偶尔会返回被截断的
+        短输出（如只有 `0x08 0x47`），硬解会显示成厂商名「G」，比读不到更误导现场。
+
+        Returns:
+            (name, error)
+        """
+        tokens = re.findall(r'0x([0-9a-fA-F]{1,2})', raw or "")
+        if not tokens:
+            return "", "厂商名输出无法识别"
+
+        data = [int(t, 16) for t in tokens]
+        length = data[0]
+        if length <= 0 or length > self.BATTERY_MANUFACTURER_MAX_LEN:
+            return "", f"厂商名长度非法: {length}"
+        if len(data) - 1 < length:
+            return "", (f"厂商名数据不完整: 声明长度 {length} 字节，"
+                        f"实际只有 {len(data) - 1} 字节")
+        name_bytes = data[1:1 + length]
+        if any(b < 0x20 or b > 0x7E for b in name_bytes):
+            return "", f"厂商名含非 ASCII 字节: {raw.strip()}"
+        return bytes(name_bytes).decode('ascii'), ""
 
     @staticmethod
+
     def _to_signed16(value: int) -> int:
         """16 位补码转有符号整数（电流寄存器用）"""
         return value - 0x10000 if value >= 0x8000 else value
@@ -1103,7 +1232,15 @@ class DeviceTester:
     def test_battery(self) -> TestResult:
         """电池检测：i2cget 读取电量计寄存器
 
-        判定标准：默认能读出全部数据即通过，任一寄存器读失败则失败。
+        判定标准：默认能读出全部必读数据即通过，任一必读寄存器读失败则失败。
+
+        检测结果展示字段（顺序固定）：
+            电池厂商、充电状态、绝对电量、相对电量、温度(℃)、电池电压、额定容量、当前容量、电流
+        电池厂商走 i2ctransfer 单独读（SBS ManufacturerName，字符串命令 i2cget
+        读不出来），读不到只在详情里标注，不影响该项判定。
+
+        检测通过后是否继续配置 shutdown 模式由芯片配置 battery_shutdown_config
+        决定（该流程只适配 RK3576 电量计，海思310P 需设 False 跳过）。
         """
         logger.info(f"[{self.sn}] 开始电池检测...")
         result = TestResult()
@@ -1115,7 +1252,7 @@ class DeviceTester:
                 result.set_passed("电池检测跳过", f"{self.chip_config.chip_model} 芯片电池检测默认通过")
                 return result
 
-            readings, errors = self._read_battery_registers()
+            readings, errors, optional_readings = self._read_battery_registers()
 
             if errors:
                 detail = "\n".join(errors.values())
@@ -1130,48 +1267,70 @@ class DeviceTester:
             voltage_mv = readings['voltage']
             current_ma = self._to_signed16(readings['current'])
             temperature = readings['temperature'] / 10.0 - 273.15   # 0.1K → ℃
-            cycle_count = readings['cycle_count']
+            rated_capacity = readings['design_cap']
+            current_capacity = readings['remaining']
             status = readings['status']
 
             status_summary, status_detail = self._decode_battery_status(status)
 
-            # 充放电状态：以电流符号为准，再叠加状态寄存器的充满/放空标志
+            # 充电状态：以电流符号为准，再叠加状态寄存器的充满/放空标志
             if current_ma > 0:
-                state = f"充电中 (电流 {current_ma} mA)"
+                charge_state = "充电中"
             elif current_ma < 0:
-                state = f"放电中 (电流 {current_ma} mA)"
+                charge_state = "放电中"
             else:
-                state = "静置 (电流 0 mA)"
+                charge_state = "静置"
             extra_flags = [f for f in ("已充满", "已放空") if f in status_summary]
             if extra_flags:
-                state += "、" + "、".join(extra_flags)
+                charge_state += "、" + "、".join(extra_flags)
             if status & (1 << 15) or status & (1 << 13):
-                state += "，注意：存在告警标志"
+                charge_state += "（存在告警标志）"
 
+            # 电池厂商：字符串命令，单独走 i2ctransfer。
+            # 读不到不算失败（部分电量计不实现 ManufacturerName），
+            # 只把原因记在详情里，判定仍以必读寄存器为准。
+            manufacturer, manufacturer_error = self._read_battery_manufacturer()
+
+            # 面板展示：字段按固定顺序拼成一行，过长时界面靠 tooltip 看全文
+            manufacturer_text = manufacturer if manufacturer else "未读到"
             message = (
-                f"电池正常 ({state} | 相对电量: {relative_soc}% | 绝对电量: {absolute_soc}% | "
-                f"电压: {voltage_mv} mV | 温度: {temperature:.1f}℃ | 循环次数: {cycle_count})"
+                f"电池厂商: {manufacturer_text} | 充电状态: {charge_state} | "
+                f"绝对电量: {absolute_soc}% | 相对电量: {relative_soc}% | "
+                f"温度: {temperature:.1f}℃ | 电池电压: {voltage_mv} mV | "
+                f"额定容量: {rated_capacity} mAh | 当前容量: {current_capacity} mAh | 电流: {current_ma} mA"
             )
-            detail = "\n".join([
-                f"充放电状态: {state}",
-                f"相对电量: {relative_soc}%",
+
+            detail_lines = [
+                f"充电状态: {charge_state}",
                 f"绝对电量: {absolute_soc}%",
-                f"剩余容量: {readings['remaining']} mAh",
-                f"满充容量FCC: {readings['full_charge']} mAh",
-                f"设计容量DC: {readings['design_cap']} mAh",
-                f"电压: {voltage_mv} mV",
-                f"电流: {current_ma} mA (原始 0x{readings['current']:04X})",
+                f"相对电量: {relative_soc}%",
                 f"温度: {temperature:.1f}℃ (原始 0x{readings['temperature']:04X} = 0.1K)",
-                f"循环次数: {cycle_count}",
-                f"状态寄存器: {status_summary}",
-                status_detail,
-            ])
+                f"电池电压: {voltage_mv} mV",
+                f"额定容量: {rated_capacity} mAh",
+                f"当前容量: {current_capacity} mAh",
+                f"电流: {current_ma} mA (原始 0x{readings['current']:04X})",
+            ]
+            if 'full_charge' in optional_readings:
+                detail_lines.append(f"满充容量FCC: {optional_readings['full_charge']} mAh")
+            if 'cycle_count' in optional_readings:
+                detail_lines.append(f"循环次数: {optional_readings['cycle_count']}")
+            detail_lines.append(f"状态寄存器: {status_summary}")
+            detail_lines.append(status_detail)
+            # 厂商名放在最前面：详情里字段顺序与面板展示保持一致
+            detail_lines.insert(0, f"电池厂商: {manufacturer}" if manufacturer
+                                else f"电池厂商: 未读到 ({manufacturer_error})")
+            detail = "\n".join(detail_lines)
+
             result.set_passed(message, detail)
             logger.info(f"[{self.sn}] 电池检测通过: {message}")
             logger.info(f"[{self.sn}] 电池检测详情:\n{detail}")
 
-            # 电池检测通过后自动配置 shutdown 模式
-            self._configure_battery_shutdown_mode()
+            # 电池检测通过后按芯片配置决定是否配置 shutdown 模式
+            if self.chip_config.battery_shutdown_config:
+                self._configure_battery_shutdown_mode()
+            else:
+                logger.info(f"[{self.sn}] 芯片 {self.chip_config.chip_model} "
+                            f"不做 shutdown 模式配置，跳过解密/使能/休眠流程")
 
         except Exception as e:
             result.set_failed("电池检测异常", str(e))
@@ -1187,10 +1346,13 @@ class DeviceTester:
         2. 判定并配置 Auto Ship Bit 位（如未开启则开启）
         3. 判定并配置关机时间（如非 3 天则配置为 3 天）
         4. 上锁
+
+        总线号与 _read_battery_registers 取同一份芯片级配置，避免读写走不同总线。
+        仅当芯片配置 battery_shutdown_config 为 True 时由 test_battery 调用。
         """
-        bus = config.battery_i2c_bus
+        bus = self._battery_i2c_bus()
         addr = config.battery_i2c_addr
-        
+
         try:
             logger.info(f"[{self.sn}] 开始配置电池 shutdown 模式...")
             

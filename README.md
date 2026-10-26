@@ -34,6 +34,8 @@ doorCheck/
 ├── requirements.txt                # Python 依赖
 ├── config/
 │   ├── config.yaml                 # 门控、音箱配置及应用版本
+│   ├── printer/
+│   │   └── config.yaml             # 扫码打印工具配置
 │   └── master_control/
 │       ├── config.yaml             # 主控独立配置
 │       ├── blescan.sh              # 主控蓝牙检测脚本
@@ -47,6 +49,7 @@ doorCheck/
 │   ├── hardware/                   # 门控及音箱标签打印
 │   ├── data/                       # 门控及音箱数据存储代码
 │   ├── utils/                      # 配置、日志、路径、串口等工具
+│   ├── qrcode_print/               # 扫码打印独立模块（界面、模板、打印、配置及测试）
 │   └── master_control/             # 主控独立模块
 │       ├── bootstrap.py            # 崩溃捕获
 │       ├── gui/                    # 主控界面
@@ -72,7 +75,7 @@ doorCheck/
 
 ## 配置与数据
 
-门控、音箱使用 `config/config.yaml`；主控使用 `config/master_control/config.yaml`，支持配置热加载。各工具保持独立的业务模块、打印配置和数据库，字体与日志目录共用。
+门控、音箱使用 `config/config.yaml`；扫码打印使用 `config/printer/config.yaml`；主控使用 `config/master_control/config.yaml`，支持配置热加载。各工具保持独立的业务模块、打印配置和数据库，字体与日志目录共用。
 
 所有工具的应用版本号及打包版本统一在 `config/config.yaml` 的 `app.version` 中维护。
 

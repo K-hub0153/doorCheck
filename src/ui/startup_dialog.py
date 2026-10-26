@@ -7,6 +7,7 @@ import sys
 
 class StartupDialog(QDialog):
     """启动选择对话框"""
+
     def __init__(self):
         super().__init__()
         self.selected_mode = None
@@ -17,11 +18,12 @@ class StartupDialog(QDialog):
         if getattr(sys, 'frozen', False):
             return os.path.join(sys._MEIPASS, 'vdian.ico')
         else:
-            return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'src', 'ui', 'icon', 'vdian.ico')
+            return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'src', 'ui', 'icon',
+                                'vdian.ico')
 
     def init_ui(self):
         self.setWindowTitle('智能设备产测工具 - 选择模式')
-        self.setFixedSize(450, 450)
+        self.setFixedSize(550, 660)  # 增加高度以容纳5个按钮
 
         # 设置窗口图标
         icon_path = self._get_icon_path()
@@ -38,8 +40,8 @@ class StartupDialog(QDialog):
                 color: white;
                 border: none;
                 border-radius: 8px;
-                padding: 15px;
-                font-size: 14px;
+                padding: 20px;
+                font-size: 15px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -51,21 +53,21 @@ class StartupDialog(QDialog):
         """)
 
         layout = QVBoxLayout()
-        layout.setSpacing(12)  # 减小间距
-        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)  # 减小间距
+        layout.setContentsMargins(40, 40, 40, 40)  # 增加边距
 
         # 标题
         title = QLabel('智能设备产测工具')
-        title.setFont(QFont('Microsoft YaHei', 12, QFont.Bold))
+        title.setFont(QFont('Microsoft YaHei', 14, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet('color: #1976D2; margin-bottom: 10px;')
         layout.addWidget(title)
 
         # 副标题
         subtitle = QLabel('请选择产测工具类型')
-        subtitle.setFont(QFont('Microsoft YaHei', 8))
+        subtitle.setFont(QFont('Microsoft YaHei', 9))
         subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setStyleSheet('color: #757575; margin-bottom: 15px;')
+        subtitle.setStyleSheet('color: #757575; margin-bottom: 20px;')
         layout.addWidget(subtitle)
 
         # 主控按钮，与门控和音箱入口保持相同图标风格
@@ -79,7 +81,7 @@ class StartupDialog(QDialog):
         # 门控按钮
         door_btn = QPushButton('🚪  智能门控产测工具')
         door_btn.setFont(QFont('Microsoft YaHei', 13))
-        door_btn.setMinimumHeight(60)
+        door_btn.setMinimumHeight(70)
         door_btn.setCursor(Qt.PointingHandCursor)
         door_btn.clicked.connect(lambda: self.select_mode('door'))
         layout.addWidget(door_btn)
@@ -87,7 +89,7 @@ class StartupDialog(QDialog):
         # 室内音箱按钮
         indoor_speaker_btn = QPushButton('🏠  智能室内音箱产测工具')
         indoor_speaker_btn.setFont(QFont('Microsoft YaHei', 13))
-        indoor_speaker_btn.setMinimumHeight(60)
+        indoor_speaker_btn.setMinimumHeight(70)
         indoor_speaker_btn.setCursor(Qt.PointingHandCursor)
         indoor_speaker_btn.clicked.connect(lambda: self.select_mode('speaker_indoor'))
         layout.addWidget(indoor_speaker_btn)
@@ -95,10 +97,18 @@ class StartupDialog(QDialog):
         # 室外音箱按钮
         outdoor_speaker_btn = QPushButton('🌳  智能室外音箱产测工具')
         outdoor_speaker_btn.setFont(QFont('Microsoft YaHei', 13))
-        outdoor_speaker_btn.setMinimumHeight(60)
+        outdoor_speaker_btn.setMinimumHeight(70)
         outdoor_speaker_btn.setCursor(Qt.PointingHandCursor)
         outdoor_speaker_btn.clicked.connect(lambda: self.select_mode('speaker_outdoor'))
         layout.addWidget(outdoor_speaker_btn)
+
+        # 添加扫码打印按钮
+        qrcode_print_btn = QPushButton("📦 扫码打印工具")
+        qrcode_print_btn.setFont(QFont('Microsoft YaHei', 13))
+        qrcode_print_btn.setMinimumHeight(70)
+        qrcode_print_btn.setCursor(Qt.PointingHandCursor)
+        qrcode_print_btn.clicked.connect(lambda: self.select_mode('qrcode_print'))
+        layout.addWidget(qrcode_print_btn)
 
         self.setLayout(layout)
 

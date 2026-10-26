@@ -4,6 +4,8 @@ battery:
 chips:
   hisi:
     battery_detection: true
+    battery_i2c_bus: 2
+    battery_shutdown_config: false
     bt_detection: true
     chip_model: 310P
     description: 海思310P芯片 (hisi-xxxxx)
@@ -26,6 +28,7 @@ database:
   path: ./mc_checker.db
 network:
   mdns_service_type: _master._tcp.local.
+  poe_interface: eth1
   poe_subnet: 198.19.0.0/24
   scan_subnet: 192.168.1.0/24
 printer:
@@ -108,6 +111,9 @@ test:
   lte_signal_quality_threshold: 80
   timeout: 10
   wifi_signal_threshold: -40
+# 4G 模组：识别厂商 + 按厂商读取信号（判定标准统一，见 src/master_control/core/lte_signal.py）
+# 留空 lte 节点即使用内置模组表（移远 AT+QENG / 龙尚 AT+CPSI）
+lte: {}
 upload:
   retry_delay: 2.0
   retry_times: 2

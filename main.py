@@ -6,7 +6,9 @@ from PyQt5.QtGui import QIcon
 from src.ui.startup_dialog import StartupDialog
 from src.ui.main_window import MainWindow
 from src.ui.speaker_test_window import SpeakerTestWindow
+from src.qrcode_print.qrcode_print_window import QRCodePrintWindow
 from src.utils.logger import logger
+from src.qrcode_print.config import QRCodePrintConfig
 
 
 def get_icon_path():
@@ -75,6 +77,10 @@ def main():
         elif mode == 'speaker_outdoor':
             logger.info("启动智能室外音箱产测工具")
             window = SpeakerTestWindow(speaker_type='outdoor')
+        elif mode == 'qrcode_print':
+            logger.info("启动扫码打印工具")
+            config = QRCodePrintConfig()
+            window = QRCodePrintWindow(config)
         else:
             logger.error(f"未知模式: {mode}")
             sys.exit(1)

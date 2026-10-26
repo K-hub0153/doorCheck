@@ -1,14 +1,14 @@
 PyQt5>=5.15.0
 paho-mqtt>=1.6.0
-amqtt>=0.11.0
+amqtt>=0.10.1
 zeroconf>=0.131.0
 requests>=2.32.0
-PyYAML>=6.0
+PyYAML>=5.4.0,<6.0
 Flask>=3.0.0
-Pillow>=11.0.0
+Pillow>=10.0.0
 qrcode>=7.0
 reportlab>=4.0.0
-imageio-ffmpeg>=0.6.0
+imageio-ffmpeg>=0.4.0
 pyserial>=3.5
 pywin32>=306; sys_platform == "win32"
 pycryptodome>=3.20.0

@@ -183,6 +183,15 @@ class BuildScript:
         else:
             self.print_success("配置文件: config/config.yaml")
 
+        qrcode_config = self.project_root / "config" / "printer" / "config.yaml"
+        if not qrcode_config.is_file():
+            self.print_error(f"扫码打印配置文件不存在: {qrcode_config}")
+            all_exist = False
+        qrcode_background = self.project_root / "config" / "printer" / "10.1POS sn码.png"
+        if not qrcode_background.is_file():
+            self.print_error(f"扫码打印底图不存在: {qrcode_background}")
+            all_exist = False
+
         # 主控配置和远端检测脚本随统一 config 目录发布
         for name in ("config.yaml", "blescan.sh", "slescan.sh"):
             resource = self.project_root / "config" / "master_control" / name
@@ -299,6 +308,7 @@ class BuildScript:
                 shutil.rmtree(dst_path)
 
             shutil.copytree(src_path, dst_path)
+
             # 使用字节读写，避免 Windows 文本模式重新引入 CRLF。
             for script_path in dst_path.rglob("*.sh"):
                 if not script_path.is_file():

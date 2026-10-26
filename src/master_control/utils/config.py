@@ -127,7 +127,17 @@ class Config:
 
     @property
     def poe_subnet(self):
+        """POE 网段兜底值
+
+        POE 检测优先在设备上自动识别 POE 网口（默认 eth1）的地址，
+        只有识别不到时才用这个值。
+        """
         return self.get('network.poe_subnet', '198.19.0.0/24')
+
+    @property
+    def poe_interface(self):
+        """POE 设备接在设备的哪个网口上（310P / RK3576 都是 eth1）"""
+        return str(self.get('network.poe_interface', 'eth1') or 'eth1')
 
     @property
     def scan_subnet(self):

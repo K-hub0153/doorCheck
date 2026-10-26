@@ -21,6 +21,12 @@ class ChipConfig:
     nearlink_detection: bool  # 是否执行星闪检测（False表示默认通过）
     description: str        # 描述信息
     battery_detection: bool = True  # 是否执行电池检测（False表示默认通过）
+    # 电池电量计挂在哪条 I2C 总线上。各芯片主板走线不同（RK3576 是 i2c-0，
+    # 海思310P 是 i2c-2），None 表示沿用全局 battery.i2c_bus。
+    battery_i2c_bus: Optional[int] = None
+    # 电池检测通过后是否继续执行 shutdown 模式配置（解密 → Auto Ship Bit → 关机时间 → 上锁）。
+    # 该流程只针对 RK3576 电量计，海思310P 电量计不支持，需设为 False 跳过。
+    battery_shutdown_config: bool = True
 
 
 class ChipManager:
@@ -49,7 +55,9 @@ class ChipManager:
                 bt_detection=chip_data.get('bt_detection', True),
                 nearlink_detection=chip_data.get('nearlink_detection', True),
                 description=chip_data.get('description', f'{chip_type}芯片'),
-                battery_detection=chip_data.get('battery_detection', True)
+                battery_detection=chip_data.get('battery_detection', True),
+                battery_i2c_bus=chip_data.get('battery_i2c_bus'),
+                battery_shutdown_config=chip_data.get('battery_shutdown_config', True)
             )
         
         # 兜底配置
@@ -63,7 +71,9 @@ class ChipManager:
                 wifi_detection=True,
                 bt_detection=True,
                 nearlink_detection=True,
-                description='海思310P芯片（默认配置）'
+                description='海思310P芯片（默认配置）',
+                battery_i2c_bus=2,
+                battery_shutdown_config=False
             )
         
         cls._chip_configs_cache = configs
