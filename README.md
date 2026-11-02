@@ -79,11 +79,18 @@ doorCheck/
 
 所有工具的应用版本号及打包版本统一在 `config/config.yaml` 的 `app.version` 中维护。
 
+## 音箱设备序列号比对
+
+从模式选择页打开“音箱设备序列号比对工具”。工具仅在自动识别的物理以太网接口监听音箱 mDNS，并复用产测的 `DeviceDiscoveryListener` 读取广播中的设备 SN、类型和 IP；Wi-Fi、VPN 等其他接口不会参与发现。发现多台音箱时停止比对，避免串台。扫描机身 SN 和彩盒贴纸 SN 后，只有两者与设备 SN 去除首尾空白后完全一致才 PASS。
+
+Windows 直连时，用户确认后工具只对唯一一块已连接物理以太网配置临时 DHCP：仅接受该接口的 DHCP 请求，使用 `172.31.250.1/24` 给音箱分配 `172.31.250.100` 起的地址，并限制 DHCP/mDNS 入站防火墙规则到该网卡。要求 RJ45 网卡原先为 DHCP 自动获取地址、没有网关、没有现有 IPv4；已配置静态地址或检测到网段冲突时拒绝改动。程序需以管理员身份运行；退出时停止 DHCP、删除本工具添加的地址和规则、恢复网卡 DHCP，意外退出时下次启动尝试恢复。请只直连一台音箱，不要连接交换机或办公网络。
+
 打包后，运行数据位于程序旁；macOS 的 `.app` 与同目录可执行文件共用外置配置和 `logs/`。沿用旧主控历史记录时，关闭程序后将 `mc_checker.db` 复制到 `logs/mc_checker.db`。主控离线 MAC 池使用 `logs/mac_pool.csv`，与门控、音箱的池文件分开。
 
 ## 离线验证
 
 ```bash
+python tools/test_speaker_sn_compare.py
 python tools/master_control/smoke_clear_and_version.py
 python tools/master_control/smoke_scan_entry.py
 ```
