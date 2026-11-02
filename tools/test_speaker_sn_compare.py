@@ -131,6 +131,20 @@ class SpeakerSNCompareTests(unittest.TestCase):
         self.assertNotIn(3, parse_dhcp_options(first))
         self.assertNotIn(6, parse_dhcp_options(first))
 
+    def test_dhcp_acknowledges_client_lease_after_server_restarts(self):
+        mac = b'\x02\x00\x00\x00\x00\x01'
+        old_pool = DhcpLeasePool()
+        old_offer = old_pool.handle(dhcp_request(mac=mac))
+        retained_address = old_offer[16:20]
+
+        restarted_pool = DhcpLeasePool()
+        request = dhcp_request(3, mac=mac, extra=b'\x32\x04' + retained_address)
+        ack = restarted_pool.handle(request)
+
+        self.assertEqual(5, parse_dhcp_options(ack)[53][0])
+        self.assertEqual(retained_address, ack[16:20])
+        self.assertIn(mac, restarted_pool.leases)
+
     def test_dhcp_rejects_malformed_packet_and_relay(self):
         pool = DhcpLeasePool()
         self.assertIsNone(pool.handle(b'bad'))

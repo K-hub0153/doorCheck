@@ -124,9 +124,9 @@ class DhcpLeasePool:
         in_pool = assigned_ip in {str(self.network[offset]) for offset in range(100, 201)}
         occupied = any(other_mac != mac and value[0] == assigned_ip
                        for other_mac, value in self.leases.items())
-        if lease is None or not in_pool or occupied or assigned_ip in self.declined:
+        if not in_pool or occupied or assigned_ip in self.declined:
             return self._build_reply(packet, '0.0.0.0', 6)
-        if lease[0] != assigned_ip:
+        if lease is not None and lease[0] != assigned_ip:
             return self._build_reply(packet, '0.0.0.0', 6)
         self.leases[mac] = (assigned_ip, self.clock() + LEASE_SECONDS)
         return self._build_reply(packet, assigned_ip, 5)
