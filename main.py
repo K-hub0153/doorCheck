@@ -77,6 +77,11 @@ def main():
         elif mode == 'speaker_outdoor':
             logger.info("启动智能室外音箱产测工具")
             window = SpeakerTestWindow(speaker_type='outdoor')
+        elif mode == 'speaker_sn_compare':
+            from src.ui.speaker_sn_compare_window import SpeakerSnCompareWindow
+
+            logger.info("启动音箱设备序列号比对工具")
+            window = SpeakerSnCompareWindow()
         elif mode == 'qrcode_print':
             logger.info("启动扫码打印工具")
             config = QRCodePrintConfig()

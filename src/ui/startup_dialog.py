@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QPushButton, QLabel
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGridLayout, QPushButton, QLabel
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QIcon
 import os
@@ -23,7 +23,7 @@ class StartupDialog(QDialog):
 
     def init_ui(self):
         self.setWindowTitle('智能设备产测工具 - 选择模式')
-        self.setFixedSize(550, 660)  # 增加高度以容纳5个按钮
+        self.setFixedSize(700, 560)
 
         # 设置窗口图标
         icon_path = self._get_icon_path()
@@ -53,8 +53,8 @@ class StartupDialog(QDialog):
         """)
 
         layout = QVBoxLayout()
-        layout.setSpacing(20)  # 减小间距
-        layout.setContentsMargins(40, 40, 40, 40)  # 增加边距
+        layout.setSpacing(20)
+        layout.setContentsMargins(36, 32, 36, 32)
 
         # 标题
         title = QLabel('智能设备产测工具')
@@ -70,45 +70,25 @@ class StartupDialog(QDialog):
         subtitle.setStyleSheet('color: #757575; margin-bottom: 20px;')
         layout.addWidget(subtitle)
 
-        # 主控按钮，与门控和音箱入口保持相同图标风格
-        master_btn = QPushButton('🖥️  主控设备产测工具')
-        master_btn.setFont(QFont('Microsoft YaHei', 13))
-        master_btn.setMinimumHeight(60)
-        master_btn.setCursor(Qt.PointingHandCursor)
-        master_btn.clicked.connect(lambda: self.select_mode('master_control'))
-        layout.addWidget(master_btn)
-
-        # 门控按钮
-        door_btn = QPushButton('🚪  智能门控产测工具')
-        door_btn.setFont(QFont('Microsoft YaHei', 13))
-        door_btn.setMinimumHeight(70)
-        door_btn.setCursor(Qt.PointingHandCursor)
-        door_btn.clicked.connect(lambda: self.select_mode('door'))
-        layout.addWidget(door_btn)
-
-        # 室内音箱按钮
-        indoor_speaker_btn = QPushButton('🏠  智能室内音箱产测工具')
-        indoor_speaker_btn.setFont(QFont('Microsoft YaHei', 13))
-        indoor_speaker_btn.setMinimumHeight(70)
-        indoor_speaker_btn.setCursor(Qt.PointingHandCursor)
-        indoor_speaker_btn.clicked.connect(lambda: self.select_mode('speaker_indoor'))
-        layout.addWidget(indoor_speaker_btn)
-
-        # 室外音箱按钮
-        outdoor_speaker_btn = QPushButton('🌳  智能室外音箱产测工具')
-        outdoor_speaker_btn.setFont(QFont('Microsoft YaHei', 13))
-        outdoor_speaker_btn.setMinimumHeight(70)
-        outdoor_speaker_btn.setCursor(Qt.PointingHandCursor)
-        outdoor_speaker_btn.clicked.connect(lambda: self.select_mode('speaker_outdoor'))
-        layout.addWidget(outdoor_speaker_btn)
-
-        # 添加扫码打印按钮
-        qrcode_print_btn = QPushButton("📦 扫码打印工具")
-        qrcode_print_btn.setFont(QFont('Microsoft YaHei', 13))
-        qrcode_print_btn.setMinimumHeight(70)
-        qrcode_print_btn.setCursor(Qt.PointingHandCursor)
-        qrcode_print_btn.clicked.connect(lambda: self.select_mode('qrcode_print'))
-        layout.addWidget(qrcode_print_btn)
+        tools_grid = QGridLayout()
+        tools_grid.setHorizontalSpacing(16)
+        tools_grid.setVerticalSpacing(16)
+        tools = [
+            ('🖥️  主控设备产测工具', 'master_control'),
+            ('🚪  智能门控产测工具', 'door'),
+            ('🏠  智能室内音箱产测工具', 'speaker_indoor'),
+            ('🌳  智能室外音箱产测工具', 'speaker_outdoor'),
+            ('📦  扫码打印工具', 'qrcode_print'),
+            ('🔎  音箱设备序列号比对工具', 'speaker_sn_compare'),
+        ]
+        for index, (text, mode) in enumerate(tools):
+            button = QPushButton(text)
+            button.setFont(QFont('Microsoft YaHei', 12))
+            button.setMinimumHeight(92)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda checked=False, selected_mode=mode: self.select_mode(selected_mode))
+            tools_grid.addWidget(button, index // 2, index % 2)
+        layout.addLayout(tools_grid)
 
         self.setLayout(layout)
 
