@@ -199,6 +199,69 @@ class DeviceDiscoveryListener(ServiceListener):
             logger.error(f"处理设备信息失败: {e}", exc_info=True)
 
 
+class SpeakerDiscovery:
+    """音箱工具共用的 mDNS 发现生命周期。"""
+
+    DEBUG_SERVICE_TYPES = (
+        "_http._tcp.local.",
+        "_https._tcp.local.",
+        "_mqtt._tcp.local.",
+        "_ssh._tcp.local.",
+        "_device-info._tcp.local.",
+        "_workstation._tcp.local.",
+    )
+
+    def __init__(self, service_type: str, http_port: int, on_device_found, on_device_removed,
+                 device_types: List[str]):
+        self.zeroconf = None
+        self.browser = None
+        self.listener = None
+        self.master_mdns = None
+        self.debug_browsers = []
+        try:
+            logger.info("初始化共用音箱 mDNS 发现服务")
+            self.zeroconf = Zeroconf()
+            self.master_mdns = MasterMdnsService(self.zeroconf, port=http_port)
+            self.master_mdns.register()
+            self.listener = DeviceDiscoveryListener(
+                on_device_found=on_device_found,
+                on_device_removed=on_device_removed,
+                device_types=device_types,
+            )
+            self.browser = ServiceBrowser(self.zeroconf, service_type, self.listener)
+            debug_listener = DebugServiceListener()
+            for debug_type in self.DEBUG_SERVICE_TYPES:
+                try:
+                    self.debug_browsers.append(ServiceBrowser(self.zeroconf, debug_type, debug_listener))
+                except Exception as exc:
+                    logger.warning(f"mDNS调试监听启动失败 {debug_type}: {exc}")
+            logger.info(f"共用音箱 mDNS 发现已启动 (服务类型: {service_type}, 设备类型: {device_types})")
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        for browser in [self.browser, *self.debug_browsers]:
+            if browser:
+                try:
+                    browser.cancel()
+                except Exception as exc:
+                    logger.warning(f"停止 mDNS ServiceBrowser 失败: {exc}")
+        self.debug_browsers.clear()
+        if self.master_mdns:
+            try:
+                self.master_mdns.unregister()
+            except Exception as exc:
+                logger.warning(f"注销主控 mDNS 服务失败: {exc}")
+            self.master_mdns = None
+        if self.zeroconf:
+            try:
+                self.zeroconf.close()
+            except Exception as exc:
+                logger.warning(f"关闭 Zeroconf 失败: {exc}")
+            self.zeroconf = None
+
+
 class MasterMdnsService:
     """主控mDNS服务（用于注册本机为主控设备）"""
 

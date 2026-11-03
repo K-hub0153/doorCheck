@@ -11,11 +11,10 @@ from PyQt5.QtGui import QFont, QColor, QPixmap, QImage, QPalette, QLinearGradien
 import threading
 import time
 import subprocess
-from zeroconf import Zeroconf, ServiceBrowser
 import imageio_ffmpeg
 
 from ..network.device_info import DeviceInfo, DEVICE_TYPE_SMART_HORN, DEVICE_TYPE_OUTDOOR_SMART_HORN
-from ..network.mdns_discovery import DeviceDiscoveryListener, MasterMdnsService, DebugServiceListener
+from ..network.mdns_discovery import SpeakerDiscovery
 from ..network.ip_scanner import IPScanner
 from ..network.speaker_http_client import SpeakerHTTPClient
 from ..core.speaker_test_engine import SpeakerTestEngine
@@ -2381,6 +2380,7 @@ class SpeakerTestWindow(QMainWindow):
         self.browser = None
         self.listener = None
         self.master_mdns = None
+        self.discovery_service = None
         self.config_server = None
         self.http_thread = None
         self.mqtt_broker = None
@@ -3277,48 +3277,19 @@ class SpeakerTestWindow(QMainWindow):
     def start_device_discovery(self):
         logger.info("启动设备发现...")
         try:
-            logger.info("初始化 Zeroconf...")
-            self.zeroconf = Zeroconf()
-            
-            # 尝试获取网络接口信息（兼容不同版本的zeroconf）
-            try:
-                if hasattr(self.zeroconf, 'interfaces'):
-                    logger.info(f"Zeroconf 初始化成功，接口: {self.zeroconf.interfaces}")
-                else:
-                    logger.info("Zeroconf 初始化成功")
-            except Exception as e:
-                logger.debug(f"获取Zeroconf接口信息失败: {e}")
-            
-            self.master_mdns = MasterMdnsService(self.zeroconf, port=self.config.http_port)
-            self.master_mdns.register()
-            
-            logger.info(f"开始监听 mDNS 服务类型: {self.config.mdns_service_type}")
-            # 只接受当前产测模式对应的音箱类型
-            self.listener = DeviceDiscoveryListener(
+            self.discovery_service = SpeakerDiscovery(
+                service_type=self.config.mdns_service_type,
+                http_port=self.config.http_port,
                 on_device_found=self.on_device_found,
                 on_device_removed=self.on_device_removed,
                 device_types=[self.speaker_device_type]
             )
-            self.browser = ServiceBrowser(self.zeroconf, self.config.mdns_service_type, self.listener)
+            self.zeroconf = self.discovery_service.zeroconf
+            self.browser = self.discovery_service.browser
+            self.listener = self.discovery_service.listener
+            self.master_mdns = self.discovery_service.master_mdns
             logger.info(f"mDNS设备发现服务已启动 (监听类型: {self.config.mdns_service_type}, 设备类型: {self.speaker_device_type})")
             
-            debug_listener = DebugServiceListener()
-            common_service_types = [
-                "_http._tcp.local.",
-                "_https._tcp.local.",
-                "_mqtt._tcp.local.",
-                "_ssh._tcp.local.",
-                "_device-info._tcp.local.",
-                "_workstation._tcp.local.",
-            ]
-            
-            logger.info("启动mDNS调试监听器，扫描常见服务类型...")
-            for service_type in common_service_types:
-                try:
-                    ServiceBrowser(self.zeroconf, service_type, debug_listener)
-                    logger.debug(f"  监听服务类型: {service_type}")
-                except Exception as e:
-                    logger.warning(f"  监听服务类型失败 {service_type}: {e}")
             
             # IP扫描已禁用，只使用mDNS发现（参考旧项目设计）
             # self.ip_scanner = IPScanner(self.on_device_found)
@@ -4343,23 +4314,29 @@ class SpeakerTestWindow(QMainWindow):
 
         # 4. 停止mDNS服务发现（关键：按正确顺序清理）
         try:
+            if getattr(self, 'discovery_service', None):
+                self.discovery_service.close()
+                self.discovery_service = None
+                self.zeroconf = self.browser = self.listener = self.master_mdns = None
+                logger.info("共用 mDNS 发现服务已停止")
+            else:
             # 先停止 ServiceBrowser
-            if hasattr(self, 'browser') and self.browser:
-                self.browser.cancel()
-                logger.info("mDNS ServiceBrowser 已停止")
-                time.sleep(0.2)  # 给 ServiceBrowser 时间完成清理
+                if hasattr(self, 'browser') and self.browser:
+                    self.browser.cancel()
+                    logger.info("mDNS ServiceBrowser 已停止")
+                    time.sleep(0.2)
 
             # 再注销 mDNS 服务
-            if hasattr(self, 'master_mdns') and self.master_mdns:
-                self.master_mdns.unregister()
-                logger.info("mDNS 服务已注销")
-                time.sleep(0.2)  # 给注销操作时间完成
+                if hasattr(self, 'master_mdns') and self.master_mdns:
+                    self.master_mdns.unregister()
+                    logger.info("mDNS 服务已注销")
+                    time.sleep(0.2)
 
             # 最后关闭 Zeroconf
-            if hasattr(self, 'zeroconf') and self.zeroconf:
-                self.zeroconf.close()
-                logger.info("Zeroconf 已关闭")
-                time.sleep(0.3)  # 确保UDP端口完全释放
+                if hasattr(self, 'zeroconf') and self.zeroconf:
+                    self.zeroconf.close()
+                    logger.info("Zeroconf 已关闭")
+                    time.sleep(0.3)
         except Exception as e:
             logger.error(f"清理Zeroconf资源失败: {e}")
 

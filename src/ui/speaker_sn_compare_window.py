@@ -11,10 +11,10 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from zeroconf import ServiceBrowser, Zeroconf
-
 from ..network.device_info import DEVICE_TYPE_OUTDOOR_SMART_HORN, DEVICE_TYPE_SMART_HORN, DeviceInfo
-from ..network.mdns_discovery import DeviceDiscoveryListener, MasterMdnsService
+from ..network.http_server import ConfigServer
+from ..network.mdns_discovery import SpeakerDiscovery
+from ..network.mqtt_broker import MQTTBrokerManager
 from ..utils.config import Config
 from ..utils.logger import logger
 
@@ -27,10 +27,9 @@ class SpeakerSnCompareWindow(QMainWindow):
         super().__init__()
         self.config = Config()
         self.devices = {}
-        self.zeroconf = None
-        self.browser = None
-        self.listener = None
-        self.master_mdns = None
+        self.discovery_service = None
+        self.config_server = None
+        self.mqtt_broker = None
         self._selected_sn = None
         self._confirmed_scans = {}
         self._closing = False
@@ -97,15 +96,27 @@ class SpeakerSnCompareWindow(QMainWindow):
 
     def _start_discovery(self):
         try:
-            self.zeroconf = Zeroconf()
-            self.master_mdns = MasterMdnsService(self.zeroconf, port=self.config.http_port)
-            self.master_mdns.register()
-            self.listener = DeviceDiscoveryListener(
+            if self.config.broker_mode == 'local':
+                self.mqtt_broker = MQTTBrokerManager(
+                    host='0.0.0.0', port=self.config.mqtt_port, ssl_enabled=True,
+                )
+                self.mqtt_broker.start()
+            self.config_server = ConfigServer(
+                host='0.0.0.0',
+                port=self.config.http_port,
+                mqtt_broker=self.config.mqtt_broker,
+                mqtt_port=self.config.mqtt_port,
+                secret_key=self.config.device_psk,
+                broker_mode=self.config.broker_mode,
+            )
+            self.config_server.start()
+            self.discovery_service = SpeakerDiscovery(
+                service_type=self.config.mdns_service_type,
+                http_port=self.config.http_port,
                 on_device_found=lambda device: self.device_found_signal.emit(device),
                 on_device_removed=lambda sn: self.device_removed_signal.emit(sn),
                 device_types=[DEVICE_TYPE_SMART_HORN, DEVICE_TYPE_OUTDOOR_SMART_HORN],
             )
-            self.browser = ServiceBrowser(self.zeroconf, self.config.mdns_service_type, self.listener)
         except Exception as exc:
             logger.error(f'音箱设备发现启动失败: {exc}', exc_info=True)
             QMessageBox.warning(self, '设备发现失败', f'无法启动音箱设备发现：{exc}')
@@ -183,13 +194,14 @@ class SpeakerSnCompareWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
-        try:
-            if self.browser:
-                self.browser.cancel()
-            if self.master_mdns:
-                self.master_mdns.unregister()
-            if self.zeroconf:
-                self.zeroconf.close()
-        except Exception as exc:
-            logger.warning(f'关闭音箱发现服务失败: {exc}')
+        for service, method in (
+            (self.discovery_service, 'close'),
+            (self.config_server, 'stop'),
+            (self.mqtt_broker, 'stop'),
+        ):
+            if service:
+                try:
+                    getattr(service, method)()
+                except Exception as exc:
+                    logger.warning(f'关闭音箱接入服务失败: {exc}')
         event.accept()
