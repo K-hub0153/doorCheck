@@ -19,6 +19,56 @@ from ..utils.config import Config
 from ..utils.logger import logger
 
 
+class ScannerInputLineEdit(QLineEdit):
+    _unshifted_punctuation = {
+        Qt.Key_Minus: '-',
+        Qt.Key_Equal: '=',
+        Qt.Key_BracketLeft: '[',
+        Qt.Key_BracketRight: ']',
+        Qt.Key_Backslash: '\\',
+        Qt.Key_Semicolon: ';',
+        Qt.Key_Apostrophe: "'",
+        Qt.Key_Comma: ',',
+        Qt.Key_Period: '.',
+        Qt.Key_Slash: '/',
+        Qt.Key_QuoteLeft: '`',
+    }
+    _shifted_punctuation = {
+        Qt.Key_Minus: '_',
+        Qt.Key_Equal: '+',
+        Qt.Key_BracketLeft: '{',
+        Qt.Key_BracketRight: '}',
+        Qt.Key_Backslash: '|',
+        Qt.Key_Semicolon: ':',
+        Qt.Key_Apostrophe: '"',
+        Qt.Key_Comma: '<',
+        Qt.Key_Period: '>',
+        Qt.Key_Slash: '?',
+        Qt.Key_QuoteLeft: '~',
+    }
+    _shifted_digits = ')!@#$%^&*('
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        shifted = bool(event.modifiers() & Qt.ShiftModifier)
+        char = None
+
+        if Qt.Key_A <= key <= Qt.Key_Z:
+            char = chr(key if shifted else key + (ord('a') - ord('A')))
+        elif Qt.Key_0 <= key <= Qt.Key_9:
+            digit = key - Qt.Key_0
+            char = self._shifted_digits[digit] if shifted else str(digit)
+        elif key in self._unshifted_punctuation:
+            char = (self._shifted_punctuation if shifted else self._unshifted_punctuation)[key]
+
+        if char is not None:
+            self.insert(char)
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+
 class SpeakerSnCompareWindow(QMainWindow):
     device_found_signal = pyqtSignal(object)
     device_removed_signal = pyqtSignal(str)
@@ -66,7 +116,7 @@ class SpeakerSnCompareWindow(QMainWindow):
         self.device_sn_label = QLabel('等待发现设备')
         self.device_sn_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         form.addRow('设备序列号 SN：', self.device_sn_label)
-        self.body_sn_input = QLineEdit()
+        self.body_sn_input = ScannerInputLineEdit()
         self.body_sn_input.setFocusPolicy(Qt.StrongFocus)
         self.body_sn_input.setInputMethodHints(Qt.ImhLatinOnly | Qt.ImhNoPredictiveText)
         self.body_sn_input.setAttribute(Qt.WA_InputMethodEnabled, False)
@@ -75,7 +125,7 @@ class SpeakerSnCompareWindow(QMainWindow):
         self.body_sn_input.textChanged.connect(lambda: self._scan_edited(self.body_sn_input))
         self.body_sn_input.returnPressed.connect(lambda: self._accept_scan(self.body_sn_input))
         form.addRow('机身 SN：', self.body_sn_input)
-        self.box_sn_input = QLineEdit()
+        self.box_sn_input = ScannerInputLineEdit()
         self.box_sn_input.setFocusPolicy(Qt.StrongFocus)
         self.box_sn_input.setInputMethodHints(Qt.ImhLatinOnly | Qt.ImhNoPredictiveText)
         self.box_sn_input.setAttribute(Qt.WA_InputMethodEnabled, False)
