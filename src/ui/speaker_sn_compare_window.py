@@ -1,4 +1,4 @@
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QComboBox,
@@ -67,12 +67,14 @@ class SpeakerSnCompareWindow(QMainWindow):
         self.device_sn_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         form.addRow('设备序列号 SN：', self.device_sn_label)
         self.body_sn_input = QLineEdit()
+        self.body_sn_input.setFocusPolicy(Qt.StrongFocus)
         self.body_sn_input.setPlaceholderText('请扫描音箱机身 SN，扫码后按回车')
         self.body_sn_input.setClearButtonEnabled(True)
         self.body_sn_input.textChanged.connect(lambda: self._scan_edited(self.body_sn_input))
         self.body_sn_input.returnPressed.connect(lambda: self._accept_scan(self.body_sn_input))
         form.addRow('机身 SN：', self.body_sn_input)
         self.box_sn_input = QLineEdit()
+        self.box_sn_input.setFocusPolicy(Qt.StrongFocus)
         self.box_sn_input.setPlaceholderText('请扫描彩盒贴纸 SN，扫码后按回车')
         self.box_sn_input.setClearButtonEnabled(True)
         self.box_sn_input.textChanged.connect(lambda: self._scan_edited(self.box_sn_input))
@@ -157,6 +159,8 @@ class SpeakerSnCompareWindow(QMainWindow):
         if selected_sn != self._selected_sn:
             self._selected_sn = selected_sn
             self._reset_scans()
+            if device:
+                QTimer.singleShot(0, self.body_sn_input.setFocus)
         self._evaluate()
 
     def _scan_edited(self, field):
@@ -171,6 +175,11 @@ class SpeakerSnCompareWindow(QMainWindow):
             if field is self.body_sn_input:
                 self.box_sn_input.setFocus()
                 self.box_sn_input.selectAll()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.device_combo.currentData():
+            QTimer.singleShot(0, self.body_sn_input.setFocus)
 
     def _evaluate(self):
         device = self.device_combo.currentData()
@@ -190,7 +199,8 @@ class SpeakerSnCompareWindow(QMainWindow):
         self.body_sn_input.clear()
         self.box_sn_input.clear()
         self._evaluate()
-        self.body_sn_input.setFocus()
+        if self.body_sn_input.isEnabled() and self.isVisible():
+            QTimer.singleShot(0, self.body_sn_input.setFocus)
 
     def closeEvent(self, event):
         self._closing = True
