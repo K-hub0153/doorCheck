@@ -1,3 +1,7 @@
+import socket
+import threading
+
+import requests
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
@@ -72,11 +76,14 @@ class ScannerInputLineEdit(QLineEdit):
 class SpeakerSnCompareWindow(QMainWindow):
     device_found_signal = pyqtSignal(object)
     device_removed_signal = pyqtSignal(str)
+    heartbeat_result_signal = pyqtSignal(str, str, bool)
 
     def __init__(self):
         super().__init__()
         self.config = Config()
         self.devices = {}
+        self._heartbeat_failures = {}
+        self._heartbeat_running = False
         self.discovery_service = None
         self.config_server = None
         self.mqtt_broker = None
@@ -85,8 +92,12 @@ class SpeakerSnCompareWindow(QMainWindow):
         self._closing = False
         self.device_found_signal.connect(self._add_device)
         self.device_removed_signal.connect(self._remove_device)
+        self.heartbeat_result_signal.connect(self._apply_heartbeat_result)
         self._init_ui()
         self._start_discovery()
+        self.heartbeat_timer = QTimer(self)
+        self.heartbeat_timer.timeout.connect(self._check_devices)
+        self.heartbeat_timer.start(5000)
 
     def _init_ui(self):
         self.setWindowTitle('音箱设备序列号比对工具')
@@ -181,13 +192,54 @@ class SpeakerSnCompareWindow(QMainWindow):
         if self._closing:
             return
         self.devices[device.sn] = device
+        self._heartbeat_failures.pop(device.sn, None)
         self._refresh_device_list()
 
     def _remove_device(self, sn):
         if self._closing:
             return
         self.devices.pop(sn, None)
+        self._heartbeat_failures.pop(sn, None)
         self._refresh_device_list()
+
+    def _check_devices(self):
+        if self._closing or self._heartbeat_running or not self.devices:
+            return
+        self._heartbeat_running = True
+        devices = [(device.sn, device.ip) for device in self.devices.values()]
+        threading.Thread(target=self._probe_devices, args=(devices,), daemon=True).start()
+
+    def _probe_devices(self, devices):
+        try:
+            for sn, ip in devices:
+                online = False
+                try:
+                    response = requests.get(f'http://{ip}:8080/hi', timeout=1)
+                    online = 200 <= response.status_code < 400
+                except requests.exceptions.RequestException:
+                    try:
+                        with socket.create_connection((ip, 8080), timeout=1):
+                            online = True
+                    except OSError:
+                        pass
+                self.heartbeat_result_signal.emit(sn, ip, online)
+        finally:
+            self._heartbeat_running = False
+
+    def _apply_heartbeat_result(self, sn, ip, online):
+        device = self.devices.get(sn)
+        if self._closing or not device or device.ip != ip:
+            return
+        if online:
+            self._heartbeat_failures.pop(sn, None)
+            return
+        failures = self._heartbeat_failures.get(sn, 0) + 1
+        self._heartbeat_failures[sn] = failures
+        if failures >= 2:
+            logger.info(f'音箱 {sn} 连续两轮心跳失败，从比对工具设备列表移除')
+            self.devices.pop(sn, None)
+            self._heartbeat_failures.pop(sn, None)
+            self._refresh_device_list()
 
     def _refresh_device_list(self):
         selected = self.device_combo.currentData()
@@ -258,6 +310,8 @@ class SpeakerSnCompareWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
+        if hasattr(self, 'heartbeat_timer'):
+            self.heartbeat_timer.stop()
         for service, method in (
             (self.discovery_service, 'close'),
             (self.config_server, 'stop'),
