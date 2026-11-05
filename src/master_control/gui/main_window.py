@@ -149,6 +149,7 @@ class TestWorker(QThread):
         try:
             methods = {
                 "poe": "test_poe_ports",
+                "usb": "test_usb3",
                 "disk": "test_disk",
                 "fan": "test_fan",
                 "lte_4g": "test_4g",
@@ -262,6 +263,7 @@ class AutoTestWorker(QThread):
             ("hdmi", "test_hdmi"),
             ("lte_4g", "test_4g"),
             ("battery", "test_battery"),
+            ("usb", "test_usb3"),
             ("poe", "test_poe_ports")
         ])
 
@@ -607,11 +609,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"连接失败: {sn}", 3000)
 
     def _get_required_tests(self, tester) -> list:
-        """根据芯片能力返回必须全部通过的检测项列表"""
-        required = ['poe', 'disk', 'fan', 'lte_4g', 'battery', 'wifi', 'bluetooth', 'nearlink', 'mac_write']
+        """根据芯片能力返回必须全部通过的检测项列表
+
+        顺序与面板上的检测项顺序一致，便于「未通过项」提示按界面顺序列出。
+        """
+        required = ['usb', 'poe', 'disk', 'fan', 'lte_4g', 'battery',
+                    'wifi', 'bluetooth', 'nearlink', 'mac_write']
         try:
             if tester and tester.chip_config.has_hdmi:
-                required.insert(3, 'hdmi')
+                required.insert(required.index('fan') + 1, 'hdmi')
         except Exception as e:
             logger.warning(f"获取芯片配置失败，使用默认检测项列表: {e}")
         return required
@@ -873,10 +879,11 @@ class MainWindow(QMainWindow):
                     model=device_info['model'],
                     port=device_info['port'],
                     disk_model=device_info.get('disk_model', ''),
-                    disk_size=device_info.get('disk_size', '')
+                    disk_size=device_info.get('disk_size', ''),
+                    disk_missing=device_info.get('disk_missing', False)
                 )
                 self.discovery.add_device(device)
-    
+
     def _on_os_version_received(self, sn: str, version: str):
         """OS版本获取完成，更新对应面板"""
         panel = self.device_panels.get(sn)
@@ -893,6 +900,7 @@ class MainWindow(QMainWindow):
 
         type_map = {
             'POE': 'poe',
+            'USB': 'usb',
             'DISK': 'disk',
             '4G': 'lte_4g',
             'WIFI': 'wifi',
@@ -1023,6 +1031,7 @@ class MainWindow(QMainWindow):
 
         sub_type_map = {
             'poe': 'POE',
+            'usb': 'USB',
             'disk': 'DISK',
             'lte_4g': '4G',
             'wifi': 'WIFI',
@@ -1162,15 +1171,16 @@ class MainWindow(QMainWindow):
             else:
                 self.statusBar().showMessage(f"数据上传成功: {sn}")
 
-            # 提取磁盘大小
+            # 提取磁盘大小：消息里按 NVMe > SATA > eMMC 列出内置盘，
+            # 第一个容量即主硬盘（U 盘已在硬盘检测里排除，不会取到它）
             disk_size = None
             for record in records:
                 if record['sub_type'] == 'DISK' and record['results'] == 'PASS':
                     remarks = record.get('remarks', '')
                     import re
-                    match = re.search(r'(\d+(?:\.\d+)?[TGMK]B?)', remarks, re.IGNORECASE)
+                    match = re.search(r'(\d+(?:\.\d+)?)\s*([TGMK])B?', remarks, re.IGNORECASE)
                     if match:
-                        raw_size = match.group(1).upper()
+                        raw_size = (match.group(1) + match.group(2)).upper()
                         disk_size = self._format_disk_capacity(raw_size)
                         break
 

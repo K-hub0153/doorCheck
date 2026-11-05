@@ -8,10 +8,14 @@ from src.master_control.utils.logger import logger
 import re
 
 
-def extract_disk_info(disk_model: str) -> str:
-    """从硬盘型号中提取品牌和标称容量"""
+def extract_disk_info(disk_model: str, disk_size: str = "") -> str:
+    """从硬盘型号/容量中提取品牌和标称容量
+
+    disk_size 是 lsblk 的 SIZE 列（如 '465.8G'），型号里没写容量时用它，
+    这样 U 盘被排除后卡片只显示本机那块内置盘的品牌与容量。
+    """
     if not disk_model:
-        return "未知"
+        return "未检测到内置盘"
 
     # 提取标称容量（如 512GB, 1TB）
     size_match = re.search(r'(\d+)\s*(TB|GB)', disk_model, re.IGNORECASE)
@@ -20,6 +24,9 @@ def extract_disk_info(disk_model: str) -> str:
 
     brand = brand_match.group(1) if brand_match else ""
     size = size_match.group(1) + size_match.group(2)[0].upper() if size_match else ""
+    if not size and disk_size:
+        # lsblk 的 465.8G / 1.8T 归到标称容量：465G / 1.8T
+        size = disk_size.strip().upper()
 
     if brand and size:
         return f"{brand} {size}"
@@ -67,7 +74,13 @@ class DeviceCard(QFrame):
         ip_label.setStyleSheet("color: black;")
         layout.addWidget(ip_label)
 
-        disk_info = extract_disk_info(self.device.disk_model) if self.device.disk_model else "未知"
+        if self.device.disk_model:
+            disk_info = extract_disk_info(self.device.disk_model, self.device.disk_size)
+        elif self.device.disk_missing:
+            # 扫描时确认机上只有 U 盘/移动硬盘 —— 卡片不能显示那块 U 盘的型号
+            disk_info = "未装内置硬盘(仅接了U盘)"
+        else:
+            disk_info = "未检测到内置盘"
         model_label = QLabel(f"硬盘: {disk_info}")
         model_label.setFont(QFont("Arial", 10))
         model_label.setStyleSheet("color: black;")

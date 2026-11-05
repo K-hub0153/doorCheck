@@ -3,6 +3,7 @@ import time
 from typing import List, Callable, Optional
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf, ServiceInfo
 from src.master_control.core.device import MasterDevice
+from src.master_control.core import disk_info
 from src.master_control.utils.logger import logger
 from src.master_control.utils.config import config
 import threading
@@ -166,26 +167,20 @@ class DeviceDiscovery(QObject):
             stdin, stdout, stderr = ssh.exec_command("uname -m")
             model = stdout.read().decode().strip()
 
-            # 优化硬盘检测：使用 --pairs 输出格式，避免列宽/空格问题
-            stdin, stdout, stderr = ssh.exec_command(
-                "lsblk -d -n -P -o NAME,MODEL,SIZE | grep -E 'NAME=\"(sd|nvme|mmcblk)' | head -1"
-            )
-            disk_info = stdout.read().decode().strip()
+            # 读取内置硬盘信息：一次读回整盘表 + 可移动/总线标记，
+            # 排除 U 盘与移动硬盘（USB 3.0 检测要求插着一个，别把它当本机硬盘）
+            stdin, stdout, stderr = ssh.exec_command(disk_info.PROBE_CMD)
+            disks = disk_info.parse(stdout.read().decode('utf-8', errors='ignore'))
             disk_model = ""
             disk_size = ""
-            if disk_info:
-                # 解析 KEY="VALUE" 格式
-                import re
-                model_match = re.search(r'MODEL="([^"]*)"', disk_info)
-                size_match = re.search(r'SIZE="([^"]+)"', disk_info)
-                name_match = re.search(r'NAME="([^"]+)"', disk_info)
-                
-                disk_model = model_match.group(1).strip() if model_match and model_match.group(1).strip() else ''
-                disk_size = size_match.group(1) if size_match else ''
-                
-                # 如果 MODEL 为空，使用设备名
-                if not disk_model and name_match:
-                    disk_model = name_match.group(1)
+            internal = disk_info.internal_disks(disks)
+            if internal:
+                disk_model = internal[0].display_model
+                disk_size = internal[0].size
+            elif disks:
+                # 只有 U 盘/移动硬盘：设备卡片显示「未装内置硬盘」而不是 U 盘型号
+                logger.info(f"[{ip}] 只找到可移动设备，无内置硬盘: "
+                            + '、'.join(d.label for d in disks))
 
             ssh.close()
 
@@ -196,7 +191,8 @@ class DeviceDiscovery(QObject):
                     'model': model if model else 'MASTER',
                     'port': 22,
                     'disk_model': disk_model,
-                    'disk_size': disk_size
+                    'disk_size': disk_size,
+                    'disk_missing': (not internal) and bool(disks)
                 }
         except Exception as e:
             logger.debug(f"SSH连接 {ip} 失败: {e}")
@@ -387,7 +383,8 @@ class MasterDeviceListener(ServiceListener):
                         model=device_info['model'],
                         port=device_info['port'],
                         disk_model=device_info.get('disk_model', ''),
-                        disk_size=device_info.get('disk_size', '')
+                        disk_size=device_info.get('disk_size', ''),
+                        disk_missing=device_info.get('disk_missing', False)
                     )
                 else:
                     # SSH 失败，使用 mDNS 信息

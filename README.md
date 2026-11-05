@@ -91,3 +91,15 @@ python tools/master_control/smoke_scan_entry.py
 ```
 
 上述验证不连接真实设备、不打印。设备检测、MAC 写入、上传和物理打印需在产线实机验收。
+
+## 主控检测说明
+
+已迁移原始主控工程 `mcChecker` 的提交 `c8de99ff3b584e973b7a8f399c2a87427f029016`（`usb_ble_fix`），保留本工程的独立主控配置、共享日志与统一版本号。
+
+- USB 接口：RK3576 使用 Type-A，海思 310P 使用 Type-C。测试前接入 USB 3.0 设备；读取 `lsusb -t`，不可用时退回 sysfs。默认协商速率至少 5000 Mbps 才通过，不将 root hub 自身计为设备。USB 已接入单项检测、一键测试、打印门限、历史记录和上传。
+- USB 配置：在 `config/master_control/config.yaml` 的 `usb` 节点设置 `min_speed_mbps`、`probe_retries` 和 `probe_interval`；芯片的 `usb_detection`、`usb_connector` 分别控制检测开关与接口名称。
+- 内置硬盘：发现设备与硬盘检测共用识别逻辑，排除 USB/可移动存储，优先显示 NVMe、SATA，再到 eMMC。只接 U 盘时不会将 U 盘作为内置硬盘，卡片明确提示缺少内置盘。
+- 蓝牙：扫描前停止设备上占用蓝牙的 Java 进程并重启蓝牙服务，缩短扫描等待时间，增加带时间戳的阶段日志，并调整主控侧脚本等待超时。此操作会中断设备上的 Java 业务服务，需在产测环境执行。
+- 电池：读取厂商名，按品牌选择 shutdown 地址字；内置格瑞普 Greenway 和九夷 Sunwoda 配置。未知品牌不猜测地址；可用 `battery.shutdown_profiles` 替换内置表，或用 `battery.force_profile` 指定已知批次。写入 Auto Ship 和关机时间后回读校验，配置失败会使电池检测失败；海思 310P 仍按芯片配置跳过 shutdown 设置。
+
+电池寄存器写入、USB 实际协商速率和蓝牙扫描需在对应芯片与电池品牌的实机上验收。

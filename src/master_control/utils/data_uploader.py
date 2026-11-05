@@ -206,6 +206,7 @@ class DataUploader:
 
         device_name_map = {
             'POE': 'POE',
+            'USB': 'USB',
             'DISK': 'DISK',
             '4G': '4G',
             'WIFI': 'WIFI',

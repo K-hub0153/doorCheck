@@ -231,6 +231,34 @@ class Config:
             return '0x0b'
 
     @property
+    def usb_min_speed(self):
+        """USB 3.0 判定的最低协商速率（Mbps）
+
+        5000 = USB 3.2 Gen1（原 USB 3.0）。接到 2.0 口或用了 2.0 线材时
+        设备只会协商到 480M，据此判不通过。
+        """
+        try:
+            return float(self.get('usb.min_speed_mbps', 5000))
+        except (TypeError, ValueError):
+            return 5000.0
+
+    @property
+    def usb_probe_retries(self):
+        """读不到 3.0 设备时重试几次（应对热插拔枚举延迟）"""
+        try:
+            return max(0, int(self.get('usb.probe_retries', 2)))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
+    def usb_probe_interval(self):
+        """每次重试前等待的秒数"""
+        try:
+            return max(0.0, float(self.get('usb.probe_interval', 1.0)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
     def upload_retry_times(self):
         """数据上传失败重试次数（针对网关限流页等可恢复错误）"""
         try:

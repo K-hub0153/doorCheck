@@ -41,6 +41,7 @@ class DeviceTestResults:
     sn: str
     ip: str
     poe: TestResult = field(default_factory=TestResult)
+    usb: TestResult = field(default_factory=TestResult)  # USB 3.0 接口检测
     disk: TestResult = field(default_factory=TestResult)
     wifi: TestResult = field(default_factory=TestResult)
     bluetooth: TestResult = field(default_factory=TestResult)
@@ -50,10 +51,10 @@ class DeviceTestResults:
     fan: TestResult = field(default_factory=TestResult)
     hdmi: TestResult = field(default_factory=TestResult)  # HDMI 接口检测（仅部分芯片支持）
     battery: TestResult = field(default_factory=TestResult)  # 电池检测
-    
+
     def get_overall_status(self) -> TestStatus:
-        results = [self.poe, self.disk, self.lte_4g]
-        
+        results = [self.poe, self.usb, self.disk, self.lte_4g]
+
         if any(r.status == TestStatus.FAILED for r in results):
             return TestStatus.FAILED
         
@@ -70,6 +71,7 @@ class DeviceTestResults:
             'sn': self.sn,
             'ip': self.ip,
             'poe': {'status': self.poe.status.value, 'message': self.poe.message, 'detail': self.poe.detail},
+            'usb': {'status': self.usb.status.value, 'message': self.usb.message, 'detail': self.usb.detail},
             'disk': {'status': self.disk.status.value, 'message': self.disk.message, 'detail': self.disk.detail},
             'wifi': {'status': self.wifi.status.value, 'message': self.wifi.message, 'detail': self.wifi.detail},
             'bluetooth': {'status': self.bluetooth.status.value, 'message': self.bluetooth.message, 'detail': self.bluetooth.detail},

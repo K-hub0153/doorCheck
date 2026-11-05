@@ -171,6 +171,7 @@ class DeviceDetailPanel(QWidget):
 
         self.test_widgets = {}
         test_items = [
+            ("usb", "USB 接口"),
             ("poe", "POE 网口"),
             ("disk", "硬盘"),
             ("fan", "风扇"),

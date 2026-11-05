@@ -1,6 +1,14 @@
 battery:
   i2c_addr: 0x0b
   i2c_bus: 0
+  # 休眠（shutdown）配置的地址字按电池品牌区分：
+  #   博立威 Greenway: Auto Ship 0xD0 0x4B / 关机时间 0x04 0x4C
+  #   九夷 Sunwoda  : Auto Ship 0x8B 0x48 / 关机时间 0xAF 0x48
+  # 留空 shutdown_profiles 即用内置品牌表（src/master_control/core/battery_profile.py）；
+  # 新增品牌时展开本节点，整表以配置为准（不再合并内置表）。
+  shutdown_profiles: []
+  # 已知批次可直接指定品牌，跳过按厂商名识别（值写 name 字段，如 九夷 Sunwoda）
+  # force_profile: 九夷 Sunwoda
 chips:
   hisi:
     battery_detection: true
@@ -13,6 +21,8 @@ chips:
     has_hdmi: false
     nearlink_detection: true
     poe_count: 14
+    usb_connector: Type-C
+    usb_detection: true
     wifi_detection: true
   wdse:
     battery_detection: true
@@ -23,6 +33,8 @@ chips:
     has_hdmi: true
     nearlink_detection: true
     poe_count: 8
+    usb_connector: Type-A
+    usb_detection: true
     wifi_detection: true
 database:
   path: ./mc_checker.db
@@ -111,6 +123,11 @@ test:
   lte_signal_quality_threshold: 80
   timeout: 10
   wifi_signal_threshold: -40
+# USB 3.0 接口检测：设备以 3.x 超速模式枚举即通过（速率 >= min_speed_mbps）
+usb:
+  min_speed_mbps: 5000
+  probe_interval: 1.0
+  probe_retries: 2
 # 4G 模组：识别厂商 + 按厂商读取信号（判定标准统一，见 src/master_control/core/lte_signal.py）
 # 留空 lte 节点即使用内置模组表（移远 AT+QENG / 龙尚 AT+CPSI）
 lte: {}

@@ -27,6 +27,11 @@ class ChipConfig:
     # 电池检测通过后是否继续执行 shutdown 模式配置（解密 → Auto Ship Bit → 关机时间 → 上锁）。
     # 该流程只针对 RK3576 电量计，海思310P 电量计不支持，需设为 False 跳过。
     battery_shutdown_config: bool = True
+    # 是否执行 USB 3.0 接口检测（False 表示默认通过）
+    usb_detection: bool = True
+    # USB 接口形态，只用于展示：RK3576 是 Type-A，海思310P 是 Type-C。
+    # 判定只看协商速率，与接口形态无关，所以留空也能跑。
+    usb_connector: str = ''
 
 
 class ChipManager:
@@ -57,7 +62,9 @@ class ChipManager:
                 description=chip_data.get('description', f'{chip_type}芯片'),
                 battery_detection=chip_data.get('battery_detection', True),
                 battery_i2c_bus=chip_data.get('battery_i2c_bus'),
-                battery_shutdown_config=chip_data.get('battery_shutdown_config', True)
+                battery_shutdown_config=chip_data.get('battery_shutdown_config', True),
+                usb_detection=chip_data.get('usb_detection', True),
+                usb_connector=str(chip_data.get('usb_connector', '') or '')
             )
         
         # 兜底配置
@@ -73,7 +80,8 @@ class ChipManager:
                 nearlink_detection=True,
                 description='海思310P芯片（默认配置）',
                 battery_i2c_bus=2,
-                battery_shutdown_config=False
+                battery_shutdown_config=False,
+                usb_connector='Type-C'
             )
         
         cls._chip_configs_cache = configs

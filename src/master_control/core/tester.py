@@ -5,11 +5,16 @@ import time
 import os
 from ..utils.paths import config_dir
 
+from typing import List
+
 from src.master_control.core.ssh_client import SSHClient
 from src.master_control.core.test_result import DeviceTestResults, TestResult
 from src.master_control.core.chip_config import ChipManager, ChipConfig
 from src.master_control.core import lte_signal
 from src.master_control.core import poe_net
+from src.master_control.core import usb_link
+from src.master_control.core import disk_info
+from src.master_control.core import battery_profile
 from src.master_control.utils.logger import logger
 from src.master_control.utils.config import config
 from src.master_control.utils.mac_allocator import MACAllocator
@@ -101,6 +106,77 @@ class DeviceTester:
     def disconnect(self):
         if self.ssh:
             self.ssh.disconnect()
+
+    def test_usb3(self) -> TestResult:
+        """USB 3.0 接口检测：协商速率 >= 5000M 的设备存在即通过
+
+        质检时接入一个 USB 3.0 设备（U 盘/移动硬盘），
+        只要它在 USB 3.x 超速模式下枚举出来就判通过；
+        退化成 480M（USB 2.0）或在 3.0 总线上没有设备则判不通过。
+
+        root hub 自己也会报 5000M，必须排除，否则永远通过（见 usb_link）。
+        """
+        logger.info(f"[{self.sn}] 开始检测 USB 接口...")
+        result = TestResult()
+        result.set_testing()
+
+        try:
+            if not self.chip_config.usb_detection:
+                logger.info(f"[{self.sn}] 芯片类型 {self.chip_config.chip_model}，USB 检测默认通过")
+                result.set_passed("USB 检测跳过",
+                                  f"{self.chip_config.chip_model} 芯片 USB 检测默认通过")
+                return result
+
+            min_speed = config.usb_min_speed
+            connector = self.chip_config.usb_connector
+            logger.info(f"[{self.sn}] 芯片 {self.chip_config.chip_model} 的 USB 接口: "
+                        f"{connector or '未配置'}, 判定阈值 {min_speed:g} Mbps")
+
+            devices, source, notes = usb_link.probe(
+                self.ssh, min_speed=min_speed,
+                retries=config.usb_probe_retries, interval=config.usb_probe_interval)
+
+            found = usb_link.superspeed_devices(devices, min_speed)
+            only_usb2 = usb_link.usb2_devices(devices)
+            others = [d for d in devices if not d.is_root_hub]
+            detail = usb_link.format_detail(devices, source, min_speed, connector, notes)
+
+            logger.info(f"[{self.sn}] USB 设备树 ({source}):\n"
+                        + "\n".join(d.label for d in devices if not d.is_root_hub))
+            for note in notes:
+                logger.info(f"[{self.sn}] USB 检测备注: {note}")
+
+            if found:
+                # 面板一行：接口 + 主设备速率 + 主设备类型
+                head = found[0]
+                extra = f" 等 {len(found)} 个设备" if len(found) > 1 else ""
+                message = (f"USB 3.0 正常 ({connector or '接口'}: {head.dev_class} "
+                           f"{head.speed_text}{extra})")
+                result.set_passed(message, detail)
+                logger.info(f"[{self.sn}] USB 检测通过: {message}")
+            elif only_usb2:
+                # 有设备但都只跑在 2.0：质检用的设备插上了却没跑 3.0，
+                # 常见原因是线材/接口是 2.0、或插在了 2.0 口上
+                summary = '、'.join(f"{d.dev_class} {d.speed_text}" for d in only_usb2[:3])
+                message = f"USB 未跑在 3.0 ({summary})"
+                result.set_failed(message, detail)
+                logger.warning(f"[{self.sn}] USB 检测失败: {message}")
+            elif others:
+                # 有设备但都读不到速率（老固件 / 权限不足）：不能当通过
+                summary = '、'.join(d.dev_class for d in others[:3])
+                message = f"USB 设备速率未知 ({summary})"
+                result.set_failed(message, detail)
+                logger.warning(f"[{self.sn}] USB 检测失败: {message}")
+            else:
+                message = "未检测到 USB 3.0 设备"
+                result.set_failed(message, detail)
+                logger.warning(f"[{self.sn}] USB 检测失败: {message}")
+
+        except Exception as e:
+            result.set_failed("USB 检测异常", str(e))
+            logger.error(f"[{self.sn}] USB 检测异常: {e}", exc_info=True)
+
+        return result
 
     def test_poe_ports(self) -> TestResult:
         """POE 网口检测：自动获取设备的 POE 网段（eth1）再扫描"""
@@ -202,86 +278,65 @@ class DeviceTester:
         result.set_testing()
 
         try:
-            # 使用 --pairs 输出 KEY=VALUE 格式，避免列宽/空格导致解析错位
-            cmd = "lsblk -d -n -P -o NAME,MODEL,SIZE | grep -E 'NAME=\"(sd|nvme|mmcblk)'"
-            success, stdout, stderr = self.ssh.execute_command(cmd)
+            # 一次读回整盘列表 + 可移动标记/总线归属，接 U 盘时不会把 U 盘当硬盘
+            disks, error = disk_info.probe(self.ssh)
 
-            if success and stdout:
-                logger.info(f"[{self.sn}] lsblk 原始输出: {stdout}")
-                disk_lines = stdout.strip().split('\n')
-                disk_info_list = []
+            if error and not disks:
+                result.set_failed("检测命令执行失败", error)
+                logger.error(f"[{self.sn}] 硬盘检测失败: {error}")
+                return result
 
-                for line in disk_lines:
-                    if not line.strip():
-                        continue
+            logger.info(f"[{self.sn}] 磁盘原始信息: "
+                        + "; ".join(f"{d.name}={d.display_model}/{d.size}"
+                                    f"{'/可移动' if not d.is_internal else ''}"
+                                    for d in disks))
 
-                    # 解析 KEY="VALUE" 格式：NAME="sda" MODEL="WD Blue" SIZE="500G"
-                    import re as _re
-                    name_match = _re.search(r'NAME="([^"]+)"', line)
-                    model_match = _re.search(r'MODEL="([^"]*)"', line)
-                    size_match = _re.search(r'SIZE="([^"]+)"', line)
+            internal = disk_info.internal_disks(disks)
+            note = disk_info.ignored_note(disks)
+            if note:
+                logger.info(f"[{self.sn}] {note}")
 
-                    name = name_match.group(1) if name_match else '未知设备'
-                    model = model_match.group(1).strip() if model_match and model_match.group(1).strip() else name
-                    size = size_match.group(1) if size_match else '未知大小'
+            if internal:
+                # 查询固件版本（smartctl -a /dev/xxx）
+                firmwares = {info.name: self._get_disk_firmware(info.name) for info in internal}
 
-                    logger.info(f"[{self.sn}] 解析硬盘: 设备={name}, 型号={model}, 大小={size}")
+                disk_summary = []
+                for info in internal:
+                    fw = firmwares.get(info.name)
+                    suffix = f", FW:{fw}" if fw else ""
+                    size = info.size or "容量未知"
+                    disk_summary.append(f"{info.display_model} ({size}{suffix})")
 
-                    # 从型号中提取品牌
-                    vendor = '未知品牌'
-                    if model != '未知型号':
-                        model_upper = model.upper()
-                        if 'SAMSUNG' in model_upper:
-                            vendor = 'Samsung'
-                        elif 'WD' in model_upper or 'WESTERN' in model_upper:
-                            vendor = 'Western Digital'
-                        elif 'SEAGATE' in model_upper or 'ST' in model_upper:
-                            vendor = 'Seagate'
-                        elif 'TOSHIBA' in model_upper:
-                            vendor = 'Toshiba'
-                        elif 'KINGSTON' in model_upper:
-                            vendor = 'Kingston'
-                        elif 'SANDISK' in model_upper:
-                            vendor = 'SanDisk'
-                        elif 'INTEL' in model_upper:
-                            vendor = 'Intel'
-                        elif 'OSC' in model_upper:
-                            vendor = 'OSC'
+                result_message = f"检测到 {len(internal)} 个硬盘: {', '.join(disk_summary)}"
 
-                    disk_info_list.append({
-                        'name': name,
-                        'vendor': vendor,
-                        'model': model,
-                        'size': size
-                    })
-                    logger.info(f"[{self.sn}] 解析硬盘信息: 品牌={vendor}, 型号={model}, 大小={size}")
+                detail_lines = []
+                for i, info in enumerate(internal):
+                    fw = firmwares.get(info.name) or '未获取'
+                    vendor = info.vendor or '未知品牌'
+                    size = info.size or '容量未知'
+                    detail_lines.append(
+                        f"硬盘{i+1}: 品牌={vendor}, 型号={info.display_model}, "
+                        f"大小={size}, 固件版本={fw}"
+                    )
+                if note:
+                    detail_lines.append(note)
+                result_detail = "\n".join(detail_lines)
 
-                if disk_info_list:
-                    # 查询固件版本（smartctl -a /dev/xxx）
-                    for info in disk_info_list:
-                        info['firmware'] = self._get_disk_firmware(info['name'])
-
-                    # 构建简洁的消息显示
-                    disk_summary = []
-                    for info in disk_info_list:
-                        fw = f", FW:{info['firmware']}" if info.get('firmware') else ""
-                        disk_summary.append(f"{info['model']} ({info['size']}{fw})")
-
-                    result_message = f"检测到 {len(disk_info_list)} 个硬盘: {', '.join(disk_summary)}"
-                    result_detail = "\n".join([
-                        f"硬盘{i+1}: 品牌={info['vendor']}, 型号={info['model']}, 大小={info['size']}, "
-                        f"固件版本={info.get('firmware') or '未获取'}"
-                        for i, info in enumerate(disk_info_list)
-                    ])
-                    result.set_passed(result_message, result_detail)
-                    logger.info(f"[{self.sn}] 硬盘检测通过: {result_message}")
-                    logger.info(f"[{self.sn}] 硬盘详情: {result_detail}")
-                else:
-                    result.set_failed("未检测到硬盘", "没有找到有效的存储设备")
-                    logger.error(f"[{self.sn}] 硬盘检测失败: 未找到存储设备")
+                result.set_passed(result_message, result_detail)
+                logger.info(f"[{self.sn}] 硬盘检测通过: {result_message}")
+                logger.info(f"[{self.sn}] 硬盘详情: {result_detail}")
+            elif disks:
+                # 只有 U 盘/移动硬盘：说明「没装内置硬盘」，不能当通过
+                movable = disk_info.movable_disks(disks)
+                found = '、'.join(d.label for d in movable)
+                result.set_failed(
+                    "未检测到内置硬盘",
+                    f"只找到可移动设备（U 盘/移动硬盘），不算内置硬盘: {found}"
+                )
+                logger.error(f"[{self.sn}] 硬盘检测失败: 只有可移动设备 {found}")
             else:
-                result.set_failed("检测命令执行失败", stderr)
-                logger.error(f"[{self.sn}] 硬盘检测失败: 命令执行失败")
+                result.set_failed("未检测到硬盘", "没有找到任何块设备")
+                logger.error(f"[{self.sn}] 硬盘检测失败: 未找到存储设备")
         except Exception as e:
             result.set_failed("异常", str(e))
             logger.error(f"[{self.sn}] 硬盘检测异常: {e}")
@@ -1327,10 +1382,25 @@ class DeviceTester:
 
             # 电池检测通过后按芯片配置决定是否配置 shutdown 模式
             if self.chip_config.battery_shutdown_config:
-                self._configure_battery_shutdown_mode()
+                # 传入厂商名：休眠配置的地址字按品牌区分（格瑞普 0xD04B / 九夷 0x8B48）
+                summary = self._configure_battery_shutdown_mode(manufacturer)
+                shutdown_lines = summary.get('lines') or []
+                if summary.get('configured'):
+                    detail += '\n\n休眠配置: 已完成\n' + '\n'.join(shutdown_lines)
+                    result.detail = detail
+                else:
+                    # 配置没完成不是电池检测失败，但必须让人看见，
+                    # 否则现场会以为休眠模式已经配好（旧版的隐性问题）
+                    detail += '\n\n休眠配置: 未完成\n' + '\n'.join(shutdown_lines)
+                    result.detail = detail
+                    message = f"{message} ｜ 休眠配置未完成"
+                    result.message = message
+                    logger.warning(f"[{self.sn}] 电池休眠配置未完成，已标注在检测结果里")
             else:
                 logger.info(f"[{self.sn}] 芯片 {self.chip_config.chip_model} "
                             f"不做 shutdown 模式配置，跳过解密/使能/休眠流程")
+                detail += '\n\n休眠配置: 跳过（芯片配置 battery_shutdown_config=false）'
+                result.detail = detail
 
         except Exception as e:
             result.set_failed("电池检测异常", str(e))
@@ -1338,129 +1408,170 @@ class DeviceTester:
 
         return result
 
-    def _configure_battery_shutdown_mode(self):
-        """电池检测后自动配置 shutdown 模式
-        
+    def _configure_battery_shutdown_mode(self, manufacturer: str = '') -> dict:
+        """电池检测通过后自动配置 shutdown 模式
+
         流程：
         1. 解密执行两遍（全解）
-        2. 判定并配置 Auto Ship Bit 位（如未开启则开启）
-        3. 判定并配置关机时间（如非 3 天则配置为 3 天）
-        4. 上锁
+        2. 判定并配置 Auto Ship Bit 位（未开启才写）
+        3. 判定并配置关机时间（不是 3 天才写）
+        4. 上锁，并回读确认（上锁后 0x44 应为 0x00）
 
-        总线号与 _read_battery_registers 取同一份芯片级配置，避免读写走不同总线。
-        仅当芯片配置 battery_shutdown_config 为 True 时由 test_battery 调用。
+        **地址字按电池品牌选择**（见 src/master_control/core/battery_profile.py）：
+        格瑞普是 0xD04B / 0x044C，九夷是 0x8B48 / 0xAF48。旧实现把格瑞普的
+        地址字写死，换九夷后读不到、写错地址，现场却只看到「已配置」的日志。
+
+        每一步写完都**回读校验**，结论不再是「命令退出码为 0 就算成功」：
+        退出码为 0 只说明 i2cset 发出去了，不代表地址字对、值真的落盘。
+
+        厂商名认不出品牌时**直接跳过并写进详情**：往不匹配的地址字写数据
+        会把电量计配置写坏，宁可跳过让人工处理。
+
+        Returns:
+            {'configured': bool, 'lines': [详情行], 'profile': 档案名或 ''}
         """
         bus = self._battery_i2c_bus()
         addr = config.battery_i2c_addr
+        lines: List[str] = []
+        summary = {'configured': False, 'lines': lines, 'profile': ''}
+
+        def fail(reason: str) -> dict:
+            lines.append(f'结果: 未完成 ({reason})')
+            logger.warning(f"[{self.sn}] 电池 shutdown 配置未完成: {reason}")
+            return summary
 
         try:
             logger.info(f"[{self.sn}] 开始配置电池 shutdown 模式...")
-            
-            # 步骤1：解密执行两遍（全解）
-            unlock_cmd = (
-                f"i2cset -y {bus} {addr} 0x00 0x88 0x20 i && "
-                f"i2cset -y {bus} {addr} 0x00 0x26 0x20 i && "
-                f"i2cset -y {bus} {addr} 0x00 0xFF 0xFF i && "
-                f"i2cset -y {bus} {addr} 0x00 0xFF 0xFF i && "
-                f"i2cset -y {bus} {addr} 0x00 0x88 0x20 i && "
-                f"i2cset -y {bus} {addr} 0x00 0x26 0x20 i && "
-                f"i2cset -y {bus} {addr} 0x00 0xFF 0xFF i && "
-                f"i2cset -y {bus} {addr} 0x00 0xFF 0xFF i"
-            )
-            success, stdout, stderr = self.ssh.execute_command(unlock_cmd, timeout=15)
+
+            # 步骤0：确定地址字（品牌）
+            profile, note = battery_profile.resolve_profile(config, manufacturer)
+            if profile is None:
+                logger.warning(f"[{self.sn}] {note}")
+                return fail(note)
+
+            summary['profile'] = profile.name
+            logger.info(f"[{self.sn}] 休眠配置档案: {profile.label} ({note})")
+            lines.append(f'配置档案: {profile.label}')
+            lines.append(f'来源: {note}')
+
+            # 步骤1：解密（两遍全解）
+            success, _, stderr = self.ssh.execute_command(
+                battery_profile.build_unlock(bus, addr), timeout=20)
             if not success:
-                logger.warning(f"[{self.sn}] 电池解密失败: {stderr}")
-                return
+                return fail(f'解密失败: {(stderr or "").strip() or "命令非零退出"}')
+            lines.append('解密: 成功（两遍全解）')
             logger.info(f"[{self.sn}] 电池解密成功")
-            
-            # 步骤2：检查并配置 Auto Ship Bit 位
-            # 2.1 读取当前值（期望 0x22 0xd0 0x4b 0x01 0x00）
-            read_autoship_cmd = (
-                f"i2cset -y {bus} {addr} 0x44 0x02 0xD0 0x4B i && "
-                f"i2cget -y {bus} {addr} 0x44 i 5"
-            )
-            success, stdout, stderr = self.ssh.execute_command(read_autoship_cmd, timeout=10)
-            if not success:
-                logger.warning(f"[{self.sn}] 读取 Auto Ship Bit 失败: {stderr}")
-                return
-                
-            # 解析输出，期望看到 "0x01"（第4个字节，tokens 索引为 3）
-            logger.info(f"[{self.sn}] Auto Ship Bit 读数: {stdout.strip()}")
-            tokens = stdout.strip().split()
-            
-            # 2.2 判断是否需要开启（期望第4个字节为 0x01，即 tokens[3]）
-            need_enable = True
-            if len(tokens) >= 5:
-                try:
-                    # tokens: [0x22, 0xd0, 0x4b, 0x01, 0x00]
-                    # 第4个字节（索引3）应为 0x01
-                    if tokens[3].lower() == '0x01':
-                        need_enable = False
-                        logger.info(f"[{self.sn}] Auto Ship Bit 已开启，跳过")
-                except (ValueError, IndexError):
-                    pass
-            
-            if need_enable:
-                enable_autoship_cmd = (
-                    f"i2cset -y {bus} {addr} 0x44 0x02 0xD0 0x4B i && "
-                    f"i2cset -y {bus} {addr} 0x44 0x04 0xD0 0x4B 0x01 0x00 i"
-                )
-                success, stdout, stderr = self.ssh.execute_command(enable_autoship_cmd, timeout=10)
-                if success:
-                    logger.info(f"[{self.sn}] Auto Ship Bit 已开启")
-                else:
-                    logger.warning(f"[{self.sn}] Auto Ship Bit 开启失败: {stderr}")
-                    return
-            
-            # 步骤3：检查并配置关机时间（3天）
-            # 3.1 读取当前关机时间（期望 0x04 0x4C 0xE0 0x10）
-            read_shutdown_time_cmd = (
-                f"i2cset -y {bus} {addr} 0x44 0x02 0x04 0x4C i && "
-                f"i2cget -y {bus} {addr} 0x44 i 5"
-            )
-            success, stdout, stderr = self.ssh.execute_command(read_shutdown_time_cmd, timeout=10)
-            if not success:
-                logger.warning(f"[{self.sn}] 读取关机时间失败: {stderr}")
-                return
-                
-            logger.info(f"[{self.sn}] 关机时间读数: {stdout.strip()}")
-            tokens = stdout.strip().split()
-            
-            # 3.2 判断是否需要配置（期望前4字节为 0x04 0x4C 0xE0 0x10）
-            need_config = True
-            if len(tokens) >= 4:
-                try:
-                    # tokens: [0x04, 0x4C, 0xE0, 0x10, 0x??]（5字节，判前4个）
-                    if (tokens[0].lower() == '0x04' and tokens[1].lower() == '0x4c' and
-                        tokens[2].lower() == '0xe0' and tokens[3].lower() == '0x10'):
-                        need_config = False
-                        logger.info(f"[{self.sn}] 关机时间已配置为 3 天，跳过")
-                except (ValueError, IndexError):
-                    pass
-            
-            if need_config:
-                set_shutdown_time_cmd = (
-                    f"i2cset -y {bus} {addr} 0x44 0x02 0x04 0x4C i && "
-                    f"i2cset -y {bus} {addr} 0x44 0x04 0x04 0x4C 0xE0 0x10 i"
-                )
-                success, stdout, stderr = self.ssh.execute_command(set_shutdown_time_cmd, timeout=10)
-                if success:
-                    logger.info(f"[{self.sn}] 关机时间已配置为 3 天")
-                else:
-                    logger.warning(f"[{self.sn}] 关机时间配置失败: {stderr}")
-                    return
-            
-            # 步骤4：执行上锁
-            lock_cmd = f"i2cset -y {bus} {addr} 0x44 0x02 0x30 0x00 i"
-            success, stdout, stderr = self.ssh.execute_command(lock_cmd, timeout=10)
-            if success:
-                logger.info(f"[{self.sn}] 电池配置上锁成功")
-                logger.info(f"[{self.sn}] 电池 shutdown 模式配置完成")
-            else:
-                logger.warning(f"[{self.sn}] 电池配置上锁失败: {stderr}")
-                
+
+            # 步骤2：Auto Ship Bit
+            enable_ok, reason = self._ensure_autoship(bus, addr, profile)
+            lines.append(f'Auto Ship Bit: {reason}')
+            if not enable_ok:
+                return fail(f'Auto Ship Bit: {reason}')
+
+            # 步骤3：关机时间 3 天
+            time_ok, reason = self._ensure_shutdown_time(bus, addr, profile)
+            lines.append(f'关机时间: {reason}')
+            if not time_ok:
+                return fail(f'关机时间: {reason}')
+
+            # 步骤4：上锁 + 回读确认
+            lock_ok, reason = self._lock_and_verify(bus, addr)
+            lines.append(f'上锁: {reason}')
+            if not lock_ok:
+                return fail(f'上锁: {reason}')
+
+            lines.append('结果: 配置完成（Auto Ship + 关机时间均已回读校验，上锁命令成功）')
+            summary['configured'] = True
+            logger.info(f"[{self.sn}] 电池 shutdown 模式配置完成 ({profile.name})")
+            return summary
+
         except Exception as e:
             logger.error(f"[{self.sn}] 配置电池 shutdown 模式异常: {e}", exc_info=True)
+            return fail(f'异常: {e}')
+
+    def _ensure_autoship(self, bus: int, addr: str, profile) -> tuple:
+        """判定 Auto Ship Bit，未开启才写，写完回读校验
+
+        Returns:
+            (ok, 说明)
+        """
+        read_cmd = battery_profile.build_read_autoship(bus, addr, profile)
+        success, stdout, stderr = self.ssh.execute_command(read_cmd, timeout=15)
+        if not success:
+            return False, f'读取失败: {(stderr or "").strip() or "命令非零退出"}'
+
+        logger.info(f"[{self.sn}] Auto Ship Bit 读数: {stdout.strip()}")
+        enabled, reason = battery_profile.autoship_state(stdout, profile)
+        if enabled:
+            logger.info(f"[{self.sn}] Auto Ship Bit {reason}，跳过写入")
+            return True, f'{reason}，无需写入'
+
+        # 未开启（或前缀异常）→ 写入后必须回读确认为 0x01
+        logger.info(f"[{self.sn}] Auto Ship Bit {reason}，写入 0x01 0x00")
+        write_cmd = battery_profile.build_enable_autoship(bus, addr, profile)
+        success, _, stderr = self.ssh.execute_command(write_cmd, timeout=15)
+        if not success:
+            return False, f'写入失败: {(stderr or "").strip() or "命令非零退出"}'
+
+        time.sleep(battery_profile.READBACK_SETTLE_SECONDS)
+        success, stdout, stderr = self.ssh.execute_command(read_cmd, timeout=15)
+        if not success:
+            return False, f'写入后回读失败: {(stderr or "").strip() or "命令非零退出"}'
+
+        logger.info(f"[{self.sn}] Auto Ship Bit 写入后回读: {stdout.strip()}")
+        enabled, verify = battery_profile.autoship_state(stdout, profile)
+        if enabled:
+            return True, f'写入后校验通过 ({verify})'
+        return False, f'写入后校验失败 ({verify})，地址字 {profile.autoship_word_text} 可能不匹配'
+
+    def _ensure_shutdown_time(self, bus: int, addr: str, profile) -> tuple:
+        """判定关机时间，非 3 天才写，写完回读校验
+
+        Returns:
+            (ok, 说明)
+        """
+        read_cmd = battery_profile.build_read_shutdown_time(bus, addr, profile)
+        success, stdout, stderr = self.ssh.execute_command(read_cmd, timeout=15)
+        if not success:
+            return False, f'读取失败: {(stderr or "").strip() or "命令非零退出"}'
+
+        logger.info(f"[{self.sn}] 关机时间读数: {stdout.strip()}")
+        configured, reason = battery_profile.shutdown_time_state(stdout, profile)
+        if configured:
+            logger.info(f"[{self.sn}] 关机时间{reason}，跳过写入")
+            return True, f'{reason}，无需写入'
+
+        logger.info(f"[{self.sn}] 关机时间{reason}，写入 0xE0 0x10")
+        write_cmd = battery_profile.build_set_shutdown_time(bus, addr, profile)
+        success, _, stderr = self.ssh.execute_command(write_cmd, timeout=15)
+        if not success:
+            return False, f'写入失败: {(stderr or "").strip() or "命令非零退出"}'
+
+        time.sleep(battery_profile.READBACK_SETTLE_SECONDS)
+        success, stdout, stderr = self.ssh.execute_command(read_cmd, timeout=15)
+        if not success:
+            return False, f'写入后回读失败: {(stderr or "").strip() or "命令非零退出"}'
+
+        logger.info(f"[{self.sn}] 关机时间写入后回读: {stdout.strip()}")
+        configured, verify = battery_profile.shutdown_time_state(stdout, profile)
+        if configured:
+            return True, f'写入后校验通过 ({verify})'
+        return False, f'写入后校验失败 ({verify})，地址字 {profile.shutdown_word_text} 可能不匹配'
+
+    def _lock_and_verify(self, bus: int, addr: str) -> tuple:
+        """上锁
+
+        发送上锁命令，命令退出码为 0 即视为成功。
+        上锁后 0x44 回读值不固定（实测为 0x16），**不做回读校验**。
+
+        Returns:
+            (ok, 说明)
+        """
+        success, _, stderr = self.ssh.execute_command(
+            battery_profile.build_lock(bus, addr), timeout=15)
+        if not success:
+            return False, f'上锁命令失败: {(stderr or "").strip() or "命令非零退出"}'
+        return True, '已上锁（命令退出码 0）'
 
     def run_all_tests(self) -> DeviceTestResults:
         if not self.connect():
@@ -1468,6 +1579,7 @@ class DeviceTester:
             return self.results
 
         try:
+            self.results.usb = self.test_usb3()
             self.results.poe = self.test_poe_ports()
             self.results.disk = self.test_disk()
             self.results.lte_4g = self.test_4g()
