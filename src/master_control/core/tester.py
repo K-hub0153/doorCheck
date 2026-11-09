@@ -207,28 +207,11 @@ class DeviceTester:
             if target.note:
                 detail_lines.append(f"备注: {target.note}")
 
-            # 清空邻居表
-            cmd_clear = poe_net.build_flush_command(target)
-            self.ssh.execute_command(cmd_clear, timeout=poe_net.PROBE_TIMEOUT)
-            logger.info(f"[{self.sn}] 已清空ARP表")
-
-            # 并发 ping 扫描
-            cmd_ping = poe_net.build_ping_command(target)
-            success, stdout, stderr = self.ssh.execute_command(cmd_ping, timeout=poe_net.PING_TIMEOUT)
-            logger.info(f"[{self.sn}] 完成网段ping扫描")
-
-            # 查看邻居表详情（写日志）
-            cmd_arp_detail = poe_net.build_neigh_detail_command(target)
-            success_detail, arp_detail, stderr_detail = self.ssh.execute_command(cmd_arp_detail)
-            if success_detail and arp_detail:
+            online_count, arp_detail, err = poe_net.count_online(self.ssh, target)
+            if arp_detail:
                 logger.info(f"[{self.sn}] ARP表详情:\n{arp_detail}")
 
-            # 统计 REACHABLE 设备数
-            cmd_arp = poe_net.build_neigh_count_command(target)
-            success, stdout, stderr = self.ssh.execute_command(cmd_arp)
-
-            if success and stdout:
-                online_count = int(stdout.strip())
+            if online_count is not None:
                 logger.info(f"[{self.sn}] POE设备检测结果: 发现 {online_count} 个REACHABLE设备，期望 {expected} 个")
 
                 detail_lines.append(f"在线设备: {online_count} / 期望 {expected}")
@@ -244,13 +227,51 @@ class DeviceTester:
                                      '\n'.join(detail_lines))
                     logger.warning(f"[{self.sn}] POE 检测失败: {online_count}/{expected}")
             else:
-                result.set_failed("执行失败", stderr)
-                logger.error(f"[{self.sn}] POE 检测命令执行失败: {stderr}")
+                result.set_failed("执行失败", err)
+                logger.error(f"[{self.sn}] POE 检测命令执行失败: {err}")
         except Exception as e:
             result.set_failed("异常", str(e))
             logger.error(f"[{self.sn}] POE 检测异常: {e}")
 
         return result
+
+    def check_poe_cleared(self) -> tuple:
+        """打印标签前的强校验：POE 口当前在线设备数必须为 0
+
+        与 `test_poe_ports()` 的判定方向相反 —— 那边要求「至少有 expected 路」，
+        这边要求「一路都没有」，所以不能复用检测结论，只能重新数一次。
+
+        为什么要**清表后重数**：POE 设备拔掉后，设备侧 ARP 表里的条目不会立刻消失
+        （REACHABLE 还会残留一段时间），不清表直接数会把刚拔掉的设备算进去，
+        校验永远不通过、现场以为没拔干净。
+
+        Returns:
+            (是否已清零, 提示文本)
+            未清零时仅提示在线数量，统计失败时提示失败原因
+        """
+        try:
+            if self.chip_config.poe_count == 0:
+                return True, '该芯片未配置 POE 口，跳过校验'
+
+            target = poe_net.resolve(self.ssh, iface=config.poe_interface,
+                                     fallback_subnet=config.poe_subnet)
+            logger.info(f"[{self.sn}] 打印前 POE 校验，扫描网段: {target.label}"
+                        f" ({target.source})")
+
+            online, neighbours, err = poe_net.count_online(self.ssh, target)
+            if online is None:
+                logger.error(f"[{self.sn}] 打印前 POE 校验无法统计: {err}")
+                return False, f'无法确认 POE 口状态：{err}'
+
+            if online == 0:
+                logger.info(f"[{self.sn}] 打印前 POE 校验通过：在线 0 路")
+                return True, 'POE 口在线设备数为 0'
+
+            logger.warning(f"[{self.sn}] 打印前 POE 校验未通过：在线 {online} 台\n{neighbours}")
+            return False, f'POE 口仍检测到 {online} 台在线设备，请拔掉全部 POE 设备后重试。'
+        except Exception as e:
+            logger.error(f"[{self.sn}] 打印前 POE 校验异常: {e}", exc_info=True)
+            return False, f'POE 校验异常: {e}'
 
     def _get_disk_firmware(self, dev_name: str) -> str:
         """通过 smartctl -a /dev/xxx 读取硬盘固件版本（Firmware Version）"""
@@ -591,6 +612,124 @@ class DeviceTester:
 
     # ---- MAC 烧写 ----
 
+    def _switch_to_factory(self, reason: str = 'MAC烧写') -> tuple:
+        """释放 ble_soc 后切换产测模式，返回 (是否可以继续烧写, 详情行列表)
+
+        顺序固定，不能反：先杀 wd24h-edge-core(java) 释放 ble_soc，
+        再 `ws73-modules switch factory`。若模组仍被业务占用，切换会直接报
+        `Module ble_soc is in use`，此时烧写必然全部失败。
+
+        切换后仍报 in use（java 被守护脚本拉起）时，再清一次进程重试一次。
+
+        Returns:
+            (ok, notes)：ok=False 表示 ble_soc 仍未释放，调用方应立即中止；
+            notes 是可以直接塞进检测详情的说明行
+        """
+        notes = []
+        released, msg = self.release_ble_soc(reason)
+        notes.append(f"释放 ble_soc: {msg}")
+        if not released:
+            return False, notes
+
+        logger.info(f"[{self.sn}] {self.chip_config.chip_type} 芯片，执行 ws73-modules switch factory...")
+        success, stdout, stderr = self.ssh.execute_command("ws73-modules switch factory", timeout=120)
+        out = f"{stdout}\n{stderr}".strip()
+
+        if 'in use' in out.lower():
+            logger.warning(f"[{self.sn}] ws73-modules 报模块被占用，重新清理进程后重试")
+            released, msg = self.release_ble_soc(f'{reason}重试')
+            notes.append(f"重试释放 ble_soc: {msg}")
+            if released:
+                success, stdout, stderr = self.ssh.execute_command(
+                    "ws73-modules switch factory", timeout=120)
+                out = f"{stdout}\n{stderr}".strip()
+
+        logger.info(f"[{self.sn}] ws73-modules 输出:\n{out}")
+
+        if 'in use' in out.lower():
+            logger.error(f"[{self.sn}] ble_soc 释放后仍被占用，中止 MAC 烧写")
+            notes.append(f"ble_soc 仍被占用: {out or '无输出'}")
+            return False, notes
+
+        if success:
+            notes.append("产测模式已加载 (ws73-modules)")
+        else:
+            logger.warning(f"[{self.sn}] ws73-modules 切换失败: {out}")
+            notes.append(f"产测模式切换警告: {out or '无输出'}")
+        return True, notes
+
+    def release_ble_soc(self, reason: str = '') -> tuple:
+        """释放 ble_soc 占用：杀掉业务侧 Java 进程，再做一次兜底回收
+
+        `ws73-modules switch factory` 要重新加载 8800 无线模组，若 wd24h-edge-core
+        （java）还在跑，模组处于 business 模式被业务占用，切换会直接报
+        `Module ble_soc is in use`，随后的 MAC 烧写自然全部失败。
+
+        处理顺序与蓝牙检测脚本（config/blescan.sh）保持一致：先 SIGKILL java，
+        再等内核回收，最后确认真的没了。
+
+        Args:
+            reason: 写日志用的场景说明（如 'MAC烧写'）
+
+        Returns:
+            (释放成功, 说明)
+        """
+        tag = f'[{self.sn}]{"" if not reason else " " + reason}'
+        pkgs = self._ble_holder_processes()
+        if not pkgs:
+            logger.info(f"{tag} 未发现占用 ble_soc 的 java 进程")
+            return True, '无 java 进程占用'
+
+        logger.info(f"{tag} 检测到占用 ble_soc 的 java 进程: {pkgs}，开始清理")
+        self.ssh.execute_command('pkill -9 -x java', timeout=10)
+        self.ssh.execute_command('pkill -9 -f wd24h-edge-core', timeout=10)
+
+        for _ in range(6):
+            time.sleep(0.5)
+            if not self._ble_holder_processes():
+                logger.info(f"{tag} java 进程已清理")
+                return True, '已清理 java 进程'
+
+        remain = self._ble_holder_processes()
+        logger.warning(f"{tag} java 进程未能完全清理: {remain}")
+        return False, f'java 进程残留: {remain}'
+
+    BLE_HOLDER_PATTERNS = ('java', 'wd24h-edge-core')
+
+    def _ps_supports_ef(self) -> bool:
+        """本机 ps 是否支持 -ef，探测一次后缓存
+
+        不能靠 `ps -ef | grep ...` 的退出码判断：grep 无匹配时也返回非 0，
+        与「ps 不认 -ef」的表现完全一样，那样会在空闲设备上无谓地退回裸 ps，
+        还打一条误导性的 warning。所以单独探测一次真正的 ps，结果缓存。
+        """
+        cached = getattr(self, '_ps_ef_ok', None)
+        if cached is None:
+            ok, _, _ = self.ssh.execute_command('ps -ef > /dev/null 2>&1', timeout=5)
+            cached = self._ps_ef_ok = bool(ok)
+            if not cached:
+                logger.warning(f"[{self.sn}] ps 不支持 -ef（裁剪版 BusyBox），改用裸 ps 读进程表")
+        return cached
+
+    def _ble_holder_processes(self) -> str:
+        """返回仍在运行的占用进程（ps 行），空串表示已无占用
+
+        必须用 `ps -ef`：裸 `ps` 的 COMMAND 列只有可执行文件名（还会按宽度截断），
+        `wd24h-edge-core` 是 java 的 jar 参数，根本不会出现在那一列里，
+        按它兜底匹配等于白匹配；只有带全量命令行才有意义。
+
+        设备是 BusyBox，`pgrep` 不一定存在（blescan.sh 用过，但别处固件缺），
+        所以走 ps + grep。极少数裁剪版 BusyBox 的 ps 不认 `-ef`（报 invalid option），
+        此时退回裸 `ps`：那种固件的 COMMAND 列本身就是完整 cmdline，够用。
+        """
+        pattern = '|'.join(self.BLE_HOLDER_PATTERNS)
+        ps_cmd = 'ps -ef' if self._ps_supports_ef() else 'ps'
+        success, stdout, stderr = self.ssh.execute_command(
+            f"{ps_cmd} | grep -E '{pattern}' | grep -v grep", timeout=10)
+        if not success and not stdout:
+            return ''
+        return stdout.strip()
+
     def _exec_and_read_dmesg(self, cmd: str) -> str:
         """写 /sys/ccsys/ccpriv 后读 dmesg 最后几行，返回拼接的文本"""
         self.ssh.execute_command(cmd, timeout=10)
@@ -673,15 +812,11 @@ class DeviceTester:
             # 3. 需要烧写，先切换到产测模式
             logger.info(f"[{self.sn}] 检测到未烧写的MAC，切换产测模式...")
             if self.chip_config.chip_type in ['hisi', 'wdse']:
-                # hisi 和 RK3576 使用统一的 ws73-modules 切换产测模式
-                logger.info(f"[{self.sn}] {self.chip_config.chip_type} 芯片，执行 ws73-modules switch factory...")
-                success, stdout, stderr = self.ssh.execute_command("ws73-modules switch factory", timeout=120)
-                logger.info(f"[{self.sn}] ws73-modules 输出:\n{stdout}")
-                if success:
-                    details.append("产测模式已加载 (ws73-modules)")
-                else:
-                    logger.warning(f"[{self.sn}] ws73-modules 切换失败: {stderr}")
-                    details.append(f"产测模式切换警告: {stderr}")
+                ok, notes = self._switch_to_factory('MAC烧写')
+                details.extend(notes)
+                if not ok:
+                    result.set_failed("ble_soc 被占用", "\n".join(details))
+                    return result
                 time.sleep(2)  # 等待模块加载完成
             else:
                 logger.info(f"[{self.sn}] {self.chip_config.chip_type} 芯片，跳过产测模式切换")
@@ -1417,7 +1552,7 @@ class DeviceTester:
         3. 判定并配置关机时间（不是 3 天才写）
         4. 上锁，并回读确认（上锁后 0x44 应为 0x00）
 
-        **地址字按电池品牌选择**（见 src/master_control/core/battery_profile.py）：
+        **地址字按电池品牌选择**（见 src/core/battery_profile.py）：
         格瑞普是 0xD04B / 0x044C，九夷是 0x8B48 / 0xAF48。旧实现把格瑞普的
         地址字写死，换九夷后读不到、写错地址，现场却只看到「已配置」的日志。
 

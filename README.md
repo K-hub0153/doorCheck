@@ -96,6 +96,12 @@ python tools/master_control/smoke_scan_entry.py
 
 已迁移原始主控工程 `mcChecker` 的提交 `c8de99ff3b584e973b7a8f399c2a87427f029016`（`usb_ble_fix`），保留本工程的独立主控配置、共享日志与统一版本号。
 
+另已同步 `release` 分支 2026 年 11 月 6 日至 11 月 9 日的功能改动（截至 `ce0664a`），不引入上游测试脚本；上游独立工具的 `v1.4.5` 窗口版本不覆盖本工程统一版本号。
+
+- MAC 烧写：WiFi / 星闪 MAC 均已烧写时直接通过；需要烧写时，先清理占用 `ble_soc` 的 Java / `wd24h-edge-core` 进程，再切换产测模式。进程检查优先使用 `ps -ef`，不支持时回退 `ps`；模组仍被占用则中止烧写。
+- 打印前 POE 校验：清空设备侧邻居表、重新扫描并统计在线数量，只有在线数为 0 才允许上传、打印及清除设备数据。扫描或统计失败时阻止打印；弹窗仅显示在线数量，邻居表详情写日志。校验在后台线程执行，重复点击不会启动同设备的并行校验。
+- POE 校验配置：沿用 `config/master_control/config.yaml` 的 `printer.confirm_poe_unplugged`，默认开启；设为 `false` 会跳过强校验，仅建议用于无 POE 口的产线。芯片配置的 POE 口数量为 0 时自动跳过。
+
 - USB 接口：RK3576 使用 Type-A，海思 310P 使用 Type-C。测试前接入 USB 3.0 设备；读取 `lsusb -t`，不可用时退回 sysfs。默认协商速率至少 5000 Mbps 才通过，不将 root hub 自身计为设备。USB 已接入单项检测、一键测试、打印门限、历史记录和上传。
 - USB 配置：在 `config/master_control/config.yaml` 的 `usb` 节点设置 `min_speed_mbps`、`probe_retries` 和 `probe_interval`；芯片的 `usb_detection`、`usb_connector` 分别控制检测开关与接口名称。
 - 内置硬盘：发现设备与硬盘检测共用识别逻辑，排除 USB/可移动存储，优先显示 NVMe、SATA，再到 eMMC。只接 U 盘时不会将 U 盘作为内置硬盘，卡片明确提示缺少内置盘。

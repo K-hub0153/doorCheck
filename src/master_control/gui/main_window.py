@@ -121,6 +121,38 @@ class SwitchModeWorker(QThread):
             logger.error(f"切换模式线程异常: {e}", exc_info=True)
 
 
+class PoeClearCheckWorker(QThread):
+    """打印前的 POE 拔除强校验（清邻居表 → ping → 数在线设备）
+
+    扫描整段最多要 30s（254 个地址并发 ping），必须放到子线程，
+    否则同步跑会卡死界面、看起来像程序没响应。
+    """
+
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)   # (已清零, 给现场看的提示)
+
+    def __init__(self, sn: str, tester):
+        super().__init__()
+        self.sn = sn
+        self.tester = tester
+
+    def run(self):
+        try:
+            self.log_signal.emit(f"[{self.sn}] 打印前校验 POE 口是否已全部拔除...")
+            ok, message = self.tester.check_poe_cleared()
+            if ok:
+                self.log_signal.emit(f"[{self.sn}] POE 校验通过: {message}")
+            else:
+                self.log_signal.emit(f"[{self.sn}] POE 校验未通过: {message.splitlines()[0]}")
+            self.finished_signal.emit(ok, message)
+        except Exception as e:
+            logger.error(f"[{self.sn}] POE 校验线程异常: {e}", exc_info=True)
+            try:
+                self.finished_signal.emit(False, f"POE 校验异常: {e}")
+            except Exception:
+                pass
+
+
 class TestWorker(QThread):
 
     log_signal = pyqtSignal(str)
@@ -395,6 +427,7 @@ class MainWindow(QMainWindow):
         self.device_auto_workers = {}  # {sn: AutoTestWorker}
         self.device_os_workers = {}    # {sn: OsVersionWorker}
         self.device_connect_workers = {}  # {sn: DeviceConnectWorker}
+        self._poe_check_workers = {}
 
         self.discovery_worker = None
         self.test_results_window = None
@@ -676,6 +709,11 @@ class MainWindow(QMainWindow):
 
     def _cleanup_device(self, sn: str):
         """清理设备的所有资源"""
+        poe_worker = self._poe_check_workers.pop(sn, None)
+        if poe_worker:
+            poe_worker.finished_signal.disconnect()
+            self._stop_worker(poe_worker, "PoeClearCheckWorker", sn)
+
         # 停止正在运行的 worker（每个都必须等到真正结束）
         auto_worker = self.device_auto_workers.pop(sn, None)
         if auto_worker:
@@ -1114,9 +1152,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("打印机配置已更新，已立即生效", 3000)
 
     def on_print_label(self, sn: str):
+        """打印标签入口：先做门控，再异步跑 POE 拔除强校验
+
+        POE 校验要 ping 整段（最多 30s），必须放子线程；校验通过后才进
+        `_do_print_label` 做上传 + 打印 + 清数据。
+        """
         try:
-            # 门控：默认要求所有检测项通过；printer.require_all_passed=false 时免检
             panel = self.device_panels.get(sn)
+
+            running = self._poe_check_workers.get(sn)
+            if running and running.isRunning():
+                self.statusBar().showMessage(f"正在校验 POE 口状态: {sn}，请稍候")
+                return
+
+            # 门控：默认要求所有检测项通过；printer.require_all_passed=false 时免检
             if config.print_require_all_passed and panel and not panel.all_tests_passed():
                 not_passed = panel.get_not_passed_display_names()
                 QMessageBox.warning(
@@ -1133,19 +1182,55 @@ class MainWindow(QMainWindow):
                     f"[{sn}] 已关闭检测项校验（printer.require_all_passed=false），"
                     f"仍允许打印，未通过项: {panel.get_not_passed_display_names()}")
 
-            # ========== 步骤1：打印前 POE 拔除确认 ==========
-            if config.print_confirm_poe_unplugged:
-                reply = QMessageBox.question(
-                    self, "打印前确认",
-                    "请确认：\n\n已拔掉所有 POE 设备（摄像头等）\n\n是否继续打印？",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-                if reply == QMessageBox.No:
-                    self.statusBar().showMessage("已取消打印")
-                    logger.info(f"[{sn}] 用户取消打印（未确认拔除POE设备）")
-                    return
+            if not config.print_confirm_poe_unplugged:
+                logger.warning(f"[{sn}] 已关闭 POE 校验"
+                               f"（printer.confirm_poe_unplugged=false），直接打印")
+                self._do_print_label(sn)
+                return
 
+            tester = self.device_testers.get(sn)
+            if not tester or not tester.ssh or not tester.ssh.connected:
+                QMessageBox.warning(
+                    self, "无法校验 POE 口",
+                    f"设备 {sn} 未连接，无法确认 POE 口是否已拔除，已阻止打印。\n\n"
+                    "请重新连接设备后再打印。")
+                logger.warning(f"[{sn}] 打印被拒绝：设备未连接，无法做 POE 校验")
+                return
+
+            worker = PoeClearCheckWorker(sn, tester)
+            if panel:
+                worker.log_signal.connect(panel.append_log)
+            worker.finished_signal.connect(
+                lambda ok, msg, w=worker: self._on_poe_check_finished(ok, msg, w, sn))
+            self.statusBar().showMessage(f"正在校验 POE 口是否已全部拔除: {sn}...")
+            self._poe_check_workers[sn] = worker
+            worker.start()
+            return
+
+        except Exception as e:
+            logger.error(f"[{sn}] 打印入口异常: {e}", exc_info=True)
+            QMessageBox.critical(self, "打印异常", str(e))
+
+    def _on_poe_check_finished(self, cleared: bool, message: str, worker=None, sn: str = ''):
+        """POE 强校验结束：清零才继续打印，否则明确告知当前在线数量"""
+        if worker is not None:
+            if self._poe_check_workers.get(sn) is not worker:
+                return
+            self._stop_worker(worker, "PoeClearCheckWorker", sn or "?")
+            self._poe_check_workers.pop(sn, None)
+
+        if not cleared:
+            self.statusBar().showMessage("POE 未拔除，已阻止打印")
+            QMessageBox.warning(self, "无法打印标签", message)
+            logger.warning(f"[{sn}] 打印被拒绝（POE 仍有在线设备或无法确认）")
+            return
+
+        self.statusBar().showMessage(f"POE 校验通过: {sn}", 3000)
+        self._do_print_label(sn)
+
+    def _do_print_label(self, sn: str):
+        """POE 校验通过后的打印主体：上传数据 → 打印标签 → 清除设备数据"""
+        try:
             # 获取设备所有测试记录
             records = self.database.get_records_by_sn(sn)
             if not records:

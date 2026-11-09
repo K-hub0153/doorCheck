@@ -189,10 +189,14 @@ class Config:
 
     @property
     def print_confirm_poe_unplugged(self):
-        """打印前是否弹窗提示拔掉所有 POE 设备
+        """打印前是否执行 POE 拔除校验
 
-        由 config.yaml 的 printer.confirm_poe_unplugged 控制，
-        设为 false 时直接打印，不弹确认框。
+        由 config.yaml 的 printer.confirm_poe_unplugged 控制。
+
+        **这是强校验，不是弹窗确认**：打开时实测设备 POE 网口在线设备数，
+        必须为 0 才允许打印；仍有在线设备、或统计失败（无法确认），一律阻止打印。
+
+        设为 false 时跳过校验直接打印 —— 只建议在设备不带 POE 口的产线使用。
         """
         return self._as_bool(self.get('printer.confirm_poe_unplugged', True))
 

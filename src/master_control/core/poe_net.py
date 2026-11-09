@@ -217,3 +217,35 @@ def build_neigh_detail_command(target: ScanTarget) -> str:
 def build_neigh_count_command(target: ScanTarget) -> str:
     """统计在线（REACHABLE）设备数"""
     return build_neigh_detail_command(target) + " | grep 'REACHABLE' | wc -l"
+
+
+def count_online(ssh, target: ScanTarget, flush: bool = True) -> Tuple[Optional[int], str, str]:
+    """清邻居表 → 并发 ping 整段 → 统计 REACHABLE 数量
+
+    供「打印前 POE 必须已拔除」这种只关心**当前有几路在线**的场景使用，
+    与 `test_poe_ports()` 的判定（够不够 expected 路）分开。
+
+    `flush=True` 是必须的：拔掉 POE 设备后 ARP 表里会残留 REACHABLE/STALE 条目，
+    不清表直接数会把刚拔掉的设备算进去，校验永远不通过。清表后重新 ping，
+    不回应答的地址不会重新进表，数量才是真实的。
+
+    Returns:
+        (在线数, 邻居表文本, 失败原因)
+        在线数为 None 表示统计失败，此时第三条是失败原因
+    """
+    if flush:
+        ssh.execute_command(build_flush_command(target), timeout=PROBE_TIMEOUT)
+
+    ok, _, stderr = ssh.execute_command(build_ping_command(target), timeout=PING_TIMEOUT)
+    if not ok:
+        return None, '', f'ping 扫描失败: {(stderr or "").strip() or "命令非零退出"}'
+
+    _, neighbours, _ = ssh.execute_command(build_neigh_detail_command(target), timeout=PROBE_TIMEOUT)
+
+    ok, stdout, stderr = ssh.execute_command(build_neigh_count_command(target),
+                                             timeout=PROBE_TIMEOUT)
+    text = (stdout or '').strip()
+    if not ok or not text.isdigit():
+        return None, neighbours, (
+            f'邻居表统计失败: {(stderr or "").strip() or text or "无输出"}')
+    return int(text), neighbours, ''
