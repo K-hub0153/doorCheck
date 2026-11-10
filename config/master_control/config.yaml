@@ -72,12 +72,14 @@ printer:
         y: 128
         font_size: 15
         bold: false
+        font_path: assets/fonts/方正兰亭圆简体.TTF
       - type: text
         key: sn
         x: 27
         y: 181
         font_size: 15
         bold: false
+        font_path: assets/fonts/方正兰亭圆简体.TTF
       - type: qrcode
         key: sn
         x: 260

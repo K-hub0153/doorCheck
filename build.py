@@ -198,10 +198,15 @@ class BuildScript:
             if not resource.is_file():
                 self.print_error(f"主控资源不存在: {resource}")
                 all_exist = False
-        master_font = self.project_root / "assets" / "fonts" / "label.ttf"
-        if not master_font.is_file():
-            self.print_error(f"共享标签字体不存在: {master_font}")
-            all_exist = False
+        # 标签字体统一随 assets 目录打包进程序；缺少任一字体都应阻止构建，
+        # 避免打包后主控标签静默回退到默认字体。
+        for font_name in ("label.ttf", "方正兰亭圆简体.TTF"):
+            font_path = self.project_root / "assets" / "fonts" / font_name
+            if not font_path.is_file():
+                self.print_error(f"标签字体不存在: {font_path}")
+                all_exist = False
+            else:
+                self.print_success(f"标签字体: assets/fonts/{font_name}")
 
         # 检查证书文件
         certs_dir = self.project_root / "certs"

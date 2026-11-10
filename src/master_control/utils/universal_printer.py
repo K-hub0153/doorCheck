@@ -418,9 +418,9 @@ class UniversalPrinter:
         zpl += "^XZ\n"  # 标签结束
         return zpl
 
-    def _resolve_font_path(self) -> Optional[str]:
+    def _resolve_font_path(self, font_path: Optional[str] = None) -> Optional[str]:
         """解析字体文件路径（支持绝对路径、打包目录、exe 同级、工程根目录）"""
-        font_path = self.zpl_layout.get('font_path')
+        font_path = font_path or self.zpl_layout.get('font_path')
         if not font_path:
             return None
         if os.path.isabs(font_path) and os.path.exists(font_path):
@@ -562,13 +562,12 @@ class UniversalPrinter:
         draw = ImageDraw.Draw(rgb)
         design_dpi = float(self.template.get('design_dpi', 203) or 203)
         scale = self.dpi / design_dpi
-        font_path = self._resolve_font_path()
-
         def scaled(value, minimum=0):
             return max(minimum, int(round(float(value) * scale)))
 
         def load_font(field):
             size = scaled(field.get('font_size', 16), 1)
+            font_path = self._resolve_font_path(field.get('font_path'))
             if font_path:
                 try:
                     return ImageFont.truetype(font_path, size)
