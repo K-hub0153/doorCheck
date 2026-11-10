@@ -615,11 +615,28 @@ class UniversalPrinter:
                 'center': 'mt',
                 'right': 'rt',
             }.get(str(field.get('align', '')).lower())
-            draw.text(
-                (x, y), content, font=font, fill='black',
-                stroke_width=bold_width, stroke_fill='black',
-                anchor=anchor,
-            )
+            text_threshold = field.get('text_threshold')
+            if text_threshold is None:
+                draw.text(
+                    (x, y), content, font=font, fill='black',
+                    stroke_width=bold_width, stroke_fill='black',
+                    anchor=anchor,
+                )
+            else:
+                # 203 DPI 下 1 点描边会显得过粗。单独渲染灰度文字，再用字段阈值
+                # 吸收部分抗锯齿边缘，可获得介于原字重和 1 点描边之间的效果。
+                text_mask = Image.new('L', (label_w, label_h), 255)
+                ImageDraw.Draw(text_mask).text(
+                    (x, y), content, font=font, fill=0,
+                    stroke_width=bold_width, stroke_fill=0,
+                    anchor=anchor,
+                )
+                threshold = max(0, min(255, int(text_threshold)))
+                ink_mask = text_mask.point(
+                    lambda value: 255 if value < threshold else 0,
+                    mode='L',
+                )
+                rgb.paste('black', mask=ink_mask)
 
         threshold = int(self.template.get('threshold', 160))
         return rgb.convert('L').point(

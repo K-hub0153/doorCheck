@@ -73,6 +73,7 @@ printer:
         font_size: 15
         bold: false
         font_path: assets/fonts/方正兰亭圆简体.TTF
+        text_threshold: 205
       - type: text
         key: sn
         x: 27
@@ -80,6 +81,7 @@ printer:
         font_size: 15
         bold: false
         font_path: assets/fonts/方正兰亭圆简体.TTF
+        text_threshold: 205
       - type: qrcode
         key: sn
         x: 260
