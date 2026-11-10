@@ -438,7 +438,8 @@ DPI: {dpi}
                 'paper_width_mm': self.width_spin.value(),
                 'paper_height_mm': self.height_spin.value(),
                 'tspl_layout': self.current_config.get('printer', {}).get('tspl_layout', {}),
-                'zpl_layout': self.current_config.get('printer', {}).get('zpl_layout', {})
+                'zpl_layout': self.current_config.get('printer', {}).get('zpl_layout', {}),
+                'template': self.current_config.get('printer', {}).get('template'),
             }
             
             printer = UniversalPrinter(test_config)

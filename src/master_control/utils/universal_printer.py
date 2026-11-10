@@ -2,7 +2,8 @@ import os
 import socket
 import sys
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -94,6 +95,54 @@ class UniversalPrinter:
         # 布局配置
         self.tspl_layout = cfg.get('tspl_layout', {}) or {}
         self.zpl_layout = cfg.get('zpl_layout', {}) or {}
+
+        # 产品固定内容由底图提供，更换产品只需修改 template.background_image。
+        self.template = self._select_template(cfg)
+
+    @staticmethod
+    def _select_template(cfg: dict) -> dict:
+        """读取单模板配置，并兼容早期的“模板名 + templates”结构。"""
+        template = cfg.get('template')
+        if isinstance(template, dict):
+            return template
+        if not template:
+            return {}
+        legacy_template = (cfg.get('templates', {}) or {}).get(template)
+        if not isinstance(legacy_template, dict):
+            logger.warning(f"打印模板不存在: {template}，将使用旧版布局")
+            return {}
+        return legacy_template
+
+    def _label_size_mm(self):
+        """模板可覆盖标签物理尺寸，便于不同主控使用不同规格标签。"""
+        return (
+            float(self.template.get('paper_width', self.paper_width)),
+            float(self.template.get('paper_height', self.paper_height)),
+        )
+
+    def _label_pixels(self):
+        width_mm, height_mm = self._label_size_mm()
+        return (
+            max(1, round(width_mm * self.dpi / 25.4)),
+            max(1, round(height_mm * self.dpi / 25.4)),
+        )
+
+    def _resolve_template_image(self) -> Optional[Path]:
+        """解析相对 config/master_control 的模板底图路径。"""
+        image_name = self.template.get('background_image')
+        if not image_name:
+            return None
+
+        image_path = Path(str(image_name))
+        if image_path.is_absolute():
+            candidate = image_path
+        else:
+            from .paths import config_dir
+            candidate = config_dir() / image_path
+
+        if not candidate.is_file():
+            raise FileNotFoundError(f"标签模板底图不存在: {candidate}")
+        return candidate
 
     def _detect_protocol(self) -> str:
         """根据打印机名称检测协议"""
@@ -231,6 +280,33 @@ class UniversalPrinter:
         
         return tspl
 
+    def _build_tspl_bitmap(self, sn: str, capacity: str = '') -> bytes:
+        """把模板整图作为 TSPL BITMAP 输出，条码内容与底图一次打印。"""
+        img = self._render_template_bitmap(sn, capacity)
+        width, height = img.size
+        width_bytes = (width + 7) // 8
+        pixels = img.load()
+        bitmap = bytearray(width_bytes * height)
+        for y in range(height):
+            for x in range(width):
+                if pixels[x, y] == 0:
+                    bitmap[y * width_bytes + x // 8] |= 0x80 >> (x % 8)
+
+        width_mm, height_mm = self._label_size_mm()
+        prefix = (
+            "CLS\n"
+            f"SIZE {width_mm:g} mm, {height_mm:g} mm\n"
+            "GAP 2 mm, 0 mm\n"
+            "DIRECTION 1\n"
+            "SPEED 4\n"
+            "DENSITY 10\n"
+            "REFERENCE 0,0\n"
+            "SET TEAR ON\n"
+            "CLS\n"
+            f"BITMAP 0,0,{width_bytes},{height},0,"
+        ).encode('ascii')
+        return prefix + bytes(bitmap) + b"\nPRINT 1,1\n"
+
     def _build_zpl_commands(self, sn: str, capacity: str = '') -> str:
         """构建 ZPL 打印指令
 
@@ -239,6 +315,8 @@ class UniversalPrinter:
                   转 ^GFA 发送。字体和二维码完全可控，不受打印机内置字体限制。
         - native: 使用打印机内置字体(^A/^BQN)，兼容旧行为。
         """
+        if self.template:
+            return self._build_zpl_bitmap(sn, capacity)
         render_mode = self.zpl_layout.get('render_mode', 'native')
         if render_mode == 'bitmap':
             return self._build_zpl_bitmap(sn, capacity)
@@ -362,6 +440,9 @@ class UniversalPrinter:
         渲染时按 dpi/design_dpi 缩放到当前打印机分辨率。
         仅渲染可变字段，预印内容由标签纸自带。
         """
+        if self.template:
+            return self._render_template_bitmap(sn, capacity)
+
         label_w = int(self.paper_width * self.dpi / 25.4)
         label_h = int(self.paper_height * self.dpi / 25.4)
 
@@ -461,6 +542,87 @@ class UniversalPrinter:
 
         return img
 
+    def _render_template_bitmap(self, sn: str, capacity: str = ''):
+        """按配置加载产品底图并叠加日期、SN、容量和二维码。"""
+        label_w, label_h = self._label_pixels()
+        background_path = self._resolve_template_image()
+        if background_path:
+            with Image.open(background_path) as source:
+                source = source.convert('RGBA')
+                source.thumbnail((label_w, label_h), Image.Resampling.LANCZOS)
+                rgb = Image.new('RGB', (label_w, label_h), 'white')
+                rgb.paste(
+                    source,
+                    ((label_w - source.width) // 2, (label_h - source.height) // 2),
+                    source,
+                )
+        else:
+            rgb = Image.new('RGB', (label_w, label_h), 'white')
+
+        draw = ImageDraw.Draw(rgb)
+        design_dpi = float(self.template.get('design_dpi', 203) or 203)
+        scale = self.dpi / design_dpi
+        font_path = self._resolve_font_path()
+
+        def scaled(value, minimum=0):
+            return max(minimum, int(round(float(value) * scale)))
+
+        def load_font(field):
+            size = scaled(field.get('font_size', 16), 1)
+            if font_path:
+                try:
+                    return ImageFont.truetype(font_path, size)
+                except Exception as exc:
+                    logger.error(f"加载字体失败({font_path}): {exc}")
+            return ImageFont.load_default()
+
+        for field in self.template.get('fields', []):
+            field_type = field.get('type')
+            x = scaled(field.get('x', 0))
+            y = scaled(field.get('y', 0))
+
+            if field_type == 'qrcode':
+                size_px = scaled(field.get('size', field.get('size_px', 80)), 1)
+                ecc_map = {
+                    'L': qrcode.constants.ERROR_CORRECT_L,
+                    'M': qrcode.constants.ERROR_CORRECT_M,
+                    'Q': qrcode.constants.ERROR_CORRECT_Q,
+                    'H': qrcode.constants.ERROR_CORRECT_H,
+                }
+                ecc = ecc_map.get(
+                    str(field.get('error_correction', 'M')).upper(),
+                    qrcode.constants.ERROR_CORRECT_M,
+                )
+                rgb.paste(self._render_qr_fixed_size(sn, size_px, ecc).convert('RGB'), (x, y))
+                continue
+
+            if field_type == 'date':
+                content = datetime.now().strftime(field.get('format', '%Y/%m/%d'))
+            elif field_type == 'text':
+                content = f"{field.get('label', '')}{sn}"
+            elif field_type == 'disk_size':
+                if not capacity:
+                    continue
+                content = f"{field.get('label', '')}{capacity}"
+            elif field_type == 'model':
+                content = str(field.get('value', ''))
+            else:
+                logger.warning(f"忽略未知模板字段类型: {field_type}")
+                continue
+
+            font = load_font(field)
+            bold_width = scaled(field.get('bold_width', 1 if field.get('bold') else 0))
+            draw.text(
+                (x, y), content, font=font, fill='black',
+                stroke_width=bold_width, stroke_fill='black',
+            )
+
+        threshold = int(self.template.get('threshold', 160))
+        return rgb.convert('L').point(
+            lambda value: 255 if value >= threshold else 0,
+            mode='1',
+        )
+
     def _qr_target_px(self, qr_cfg: dict, scale: float) -> int:
         """二维码目标外框边长(点)
 
@@ -537,10 +699,8 @@ class UniversalPrinter:
 
     def _build_zpl_bitmap(self, sn: str, capacity: str = '') -> str:
         """构建 ZPL 打印指令（位图渲染模式）"""
-        label_w = int(self.paper_width * self.dpi / 25.4)
-        label_h = int(self.paper_height * self.dpi / 25.4)
-
         img = self._render_label_bitmap(sn, capacity)
+        label_w, label_h = img.size
 
         # 全白位图说明布局坐标落在画布外或渲染失败，此时打出来是空标签。
         # mode '1' 下 0=黑/打印、1=白；getextrema()[0] != 0 表示一个黑点都没有
@@ -563,8 +723,9 @@ class UniversalPrinter:
 
     def _print_tspl(self, sn: str, capacity: str = '') -> bool:
         """TSPL 协议打印"""
-        tspl = self._build_tspl_commands(sn, capacity)
-        logger.info(f"TSPL 指令:\n{tspl}")
+        tspl = (self._build_tspl_bitmap(sn, capacity)
+                if self.template else self._build_tspl_commands(sn, capacity))
+        logger.info("TSPL 模板位图已生成" if isinstance(tspl, bytes) else f"TSPL 指令:\n{tspl}")
         return self._send_raw(tspl)
 
     def _print_zpl(self, sn: str, capacity: str = '') -> bool:
@@ -573,14 +734,15 @@ class UniversalPrinter:
         # logger.info(f"ZPL 指令:\n{zpl}")
         return self._send_raw(zpl)
 
-    def _send_to_network_printer(self, commands: str) -> bool:
+    def _send_to_network_printer(self, commands: Union[str, bytes]) -> bool:
         """通过网络（RAW 9100）发送打印指令"""
         try:
             logger.info(f"发送到网络打印机: {self.printer_ip}:{self.printer_port}")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(3)
                 sock.connect((self.printer_ip, self.printer_port))
-                sock.sendall(commands.encode('utf-8'))
+                data = commands if isinstance(commands, bytes) else commands.encode('utf-8')
+                sock.sendall(data)
             logger.info("网络打印成功")
             return True
         except socket.timeout:
@@ -590,7 +752,7 @@ class UniversalPrinter:
             logger.error(f"网络打印失败: {e}")
             return False
 
-    def _send_raw(self, commands: str) -> bool:
+    def _send_raw(self, commands: Union[str, bytes]) -> bool:
         """发送原始打印指令：优先网络打印，其次 Windows 本地打印机"""
         if self.printer_ip:
             return self._send_to_network_printer(commands)
@@ -600,7 +762,7 @@ class UniversalPrinter:
             return False
 
         try:
-            data = commands.encode('utf-8')
+            data = commands if isinstance(commands, bytes) else commands.encode('utf-8')
             hPrinter = win32print.OpenPrinter(self.printer_name)
             try:
                 win32print.StartDocPrinter(hPrinter, 1, ("Label", None, "RAW"))
