@@ -86,7 +86,7 @@ printer:
         error_correction: M
       - type: disk_size
         x: 306
-        y: 198
+        y: 203
         align: center
         font_size: 16
         bold: true
