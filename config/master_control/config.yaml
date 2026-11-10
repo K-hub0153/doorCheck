@@ -32,7 +32,7 @@ chips:
     fan_detection: true
     has_hdmi: true
     nearlink_detection: true
-    poe_count: 1
+    poe_count: 8
     usb_connector: Type-A
     usb_detection: true
     wifi_detection: true
