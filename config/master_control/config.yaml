@@ -32,7 +32,7 @@ chips:
     fan_detection: true
     has_hdmi: true
     nearlink_detection: true
-    poe_count: 8
+    poe_count: 1
     usb_connector: Type-A
     usb_detection: true
     wifi_detection: true
@@ -68,19 +68,19 @@ printer:
     fields:
       - type: date
         format: '%Y/%m/%d'
-        x: 100
-        y: 132
+        x: 105
+        y: 128
         font_size: 15
-        bold: true
+        bold: false
       - type: text
         key: sn
         x: 27
         y: 181
-        font_size: 14
-        bold: true
+        font_size: 15
+        bold: false
       - type: qrcode
         key: sn
-        x: 288
+        x: 260
         y: 102
         size: 92
         error_correction: M
