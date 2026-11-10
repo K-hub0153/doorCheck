@@ -84,6 +84,12 @@ printer:
         y: 102
         size: 92
         error_correction: M
+      - type: disk_size
+        x: 306
+        y: 198
+        align: center
+        font_size: 16
+        bold: true
   tspl_layout:
     border:
       thickness: 2

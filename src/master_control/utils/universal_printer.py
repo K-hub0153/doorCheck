@@ -612,9 +612,14 @@ class UniversalPrinter:
 
             font = load_font(field)
             bold_width = scaled(field.get('bold_width', 1 if field.get('bold') else 0))
+            anchor = {
+                'center': 'mt',
+                'right': 'rt',
+            }.get(str(field.get('align', '')).lower())
             draw.text(
                 (x, y), content, font=font, fill='black',
                 stroke_width=bold_width, stroke_fill='black',
+                anchor=anchor,
             )
 
         threshold = int(self.template.get('threshold', 160))
