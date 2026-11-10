@@ -93,7 +93,7 @@ printer:
         y: 203
         align: center
         font_size: 16
-        bold: true
+        bold: false
   tspl_layout:
     border:
       thickness: 2
