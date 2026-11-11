@@ -92,12 +92,49 @@ class UniversalPrinter:
         self.paper_width_mm = cfg.get('paper_width_mm', self.paper_width)
         self.paper_height_mm = cfg.get('paper_height_mm', self.paper_height)
 
+        # 整体打印位置校准（毫米）：正数向右/向下，负数向左/向上。
+        # 使用物理单位保存，切换 203/300/600 DPI 时无需重新换算配置。
+        self.offset_x_mm = self._as_float(cfg.get('offset_x_mm', 0), 'offset_x_mm')
+        self.offset_y_mm = self._as_float(cfg.get('offset_y_mm', 0), 'offset_y_mm')
+
         # 布局配置
         self.tspl_layout = cfg.get('tspl_layout', {}) or {}
         self.zpl_layout = cfg.get('zpl_layout', {}) or {}
 
         # 产品固定内容由底图提供，更换产品只需修改 template.background_image。
         self.template = self._select_template(cfg)
+
+    @staticmethod
+    def _as_float(value, name: str) -> float:
+        """把配置值安全转换为浮点数，非法值回退到 0。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"打印偏移配置 {name}={value!r} 无效，已按 0 mm 处理")
+            return 0.0
+
+    def _offset_dots(self):
+        """将毫米偏移换算为当前打印机 DPI 下的点数。"""
+        return (
+            int(round(self.offset_x_mm * self.dpi / 25.4)),
+            int(round(self.offset_y_mm * self.dpi / 25.4)),
+        )
+
+    def _apply_print_offset(self, image: Image.Image) -> Image.Image:
+        """在固定标签画布内平移整张打印内容，超出纸张的部分会被裁切。"""
+        offset_x, offset_y = self._offset_dots()
+        if offset_x == 0 and offset_y == 0:
+            return image
+
+        # 标签画布尺寸保持不变，只移动其中的全部内容。
+        background = 1 if image.mode == '1' else 'white'
+        shifted = Image.new(image.mode, image.size, background)
+        shifted.paste(image, (offset_x, offset_y))
+        logger.info(
+            f"应用整体打印偏移: x={self.offset_x_mm:g}mm ({offset_x}点), "
+            f"y={self.offset_y_mm:g}mm ({offset_y}点), dpi={self.dpi}"
+        )
+        return shifted
 
     @staticmethod
     def _select_template(cfg: dict) -> dict:
@@ -263,17 +300,27 @@ class UniversalPrinter:
             qr_cell_width = max(1, (target_dots + 24) // 25)
 
         # 日期
+        offset_x, offset_y = self._offset_dots()
+
+        def shifted(x, y):
+            # 原生 TSPL 坐标不接受负数；移出纸张时从可打印原点开始裁切。
+            return max(0, x + offset_x), max(0, y + offset_y)
+
         date_str = datetime.now().strftime("%Y/%m/%d")
+        date_x, date_y = shifted(date_x, date_y)
         tspl += f'TEXT {date_x},{date_y},"{date_font}",{date_rotation},{date_x_scale},{date_y_scale},"{date_str}"\n'
 
         # 序列号
+        sn_x, sn_y = shifted(sn_x, sn_y)
         tspl += f'TEXT {sn_x},{sn_y},"{sn_font}",{sn_rotation},{sn_x_scale},{sn_y_scale},"{sn}"\n'
 
         # QR码
+        qr_x, qr_y = shifted(qr_x, qr_y)
         tspl += f'QRCODE {qr_x},{qr_y},M,{qr_cell_width},A,0,M2,S7,"{sn}"\n'
 
         # 硬盘容量（可选）
         if disk_size:
+            disk_x, disk_y = shifted(disk_x, disk_y)
             tspl += f'TEXT {disk_x},{disk_y},"{disk_font}",0,{disk_xs},{disk_ys},"{disk_size}"\n'
 
         tspl += "PRINT 1,1\n"
@@ -282,7 +329,7 @@ class UniversalPrinter:
 
     def _build_tspl_bitmap(self, sn: str, capacity: str = '') -> bytes:
         """把模板整图作为 TSPL BITMAP 输出，条码内容与底图一次打印。"""
-        img = self._render_template_bitmap(sn, capacity)
+        img = self._apply_print_offset(self._render_template_bitmap(sn, capacity))
         width, height = img.size
         width_bytes = (width + 7) // 8
         pixels = img.load()
@@ -330,6 +377,11 @@ class UniversalPrinter:
         zpl = "^XA\n"  # 标签开始
         zpl += f"^PW{label_w}\n"  # 标签宽度（点数）
         zpl += f"^LL{label_h}\n"  # 标签长度（点数）
+        offset_x, offset_y = self._offset_dots()
+
+        def shifted(x, y):
+            # 原生 ZPL 的 ^FO 不接受负数；移出纸张时从可打印原点开始裁切。
+            return max(0, x + offset_x), max(0, y + offset_y)
 
         # 边框（与 TSPL 模板保持一致，绘制外框）
         border_cfg = self.zpl_layout.get('border', {})
@@ -339,6 +391,7 @@ class UniversalPrinter:
             b_y = border_cfg.get('y', 6)
             b_w = border_cfg.get('width', label_w - b_x * 2)
             b_h = border_cfg.get('height', label_h - b_y * 2)
+            b_x, b_y = shifted(b_x, b_y)
             zpl += f"^FO{b_x},{b_y}\n"
             zpl += f"^GB{b_w},{b_h},{b_thickness}^FS\n"
 
@@ -383,7 +436,8 @@ class UniversalPrinter:
                             for dy in range(0, b + 1)
                             if (dx, dy) != (0, 0)]
             for dx, dy in offsets:
-                out += f"^FO{x + dx},{y + dy}\n"
+                field_x, field_y = shifted(x + dx, y + dy)
+                out += f"^FO{field_x},{field_y}\n"
                 out += f"^A{font}N,{font_h},{font_w}\n"
                 out += f"^FD{text}^FS\n"
             return out
@@ -399,6 +453,7 @@ class UniversalPrinter:
                                f"{sn}", sn_cfg.get('bold_width', default_bold))
 
         # QR码（^FD 首字符为纠错等级，与 TSPL 模板保持一致）
+        qr_x, qr_y = shifted(qr_x, qr_y)
         zpl += f"^FO{qr_x},{qr_y}\n"
         zpl += f"^BQN,2,{qr_mag}\n"
         zpl += f"^FD{qr_ecc}A,{sn}^FS\n"
@@ -411,6 +466,7 @@ class UniversalPrinter:
                 disk_y = disk_cfg.get('y', 649)
                 disk_font_h = disk_cfg.get('font_height', 75)
                 disk_font_w = disk_cfg.get('font_width', 75)
+                disk_x, disk_y = shifted(disk_x, disk_y)
                 zpl += f"^FO{disk_x},{disk_y}\n"
                 zpl += f"^CF0,{disk_font_h},{disk_font_w}\n"
                 zpl += f"^FD{capacity}^FS\n"
@@ -720,7 +776,7 @@ class UniversalPrinter:
 
     def _build_zpl_bitmap(self, sn: str, capacity: str = '') -> str:
         """构建 ZPL 打印指令（位图渲染模式）"""
-        img = self._render_label_bitmap(sn, capacity)
+        img = self._apply_print_offset(self._render_label_bitmap(sn, capacity))
         label_w, label_h = img.size
 
         # 全白位图说明布局坐标落在画布外或渲染失败，此时打出来是空标签。

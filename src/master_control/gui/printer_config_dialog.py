@@ -11,7 +11,7 @@ import yaml
 import os
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFormLayout,
-                             QSpinBox, QMessageBox, QTextEdit, QRadioButton,
+                             QSpinBox, QDoubleSpinBox, QMessageBox, QTextEdit, QRadioButton,
                              QButtonGroup)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -237,6 +237,28 @@ class PrinterConfigDialog(QDialog):
         self.height_spin.setValue(30)
         self.height_spin.setSuffix(' mm')
         dpi_layout.addRow('标签高度:', self.height_spin)
+
+        self.offset_x_spin = QDoubleSpinBox()
+        self.offset_x_spin.setRange(-50.0, 50.0)
+        self.offset_x_spin.setDecimals(1)
+        self.offset_x_spin.setSingleStep(0.1)
+        self.offset_x_spin.setSuffix(' mm')
+        self.offset_x_spin.setToolTip('正数向右移动，负数向左移动')
+        dpi_layout.addRow('水平偏移（+右 / -左）:', self.offset_x_spin)
+
+        self.offset_y_spin = QDoubleSpinBox()
+        self.offset_y_spin.setRange(-50.0, 50.0)
+        self.offset_y_spin.setDecimals(1)
+        self.offset_y_spin.setSingleStep(0.1)
+        self.offset_y_spin.setSuffix(' mm')
+        self.offset_y_spin.setToolTip('正数向下移动，负数向上移动')
+        dpi_layout.addRow('垂直偏移（+下 / -上）:', self.offset_y_spin)
+
+        self.dpi_combo.currentTextChanged.connect(self.update_preview)
+        self.width_spin.valueChanged.connect(self.update_preview)
+        self.height_spin.valueChanged.connect(self.update_preview)
+        self.offset_x_spin.valueChanged.connect(self.update_preview)
+        self.offset_y_spin.valueChanged.connect(self.update_preview)
         
         layout.addWidget(dpi_group)
         
@@ -382,6 +404,8 @@ class PrinterConfigDialog(QDialog):
         height = printer_cfg.get('paper_height', 30)
         self.width_spin.setValue(width)
         self.height_spin.setValue(height)
+        self.offset_x_spin.setValue(float(printer_cfg.get('offset_x_mm', 0) or 0))
+        self.offset_y_spin.setValue(float(printer_cfg.get('offset_y_mm', 0) or 0))
         
         # 加载协议设置
         protocol = printer_cfg.get('protocol', 'auto')
@@ -406,11 +430,14 @@ class PrinterConfigDialog(QDialog):
         dpi = self.dpi_combo.currentText()
         width = self.width_spin.value()
         height = self.height_spin.value()
+        offset_x = self.offset_x_spin.value()
+        offset_y = self.offset_y_spin.value()
         
         preview = f"""打印机名称: {printer_name}
 协议模式: {protocol}
 DPI: {dpi}
 标签尺寸: {width} x {height} mm
+整体偏移: 水平 {offset_x:+.1f} mm（+右），垂直 {offset_y:+.1f} mm（+下）
 """
         self.preview_text.setText(preview)
     
@@ -437,6 +464,8 @@ DPI: {dpi}
                 'protocol': protocol,
                 'paper_width_mm': self.width_spin.value(),
                 'paper_height_mm': self.height_spin.value(),
+                'offset_x_mm': self.offset_x_spin.value(),
+                'offset_y_mm': self.offset_y_spin.value(),
                 'tspl_layout': self.current_config.get('printer', {}).get('tspl_layout', {}),
                 'zpl_layout': self.current_config.get('printer', {}).get('zpl_layout', {}),
                 'template': self.current_config.get('printer', {}).get('template'),
@@ -486,6 +515,8 @@ DPI: {dpi}
             config['printer']['paper_height'] = self.height_spin.value()
             config['printer']['paper_width_mm'] = self.width_spin.value()
             config['printer']['paper_height_mm'] = self.height_spin.value()
+            config['printer']['offset_x_mm'] = self.offset_x_spin.value()
+            config['printer']['offset_y_mm'] = self.offset_y_spin.value()
 
             # 保存配置：逐行只改需要动的标量，保住文件里的注释和键顺序
             # 不能用 yaml.dump 整体重写 —— 那会把用户写的注释全部抹掉、键顺序打乱
@@ -497,6 +528,8 @@ DPI: {dpi}
                 'paper_height': self.height_spin.value(),
                 'paper_width_mm': self.width_spin.value(),
                 'paper_height_mm': self.height_spin.value(),
+                'offset_x_mm': self.offset_x_spin.value(),
+                'offset_y_mm': self.offset_y_spin.value(),
             }
 
             with open(config_path, 'r', encoding='utf-8') as f:
