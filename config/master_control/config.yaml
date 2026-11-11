@@ -78,20 +78,17 @@ printer:
         y: 128
         font_size: 15
         bold: false
-        # 细描边使用设计坐标；0.35 在 600 DPI 下约为 1 个打印点，
-        # 比 bold: true（约 3 个打印点）更清晰且不会明显变粗。
-        bold_width: 0.35
         font_path: assets/fonts/方正兰亭圆简体.TTF
-        text_threshold: 205
+        # 比默认 205 多保留少量抗锯齿边缘，轻微加实字重但不增加描边。
+        text_threshold: 215
       - type: text
         key: sn
         x: 27
         y: 181
         font_size: 15
         bold: false
-        bold_width: 0.35
         font_path: assets/fonts/方正兰亭圆简体.TTF
-        text_threshold: 205
+        text_threshold: 215
       - type: qrcode
         key: sn
         x: 250
