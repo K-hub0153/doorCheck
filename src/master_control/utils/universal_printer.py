@@ -94,6 +94,10 @@ class UniversalPrinter:
 
         # 整体打印位置校准（毫米）：正数向右/向下，负数向左/向上。
         # 使用物理单位保存，切换 203/300/600 DPI 时无需重新换算配置。
+        self.print_scale = self._as_float(cfg.get('print_scale', 1.0), 'print_scale')
+        if self.print_scale <= 0:
+            logger.warning(f"整体打印缩放 print_scale={self.print_scale!r} 无效，已按 1.0 处理")
+            self.print_scale = 1.0
         self.offset_x_mm = self._as_float(cfg.get('offset_x_mm', 0), 'offset_x_mm')
         self.offset_y_mm = self._as_float(cfg.get('offset_y_mm', 0), 'offset_y_mm')
 
@@ -136,6 +140,29 @@ class UniversalPrinter:
         )
         return shifted
 
+    def _apply_print_scale(self, image: Image.Image) -> Image.Image:
+        """以标签中心为基准缩放全部内容，标签画布（纸张大小）保持不变。"""
+        if abs(self.print_scale - 1.0) < 1e-9:
+            return image
+
+        width, height = image.size
+        scaled_width = max(1, int(round(width * self.print_scale)))
+        scaled_height = max(1, int(round(height * self.print_scale)))
+        scaled = image.resize((scaled_width, scaled_height), Image.Resampling.NEAREST)
+
+        background = 1 if image.mode == '1' else 'white'
+        canvas = Image.new(image.mode, image.size, background)
+        canvas.paste(scaled, ((width - scaled_width) // 2, (height - scaled_height) // 2))
+        logger.info(
+            f"应用整体打印缩放: {self.print_scale:g} "
+            f"({width}x{height} -> {scaled_width}x{scaled_height}点，纸张画布不变)"
+        )
+        return canvas
+
+    def _apply_print_transform(self, image: Image.Image) -> Image.Image:
+        """先以中心缩放，再应用物理位置偏移。"""
+        return self._apply_print_offset(self._apply_print_scale(image))
+
     @staticmethod
     def _select_template(cfg: dict) -> dict:
         """读取单模板配置，并兼容早期的“模板名 + templates”结构。"""
@@ -151,11 +178,12 @@ class UniversalPrinter:
         return legacy_template
 
     def _label_size_mm(self):
-        """模板可覆盖标签物理尺寸，便于不同主控使用不同规格标签。"""
-        return (
-            float(self.template.get('paper_width', self.paper_width)),
-            float(self.template.get('paper_height', self.paper_height)),
-        )
+        """返回配置页设置的纸张物理尺寸。
+
+        模板里的 paper_width/paper_height 仅是旧版设计元数据，不能覆盖打印配置，
+        否则配置页修改纸张大小后，测试打印和正式打印都会继续使用模板的 50x30。
+        """
+        return float(self.paper_width), float(self.paper_height)
 
     def _label_pixels(self):
         width_mm, height_mm = self._label_size_mm()
@@ -329,7 +357,7 @@ class UniversalPrinter:
 
     def _build_tspl_bitmap(self, sn: str, capacity: str = '') -> bytes:
         """把模板整图作为 TSPL BITMAP 输出，条码内容与底图一次打印。"""
-        img = self._apply_print_offset(self._render_template_bitmap(sn, capacity))
+        img = self._apply_print_transform(self._render_template_bitmap(sn, capacity))
         width, height = img.size
         width_bytes = (width + 7) // 8
         pixels = img.load()
@@ -599,21 +627,25 @@ class UniversalPrinter:
         return img
 
     def _render_template_bitmap(self, sn: str, capacity: str = ''):
-        """按配置加载产品底图并叠加日期、SN、容量和二维码。"""
+        """按模板设计尺寸渲染内容，再居中放入配置页指定的纸张画布。"""
         label_w, label_h = self._label_pixels()
+        design_width_mm = float(self.template.get('paper_width', self.paper_width))
+        design_height_mm = float(self.template.get('paper_height', self.paper_height))
+        content_w = max(1, round(design_width_mm * self.dpi / 25.4))
+        content_h = max(1, round(design_height_mm * self.dpi / 25.4))
         background_path = self._resolve_template_image()
         if background_path:
             with Image.open(background_path) as source:
                 source = source.convert('RGBA')
-                source.thumbnail((label_w, label_h), Image.Resampling.LANCZOS)
-                rgb = Image.new('RGB', (label_w, label_h), 'white')
+                source.thumbnail((content_w, content_h), Image.Resampling.LANCZOS)
+                rgb = Image.new('RGB', (content_w, content_h), 'white')
                 rgb.paste(
                     source,
-                    ((label_w - source.width) // 2, (label_h - source.height) // 2),
+                    ((content_w - source.width) // 2, (content_h - source.height) // 2),
                     source,
                 )
         else:
-            rgb = Image.new('RGB', (label_w, label_h), 'white')
+            rgb = Image.new('RGB', (content_w, content_h), 'white')
 
         draw = ImageDraw.Draw(rgb)
         design_dpi = float(self.template.get('design_dpi', 203) or 203)
@@ -681,7 +713,7 @@ class UniversalPrinter:
             else:
                 # 203 DPI 下 1 点描边会显得过粗。单独渲染灰度文字，再用字段阈值
                 # 吸收部分抗锯齿边缘，可获得介于原字重和 1 点描边之间的效果。
-                text_mask = Image.new('L', (label_w, label_h), 255)
+                text_mask = Image.new('L', (content_w, content_h), 255)
                 ImageDraw.Draw(text_mask).text(
                     (x, y), content, font=font, fill=0,
                     stroke_width=bold_width, stroke_fill=0,
@@ -695,10 +727,18 @@ class UniversalPrinter:
                 rgb.paste('black', mask=ink_mask)
 
         threshold = int(self.template.get('threshold', 160))
-        return rgb.convert('L').point(
+        rendered = rgb.convert('L').point(
             lambda value: 255 if value >= threshold else 0,
             mode='1',
         )
+        if rendered.size == (label_w, label_h):
+            return rendered
+
+        # 纸张尺寸只改变打印画布；模板内容保持其设计物理尺寸，整体大小由
+        # print_scale 单独控制，避免修改纸张后背景和动态字段缩放比例不一致。
+        canvas = Image.new('1', (label_w, label_h), 1)
+        canvas.paste(rendered, ((label_w - content_w) // 2, (label_h - content_h) // 2))
+        return canvas
 
     def _qr_target_px(self, qr_cfg: dict, scale: float) -> int:
         """二维码目标外框边长(点)
@@ -776,7 +816,7 @@ class UniversalPrinter:
 
     def _build_zpl_bitmap(self, sn: str, capacity: str = '') -> str:
         """构建 ZPL 打印指令（位图渲染模式）"""
-        img = self._apply_print_offset(self._render_label_bitmap(sn, capacity))
+        img = self._apply_print_transform(self._render_label_bitmap(sn, capacity))
         label_w, label_h = img.size
 
         # 全白位图说明布局坐标落在画布外或渲染失败，此时打出来是空标签。

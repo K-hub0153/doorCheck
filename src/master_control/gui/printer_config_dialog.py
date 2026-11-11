@@ -9,6 +9,7 @@ except ImportError:
     win32print = None
 import yaml
 import os
+import re
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFormLayout,
                              QSpinBox, QDoubleSpinBox, QMessageBox, QTextEdit, QRadioButton,
@@ -142,9 +143,12 @@ class PrinterConfigDialog(QDialog):
         self.printer_list = []
         self.setWindowTitle('打印机配置')
         self.setMinimumWidth(600)
-        self.setMinimumHeight(500)
+        self.setMinimumHeight(580)
         self.init_ui()
         self.load_current_settings()
+        # 先加载已保存设置，再扫描打印机。扫描结果（尤其是实际 DPI）应当拥有
+        # 最终优先级，避免识别出 600 DPI 后又被旧配置里的 203 覆盖。
+        self.scan_printers()
     
     def init_ui(self):
         """初始化UI"""
@@ -238,6 +242,14 @@ class PrinterConfigDialog(QDialog):
         self.height_spin.setSuffix(' mm')
         dpi_layout.addRow('标签高度:', self.height_spin)
 
+        self.scale_spin = QDoubleSpinBox()
+        self.scale_spin.setRange(0.1, 3.0)
+        self.scale_spin.setDecimals(2)
+        self.scale_spin.setSingleStep(0.05)
+        self.scale_spin.setValue(1.0)
+        self.scale_spin.setToolTip('1.00 为原始大小；0.80 缩小到 80%；1.20 放大到 120%')
+        dpi_layout.addRow('整体缩放:', self.scale_spin)
+
         self.offset_x_spin = QDoubleSpinBox()
         self.offset_x_spin.setRange(-50.0, 50.0)
         self.offset_x_spin.setDecimals(1)
@@ -257,6 +269,7 @@ class PrinterConfigDialog(QDialog):
         self.dpi_combo.currentTextChanged.connect(self.update_preview)
         self.width_spin.valueChanged.connect(self.update_preview)
         self.height_spin.valueChanged.connect(self.update_preview)
+        self.scale_spin.valueChanged.connect(self.update_preview)
         self.offset_x_spin.valueChanged.connect(self.update_preview)
         self.offset_y_spin.valueChanged.connect(self.update_preview)
         
@@ -270,7 +283,7 @@ class PrinterConfigDialog(QDialog):
         
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
-        self.preview_text.setMaximumHeight(120)
+        self.preview_text.setMaximumHeight(145)
         self.preview_text.setStyleSheet('''
             QTextEdit {
                 background-color: #f8f9fa;
@@ -315,9 +328,6 @@ class PrinterConfigDialog(QDialog):
         
         layout.addLayout(button_layout)
         
-        # 初始扫描打印机
-        self.scan_printers()
-    
     def scan_printers(self):
         """扫描系统打印机"""
         try:
@@ -356,6 +366,7 @@ class PrinterConfigDialog(QDialog):
         
         printer_name = self.printer_list[index]
         detected_protocol = self._guess_protocol(printer_name)
+        detected_dpi = self._detect_printer_dpi(printer_name)
         
         # 更新检测到的协议
         protocol_text = {
@@ -364,13 +375,16 @@ class PrinterConfigDialog(QDialog):
             'AUTO': '未知'
         }.get(detected_protocol, '未知')
         
+        if detected_dpi:
+            protocol_text += f' / {detected_dpi} DPI'
         self.protocol_label.setText(protocol_text)
-        
-        # 根据检测结果设置推荐DPI
-        if detected_protocol == 'ZPL':
-            self.dpi_combo.setCurrentText('600')
-        elif detected_protocol == 'TSPL':
-            self.dpi_combo.setCurrentText('203')
+
+        # DPI 只按打印机名称或驱动能力中的真实分辨率选择，不能再按协议猜测。
+        if detected_dpi:
+            dpi_text = str(detected_dpi)
+            if self.dpi_combo.findText(dpi_text) < 0:
+                self.dpi_combo.addItem(dpi_text)
+            self.dpi_combo.setCurrentText(dpi_text)
         
         self.update_preview()
     
@@ -390,6 +404,45 @@ class PrinterConfigDialog(QDialog):
                 return protocol.upper()
         
         return 'AUTO'
+
+    @staticmethod
+    def _dpi_from_name(name: str):
+        """从如 'ZD888-600dpi'、'300 DPI' 的打印机/驱动名称提取分辨率。"""
+        match = re.search(r'(?<!\d)(\d{3,4})\s*dpi\b', name or '', re.IGNORECASE)
+        if not match:
+            return None
+        dpi = int(match.group(1))
+        return dpi if 100 <= dpi <= 2400 else None
+
+    def _detect_printer_dpi(self, printer_name: str):
+        """优先从名称识别 DPI；名称没有时再读取 Windows 驱动能力。"""
+        dpi = self._dpi_from_name(printer_name)
+        if dpi or win32print is None:
+            return dpi
+
+        handle = None
+        try:
+            handle = win32print.OpenPrinter(printer_name)
+            printer_info = win32print.GetPrinter(handle, 2) or {}
+            dev_mode = printer_info.get('pDevMode')
+            if dev_mode:
+                values = [
+                    getattr(dev_mode, 'PrintQuality', None),
+                    getattr(dev_mode, 'YResolution', None),
+                ]
+                valid = [int(value) for value in values
+                         if isinstance(value, (int, float)) and 100 <= value <= 2400]
+                if valid:
+                    return max(valid)
+        except Exception as exc:
+            logger.warning(f"读取打印机 DPI 失败({printer_name}): {exc}")
+        finally:
+            if handle is not None:
+                try:
+                    win32print.ClosePrinter(handle)
+                except Exception:
+                    pass
+        return None
     
     def load_current_settings(self):
         """加载当前配置"""
@@ -404,6 +457,7 @@ class PrinterConfigDialog(QDialog):
         height = printer_cfg.get('paper_height', 30)
         self.width_spin.setValue(width)
         self.height_spin.setValue(height)
+        self.scale_spin.setValue(float(printer_cfg.get('print_scale', 1.0) or 1.0))
         self.offset_x_spin.setValue(float(printer_cfg.get('offset_x_mm', 0) or 0))
         self.offset_y_spin.setValue(float(printer_cfg.get('offset_y_mm', 0) or 0))
         
@@ -430,6 +484,7 @@ class PrinterConfigDialog(QDialog):
         dpi = self.dpi_combo.currentText()
         width = self.width_spin.value()
         height = self.height_spin.value()
+        print_scale = self.scale_spin.value()
         offset_x = self.offset_x_spin.value()
         offset_y = self.offset_y_spin.value()
         
@@ -437,6 +492,7 @@ class PrinterConfigDialog(QDialog):
 协议模式: {protocol}
 DPI: {dpi}
 标签尺寸: {width} x {height} mm
+整体缩放: {print_scale:.2f}（{print_scale * 100:.0f}%）
 整体偏移: 水平 {offset_x:+.1f} mm（+右），垂直 {offset_y:+.1f} mm（+下）
 """
         self.preview_text.setText(preview)
@@ -462,8 +518,11 @@ DPI: {dpi}
                 'printer_name': self.printer_combo.currentText(),
                 'dpi': int(self.dpi_combo.currentText()),
                 'protocol': protocol,
+                'paper_width': self.width_spin.value(),
+                'paper_height': self.height_spin.value(),
                 'paper_width_mm': self.width_spin.value(),
                 'paper_height_mm': self.height_spin.value(),
+                'print_scale': self.scale_spin.value(),
                 'offset_x_mm': self.offset_x_spin.value(),
                 'offset_y_mm': self.offset_y_spin.value(),
                 'tspl_layout': self.current_config.get('printer', {}).get('tspl_layout', {}),
@@ -515,6 +574,7 @@ DPI: {dpi}
             config['printer']['paper_height'] = self.height_spin.value()
             config['printer']['paper_width_mm'] = self.width_spin.value()
             config['printer']['paper_height_mm'] = self.height_spin.value()
+            config['printer']['print_scale'] = self.scale_spin.value()
             config['printer']['offset_x_mm'] = self.offset_x_spin.value()
             config['printer']['offset_y_mm'] = self.offset_y_spin.value()
 
@@ -528,6 +588,7 @@ DPI: {dpi}
                 'paper_height': self.height_spin.value(),
                 'paper_width_mm': self.width_spin.value(),
                 'paper_height_mm': self.height_spin.value(),
+                'print_scale': self.scale_spin.value(),
                 'offset_x_mm': self.offset_x_spin.value(),
                 'offset_y_mm': self.offset_y_spin.value(),
             }

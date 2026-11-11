@@ -50,6 +50,8 @@ printer:
   paper_height_mm: 30
   paper_width: 50
   paper_width_mm: 50
+  # 标签内容整体缩放：1.0=原始大小，0.8=80%，1.2=120%（纸张尺寸不变）。
+  print_scale: 1.0
   # 整体打印位置校准（毫米）：正数向右/向下，负数向左/向上。
   offset_x_mm: 0
   offset_y_mm: 0
@@ -63,6 +65,7 @@ printer:
   # 产品名称、型号等固定内容由底图提供；更换产品时只需修改 background_image。
   template:
     background_image: 主机3S物料模板.png
+    # 模板设计基准尺寸；实际打印纸张大小以上面的 paper_width/paper_height 为准。
     paper_width: 50
     paper_height: 30
     # 以下坐标和字号以 203 DPI 为基准，打印时会按实际 DPI 等比缩放。
