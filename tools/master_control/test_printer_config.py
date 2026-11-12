@@ -59,14 +59,10 @@ class TestWindow(QMainWindow):
     def open_printer_config(self):
         """打开打印机配置对话框"""
         self.log_text.append("正在打开打印机配置对话框...")
-        
-        current_cfg = {
-            'printer_name': self.config.printer_config.get('printer_name', ''),
-            'protocol': self.config.printer_config.get('protocol', ''),
-            'printer_port': self.config.printer_config.get('printer_port', 9100),
-        }
-        
-        dialog = PrinterSelectionDialog(current_cfg, self)
+
+        # 测试打印必须使用完整的 printer 配置，不能只传连接参数；否则模板中的
+        # text_threshold、布局、缩放和偏移都会丢失，与主控正式打印效果不一致。
+        dialog = PrinterSelectionDialog(self.config.printer_config, self)
         
         if dialog.exec_() == dialog.Accepted:
             selected = dialog.get_selected_printer()

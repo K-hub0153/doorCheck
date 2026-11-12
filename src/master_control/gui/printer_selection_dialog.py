@@ -2,6 +2,7 @@
 打印机选择对话框
 支持扫描网络打印机和列出本地打印机
 """
+from copy import deepcopy
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -155,7 +156,10 @@ class PrinterSelectionDialog(QDialog):
     
     def __init__(self, current_config: dict, parent=None):
         super().__init__(parent)
-        self.current_config = current_config
+        # 兼容完整配置 {'printer': {...}} 和已经展开的 printer 段。
+        # 保留完整打印配置，测试打印时需要复用 template、布局、缩放、偏移等参数。
+        printer_config = current_config.get('printer', current_config) if isinstance(current_config, dict) else {}
+        self.current_config = deepcopy(printer_config or {})
         self.selected_printer = None
         self.scan_worker = None
         
@@ -436,16 +440,20 @@ class PrinterSelectionDialog(QDialog):
             protocol_text = item.text().upper() if item else "ZPL"
         
         protocol = 'tspl' if protocol_text == 'TSPL' else 'zpl'
-        dpi = 600 if protocol == 'zpl' else 203
-        
-        # 构建测试配置
-        test_config = {
+        dpi_item = self.table.item(row, 4)
+        try:
+            dpi = int(dpi_item.text()) if dpi_item else (600 if protocol == 'zpl' else 203)
+        except (TypeError, ValueError):
+            dpi = 600 if protocol == 'zpl' else 203
+
+        # 以正式打印配置为底，只覆盖测试页当前选择的连接信息。
+        # 这样 template/text_threshold、纸张、布局、缩放和偏移等参数均与正式打印一致。
+        test_config = deepcopy(self.current_config)
+        test_config.update({
             'enabled': True,
             'protocol': protocol,
             'dpi': dpi,
-            'paper_width_mm': 50,
-            'paper_height_mm': 30,
-        }
+        })
         
         if printer_type == "网络":
             test_config['printer_ip'] = name_or_ip

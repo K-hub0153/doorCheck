@@ -10,6 +10,7 @@ except ImportError:
 import yaml
 import os
 import re
+from copy import deepcopy
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFormLayout,
                              QSpinBox, QDoubleSpinBox, QMessageBox, QTextEdit, QRadioButton,
@@ -513,7 +514,10 @@ DPI: {dpi}
             elif self.tspl_radio.isChecked():
                 protocol = 'tspl'
             
-            test_config = {
+            # 以现有正式打印配置为底，再覆盖页面上正在测试的参数。这样新增的
+            # 模板/渲染配置会自动进入测试打印，不需要在这里逐项维护字段清单。
+            test_config = deepcopy(self.current_config.get('printer', {}))
+            test_config.update({
                 'enabled': True,
                 'printer_name': self.printer_combo.currentText(),
                 'dpi': int(self.dpi_combo.currentText()),
@@ -525,10 +529,7 @@ DPI: {dpi}
                 'print_scale': self.scale_spin.value(),
                 'offset_x_mm': self.offset_x_spin.value(),
                 'offset_y_mm': self.offset_y_spin.value(),
-                'tspl_layout': self.current_config.get('printer', {}).get('tspl_layout', {}),
-                'zpl_layout': self.current_config.get('printer', {}).get('zpl_layout', {}),
-                'template': self.current_config.get('printer', {}).get('template'),
-            }
+            })
             
             printer = UniversalPrinter(test_config)
             success = printer.print_label('TEST123456', '512G')
