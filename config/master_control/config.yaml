@@ -78,17 +78,21 @@ printer:
         y: 128
         font_size: 15
         bold: false
+        # 600 DPI 下约为 1 个打印点的细描边，补强日期数字的细笔画。
+        # 配合 205 阈值比单纯提高阈值更稳定，缩放后不容易出现断笔。
+        bold_width: 0.35
         font_path: assets/fonts/方正兰亭圆简体.TTF
-        # 比默认 205 多保留少量抗锯齿边缘，轻微加实字重但不增加描边。
-        text_threshold: 215
+        text_threshold: 205
       - type: text
         key: sn
         x: 27
         y: 181
         font_size: 15
         bold: false
+        # SN 字符较长，保持原字号和字体，只增加约 1 个打印点的细描边。
+        bold_width: 0.35
         font_path: assets/fonts/方正兰亭圆简体.TTF
-        text_threshold: 215
+        text_threshold: 205
       - type: qrcode
         key: sn
         x: 250

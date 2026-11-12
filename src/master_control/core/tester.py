@@ -50,6 +50,9 @@ def _diagnose_ble_failure(success: bool, output: str) -> tuple:
     if missing_line:
         return f"蓝牙工具或服务缺失: {missing_line[:100]}", detail
 
+    if re.search(r'BLE 初始化(未完成|等待超时)', raw_output, re.IGNORECASE):
+        return "BLE 初始化未完成，扫描指令未执行", detail
+
     error_line = next(
         (line for line in lines
          if re.search(r'(\[BLE_ERROR\]|(^|\W)(error|failed|failure)(\W|$))', line, re.IGNORECASE)),
@@ -603,7 +606,8 @@ class DeviceTester:
                 return result
 
             self.ssh.execute_command(f"chmod +x {remote_path}", timeout=5)
-            success, stdout, stderr = self.ssh.execute_command(f"{remote_path}", timeout=30)
+            # BLEENABLE 初始化最多等待 10 秒，预留扫描和清理时间，避免正常流程被 30 秒截断。
+            success, stdout, stderr = self.ssh.execute_command(f"{remote_path}", timeout=45)
 
             output = '\n'.join(part for part in (stdout, stderr) if part).strip()
             devices = _parse_ble_devices(output)
