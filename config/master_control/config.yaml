@@ -51,10 +51,10 @@ printer:
   paper_width: 50
   paper_width_mm: 50
   # 标签内容整体缩放：1.0=原始大小，0.8=80%，1.2=120%（纸张尺寸不变）。
-  print_scale: 0.95
+  print_scale: 0.98
   # 整体打印位置校准（毫米）：正数向右/向下，负数向左/向上。
-  offset_x_mm: -0.99
-  offset_y_mm: -0.5
+  offset_x_mm: -0.8
+  offset_y_mm: -0.7
   printer_ip: null
   printer_name: ZDesigner 110Xi4 600 dpi (1)
   printer_port: null
@@ -80,7 +80,7 @@ printer:
         bold: false
         # 600 DPI 下约为 1 个打印点的细描边，补强日期数字的细笔画。
         # 配合 205 阈值比单纯提高阈值更稳定，缩放后不容易出现断笔。
-        bold_width: 0.35
+        bold_width: 0.45
         font_path: assets/fonts/方正兰亭圆简体.TTF
         text_threshold: 205
       - type: text
@@ -90,7 +90,7 @@ printer:
         font_size: 15
         bold: false
         # SN 字符较长，保持原字号和字体，只增加约 1 个打印点的细描边。
-        bold_width: 0.35
+        bold_width: 0.45
         font_path: assets/fonts/方正兰亭圆简体.TTF
         text_threshold: 205
       - type: qrcode
