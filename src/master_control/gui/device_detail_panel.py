@@ -70,11 +70,11 @@ class TestItemWidget(QWidget):
         # 显示检测详细信息（message字段）
         display_text = message if message else ""
         self.message_label.setText(display_text)
-        # 文本过长时设置 tooltip，鼠标悬停可查看全文
-        if display_text and len(display_text) > 40:
-            self.message_label.setToolTip(display_text)
-        else:
-            self.message_label.setToolTip("")
+        # detail 保存命令原始输出；界面保持简洁，悬停时可直接查看完整失败现场。
+        tooltip_text = display_text
+        if detail:
+            tooltip_text = f"{display_text}\n\n{detail}" if display_text else detail
+        self.message_label.setToolTip(tooltip_text)
 
 
 class DeviceDetailPanel(QWidget):

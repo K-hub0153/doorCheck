@@ -10,6 +10,16 @@ DAEMON_CMD="bluetoothd"   # 你的后台服务路径
 EDGE_CORE_CMD="java"
 # ===========================================
 
+if ! command -v "$TOOL_CMD" > /dev/null 2>&1; then
+    echo "[BLE_ERROR] 找不到蓝牙控制工具: $TOOL_CMD" >&2
+    exit 127
+fi
+
+if ! command -v "$DAEMON_CMD" > /dev/null 2>&1; then
+    echo "[BLE_ERROR] 找不到蓝牙后台服务: $DAEMON_CMD" >&2
+    exit 127
+fi
+
 echo "[$(date '+%H:%M:%S')] === 自动化扫描任务开始 ==="
 echo "[$(date '+%H:%M:%S')] >> 扫描持续时间设置为: ${SCAN_DURATION} 秒"
 
@@ -77,7 +87,12 @@ echo "[$(date '+%H:%M:%S')] --- [3/5] 执行 AT 指令序列 ---"
     echo "quit"
     echo "exit"
 
-) | $TOOL_CMD
+) | "$TOOL_CMD"
+TOOL_STATUS=${PIPESTATUS[1]}
+
+if [ "$TOOL_STATUS" -ne 0 ]; then
+    echo "[BLE_ERROR] $TOOL_CMD 异常退出，退出码: $TOOL_STATUS" >&2
+fi
 
 echo "[$(date '+%H:%M:%S')] --- [4/5] 扫描结束，清理工具进程 ---"
 # 强制确保 bluetoothctrl 退出
@@ -93,3 +108,4 @@ else
 fi
 
 echo "[$(date '+%H:%M:%S')] === 全部完成 ==="
+exit "$TOOL_STATUS"

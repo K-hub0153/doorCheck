@@ -20,6 +20,59 @@ from src.master_control.utils.config import config
 from src.master_control.utils.mac_allocator import MACAllocator
 
 
+_BLE_DEVICE_PATTERN = re.compile(
+    r'(?:ScanResultCallback\s*:\s*gap\s+(?:ext\s+)?adv\s+report|\[adv_report\])'
+    r'.*?\baddr\s*:\s*(0x[0-9a-fA-F:*]+)',
+    re.IGNORECASE,
+)
+
+
+def _parse_ble_devices(output: str) -> list:
+    """从不同固件版本的 BLE 广播回调中提取并去重设备地址。"""
+    return list(dict.fromkeys(_BLE_DEVICE_PATTERN.findall(output or '')))
+
+
+def _diagnose_ble_failure(success: bool, output: str) -> tuple:
+    """将 BLE 脚本失败转换为操作员可直接理解的原因和详情。"""
+    raw_output = (output or '').strip()
+    detail = f"脚本执行成功: {'是' if success else '否'}"
+    if raw_output:
+        detail += f"\n\n原始输出:\n{raw_output}"
+    else:
+        detail += "\n\n原始输出: <空>"
+
+    lines = [line.strip() for line in raw_output.splitlines() if line.strip()]
+    missing_line = next(
+        (line for line in lines
+         if re.search(r'(not found|no such file|不存在|找不到)', line, re.IGNORECASE)),
+        None,
+    )
+    if missing_line:
+        return f"蓝牙工具或服务缺失: {missing_line[:100]}", detail
+
+    error_line = next(
+        (line for line in lines
+         if re.search(r'(\[BLE_ERROR\]|(^|\W)(error|failed|failure)(\W|$))', line, re.IGNORECASE)),
+        None,
+    )
+    if error_line:
+        prefix = "蓝牙扫描脚本执行失败" if not success else "蓝牙初始化或扫描命令报错"
+        return f"{prefix}: {error_line[:100]}", detail
+
+    if not success:
+        return "蓝牙扫描脚本执行失败", detail
+    if not raw_output:
+        return "蓝牙扫描脚本无输出", detail
+
+    if re.search(r'(ScanResultCallback|adv[_ ]report)', raw_output, re.IGNORECASE):
+        return "收到蓝牙回调，但输出格式无法解析", detail
+
+    if 'AT+BLESTARTSCAN' in raw_output.upper():
+        return "扫描命令已执行，但未收到 BLE 广播", detail
+
+    return "蓝牙扫描未产生设备回调", detail
+
+
 class DeviceTester:
 
     def __init__(self, host: str, sn: str):
@@ -552,16 +605,25 @@ class DeviceTester:
             self.ssh.execute_command(f"chmod +x {remote_path}", timeout=5)
             success, stdout, stderr = self.ssh.execute_command(f"{remote_path}", timeout=30)
 
-            output = stdout + stderr
-            devices = re.findall(r'ScanResultCallback: gap ext adv report.*?addr:(0x[0-9a-fA-F:*]+)', output)
+            output = '\n'.join(part for part in (stdout, stderr) if part).strip()
+            devices = _parse_ble_devices(output)
 
             if devices:
                 count = len(devices)
-                result.set_passed(f"蓝牙正常 (检测到 {count} 个信号)", f"扫描到 {count} 个蓝牙设备")
+                result.set_passed(
+                    f"蓝牙正常 (检测到 {count} 个设备)",
+                    "设备地址:\n" + "\n".join(devices),
+                )
                 logger.info(f"[{self.sn}] 蓝牙检测通过: 扫描到 {count} 个设备")
             else:
-                result.set_failed("未扫描到设备", "蓝牙扫描结果为空")
-                logger.warning(f"[{self.sn}] 蓝牙检测失败")
+                reason, detail = _diagnose_ble_failure(success, output)
+                result.set_failed(reason, detail)
+                logger.warning(
+                    f"[{self.sn}] 蓝牙检测失败: {reason}\n"
+                    f"--- BLE 扫描原始输出开始 ---\n"
+                    f"{output or '<空>'}\n"
+                    f"--- BLE 扫描原始输出结束 ---"
+                )
         except Exception as e:
             result.set_failed("异常", str(e))
             logger.error(f"[{self.sn}] 蓝牙检测异常: {e}")
