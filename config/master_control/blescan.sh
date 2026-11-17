@@ -68,8 +68,7 @@ sleep 2
 
 echo "[$(date '+%H:%M:%S')] --- [3/5] 执行 AT 指令序列 ---"
 
-# 统计 bluetoothctrl 提示符出现次数。每条 AT 指令执行完成后会重新打印提示符，
-# 因而可以动态判断初始化/命令是否完成，不再依赖固定 sleep 猜测时序。
+# 提示符只表示可以输入，不表示异步初始化已完成。
 prompt_count() {
     grep -o 'bluetoothctrl>' "$TOOL_LOG" 2>/dev/null | wc -l | tr -d ' '
 }
@@ -95,13 +94,28 @@ wait_for_prompt() {
     return 0
 }
 
-send_and_wait() {
+send_and_confirm() {
     command=$1
     timeout_seconds=$2
     stage_name=$3
-    before_count=$(prompt_count)
-    echo "$command" >&3
-    wait_for_prompt $((before_count + 1)) "$timeout_seconds" "$stage_name"
+    marker=$4
+    start_time=$(date +%s)
+    while :; do
+        echo "$command" >&3 || return 1
+        sleep 1
+        if grep -E "Starting[[:space:]]+${marker}" "$TOOL_LOG" > /dev/null 2>&1; then
+            return 0
+        fi
+        if ! kill -0 "$TOOL_PIPE_PID" 2>/dev/null; then
+            echo "[BLE_ERROR] $TOOL_CMD 在${stage_name}期间提前退出" >&2
+            return 1
+        fi
+        now=$(date +%s)
+        if [ $((now - start_time)) -ge "$timeout_seconds" ]; then
+            echo "[BLE_ERROR] ${stage_name}等待超时（${timeout_seconds}秒），未见 $marker" >&2
+            return 1
+        fi
+    done
 }
 
 mkfifo "$TOOL_INPUT"
@@ -113,17 +127,19 @@ exec 3> "$TOOL_INPUT"
 CONTROL_STATUS=0
 if ! wait_for_prompt 1 5 "控制工具启动"; then
     CONTROL_STATUS=21
-elif ! send_and_wait "AT+BLEENABLE" "$BLE_INIT_TIMEOUT" "BLE 初始化"; then
+elif ! send_and_confirm "AT+BLEENABLE" "$BLE_INIT_TIMEOUT" "BLE 初始化" 'AT\+BLEENABLE'; then
     CONTROL_STATUS=20
-elif ! send_and_wait "AT+BLEGAPREGCBK" 5 "BLE 回调注册"; then
+elif ! sleep 2; then
+    CONTROL_STATUS=20
+elif ! send_and_confirm "AT+BLEGAPREGCBK" "$BLE_INIT_TIMEOUT" "BLE 回调注册" 'AT\+BLEGAPREGCBK'; then
     CONTROL_STATUS=22
-elif ! send_and_wait "AT+BLESETSCANPAR=0x48,0x48,1,1,0" 5 "BLE 扫描参数设置"; then
+elif ! send_and_confirm "AT+BLESETSCANPAR=0x48,0x48,1,1,0" 5 "BLE 扫描参数设置" 'AT\+BLESETSCANPAR'; then
     CONTROL_STATUS=23
-elif ! send_and_wait "AT+BLESTARTSCAN" 5 "BLE 启动扫描"; then
+elif ! send_and_confirm "AT+BLESTARTSCAN" 5 "BLE 启动扫描" 'AT\+BLESTARTSCAN'; then
     CONTROL_STATUS=24
 else
     sleep "$SCAN_DURATION"
-    if ! send_and_wait "AT+BLESTOPSCAN" 5 "BLE 停止扫描"; then
+    if ! send_and_confirm "AT+BLESTOPSCAN" 5 "BLE 停止扫描" 'AT\+BLESTOPSCAN'; then
         CONTROL_STATUS=25
     fi
 fi

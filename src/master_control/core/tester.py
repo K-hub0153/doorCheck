@@ -606,13 +606,13 @@ class DeviceTester:
                 return result
 
             self.ssh.execute_command(f"chmod +x {remote_path}", timeout=5)
-            # BLEENABLE 初始化最多等待 10 秒，预留扫描和清理时间，避免正常流程被 30 秒截断。
-            success, stdout, stderr = self.ssh.execute_command(f"{remote_path}", timeout=45)
+            # 预留初始化、命令重试、扫描和清理时间。
+            success, stdout, stderr = self.ssh.execute_command(f"{remote_path}", timeout=60)
 
             output = '\n'.join(part for part in (stdout, stderr) if part).strip()
             devices = _parse_ble_devices(output)
 
-            if devices:
+            if success and devices:
                 count = len(devices)
                 result.set_passed(
                     f"蓝牙正常 (检测到 {count} 个设备)",
