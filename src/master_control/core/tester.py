@@ -27,20 +27,32 @@ _BLE_REPORT_PATTERN = re.compile(
 )
 _BLE_ADDR_PATTERN = re.compile(r'\baddr\s*:\s*(0x[0-9a-fA-F:*]+)', re.IGNORECASE)
 _BLE_RSSI_PATTERN = re.compile(
-    r'\brssi\s*[:=]\s*\(?\s*(-?(?:0x[0-9a-fA-F]+|\d+))',
+    r'\brssi(?:[\s_-]*(?:value|val))?(?:\s*[:=]\s*|\s+)'
+    r'\(?\s*([+-]?(?:0x)?[0-9a-fA-F]+)\b',
     re.IGNORECASE,
 )
 
 
 def _parse_ble_rssi(raw_value: str):
-    """解析 BLE RSSI，同时兼容 -45 和 0xd3 这类有符号 8 位值。"""
+    """解析 BLE RSSI，兼容 -45、211、d3 和 ffffffd3 等补码格式。"""
+    text = (raw_value or '').strip().lower()
     try:
-        value = int(raw_value, 0)
+        if text.startswith(('+0x', '-0x')):
+            value = int(text, 16)
+        elif text.startswith('0x') or any(char in 'abcdef' for char in text.lstrip('+-')):
+            value = int(text, 16)
+        else:
+            value = int(text, 10)
     except (TypeError, ValueError):
         return None
-    if raw_value.lower().startswith('0x') and 128 <= value <= 255:
-        value -= 256
-    return value
+
+    # 固件可能把负 RSSI 按无符号 8/16/32/64 位补码打印。
+    if not text.startswith('-') and value > 127:
+        width = max(8, ((value.bit_length() + 7) // 8) * 8)
+        if width in (8, 16, 32, 64) and value & (1 << (width - 1)):
+            value -= 1 << width
+
+    return value if -127 <= value <= 20 else None
 
 
 def _parse_ble_devices(output: str) -> list:
@@ -621,19 +633,34 @@ class DeviceTester:
 
             if devices:
                 count = len(devices)
+                visible_devices = devices[:10]
                 detail_lines = [
                     f"{address} (RSSI: {rssi} dBm)" if rssi is not None
                     else f"{address} (RSSI: 未提供)"
-                    for address, rssi in devices
+                    for address, rssi in visible_devices
                 ]
+                detail_title = (
+                    f"信号最强的 {len(visible_devices)} 个设备"
+                    f"（共扫描到 {count} 个）:"
+                )
                 result.set_passed(
                     f"蓝牙正常 (检测到 {count} 个信号)",
-                    "按信号强度从强到弱:\n" + "\n".join(detail_lines),
+                    detail_title + "\n" + "\n".join(detail_lines),
                 )
                 logger.info(
-                    f"[{self.sn}] 蓝牙检测通过: 扫描到 {count} 个设备，"
-                    f"信号从强到弱:\n" + "\n".join(detail_lines)
+                    f"[{self.sn}] 蓝牙检测通过: {detail_title}\n"
+                    + "\n".join(detail_lines)
                 )
+                missing_rssi_count = sum(1 for _, rssi in devices if rssi is None)
+                if missing_rssi_count:
+                    samples = [
+                        ' '.join(match.group(0).split())[:500]
+                        for match in list(_BLE_REPORT_PATTERN.finditer(output))[:3]
+                    ]
+                    logger.warning(
+                        f"[{self.sn}] {missing_rssi_count}/{count} 个 BLE 设备未解析到 RSSI"
+                        + ("\n回调样例:\n" + "\n".join(samples) if samples else "")
+                    )
             else:
                 raw_output = '\n\n--- 重试分隔 ---\n\n'.join(attempt_outputs).strip()
                 result.set_failed(
