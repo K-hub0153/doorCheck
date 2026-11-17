@@ -998,6 +998,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未连接设备", f"设备 {sn} 未连接")
             return
 
+        auto_worker = self.device_auto_workers.get(sn)
+        if auto_worker and auto_worker.isRunning():
+            QMessageBox.warning(self, "一键测试中", f"设备 {sn} 正在一键测试，请等待完成后再进行单项测试")
+            return
+
         panel = self.device_panels.get(sn)
         if not panel:
             return
@@ -1037,6 +1042,17 @@ class MainWindow(QMainWindow):
         existing = self.device_auto_workers.get(sn)
         if existing and existing.isRunning():
             QMessageBox.warning(self, "测试进行中", f"设备 {sn} 的一键测试正在进行中")
+            return
+
+        running_tests = [
+            name for name, worker in self.device_test_workers.get(sn, {}).items()
+            if worker and worker.isRunning()
+        ]
+        if running_tests:
+            QMessageBox.warning(
+                self, "单项测试中",
+                f"设备 {sn} 正在执行单项测试，请等待完成后再启动一键测试",
+            )
             return
 
         panel = self.device_panels.get(sn)

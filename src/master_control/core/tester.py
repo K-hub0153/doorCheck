@@ -20,6 +20,53 @@ from src.master_control.utils.config import config
 from src.master_control.utils.mac_allocator import MACAllocator
 
 
+_BLE_REPORT_PATTERN = re.compile(
+    r'ScanResultCallback\s*:\s*gap\s+(?:ext\s+)?adv\s+report'
+    r'(?P<body>.*?)(?=ScanResultCallback\s*:\s*gap\s+(?:ext\s+)?adv\s+report|\Z)',
+    re.IGNORECASE | re.DOTALL,
+)
+_BLE_ADDR_PATTERN = re.compile(r'\baddr\s*:\s*(0x[0-9a-fA-F:*]+)', re.IGNORECASE)
+_BLE_RSSI_PATTERN = re.compile(
+    r'\brssi\s*[:=]\s*\(?\s*(-?(?:0x[0-9a-fA-F]+|\d+))',
+    re.IGNORECASE,
+)
+
+
+def _parse_ble_rssi(raw_value: str):
+    """解析 BLE RSSI，同时兼容 -45 和 0xd3 这类有符号 8 位值。"""
+    try:
+        value = int(raw_value, 0)
+    except (TypeError, ValueError):
+        return None
+    if raw_value.lower().startswith('0x') and 128 <= value <= 255:
+        value -= 256
+    return value
+
+
+def _parse_ble_devices(output: str) -> list:
+    """提取 BLE 设备，同地址保留最强 RSSI，并按信号从强到弱排序。"""
+    strongest_by_addr = {}
+    for match in _BLE_REPORT_PATTERN.finditer(output or ''):
+        body = match.group('body')
+        addr_match = _BLE_ADDR_PATTERN.search(body)
+        if not addr_match:
+            continue
+        address = addr_match.group(1)
+        rssi_match = _BLE_RSSI_PATTERN.search(body)
+        rssi = _parse_ble_rssi(rssi_match.group(1)) if rssi_match else None
+
+        old_rssi = strongest_by_addr.get(address)
+        if address not in strongest_by_addr or (
+                rssi is not None and (old_rssi is None or rssi > old_rssi)):
+            strongest_by_addr[address] = rssi
+
+    return sorted(
+        strongest_by_addr.items(),
+        key=lambda item: (item[1] is not None, item[1] if item[1] is not None else -1000),
+        reverse=True,
+    )
+
+
 class DeviceTester:
 
     def __init__(self, host: str, sn: str):
@@ -550,18 +597,51 @@ class DeviceTester:
                 return result
 
             self.ssh.execute_command(f"chmod +x {remote_path}", timeout=5)
-            success, stdout, stderr = self.ssh.execute_command(f"{remote_path}", timeout=30)
 
-            output = stdout + stderr
-            devices = re.findall(r'ScanResultCallback: gap ext adv report.*?addr:(0x[0-9a-fA-F:*]+)', output)
+            # RK3576 的 WiFi/BLE 共用组合无线模组。一键测试刚扫完 WiFi 时，
+            # wpa_supplicant 仍在占用模组，立即启动 BLE 容易得到空结果。
+            if self.chip_config.chip_model == 'RK3576':
+                logger.info(f"[{self.sn}] 释放 WiFi 扫描进程，等待无线模组切换到 BLE")
+                self.ssh.execute_command(
+                    "pkill -TERM -x wpa_supplicant 2>/dev/null || true", timeout=5)
+                time.sleep(2)
+
+            devices = []
+            attempt_outputs = []
+            for attempt in range(1, 3):
+                success, stdout, stderr = self.ssh.execute_command(f"{remote_path}", timeout=30)
+                output = '\n'.join(part for part in (stdout, stderr) if part)
+                attempt_outputs.append(output)
+                devices = _parse_ble_devices(output)
+                if devices:
+                    break
+                if attempt == 1:
+                    logger.warning(f"[{self.sn}] 首次蓝牙扫描为空，3秒后自动重试")
+                    time.sleep(3)
 
             if devices:
                 count = len(devices)
-                result.set_passed(f"蓝牙正常 (检测到 {count} 个信号)", f"扫描到 {count} 个蓝牙设备")
-                logger.info(f"[{self.sn}] 蓝牙检测通过: 扫描到 {count} 个设备")
+                detail_lines = [
+                    f"{address} (RSSI: {rssi} dBm)" if rssi is not None
+                    else f"{address} (RSSI: 未提供)"
+                    for address, rssi in devices
+                ]
+                result.set_passed(
+                    f"蓝牙正常 (检测到 {count} 个信号)",
+                    "按信号强度从强到弱:\n" + "\n".join(detail_lines),
+                )
+                logger.info(
+                    f"[{self.sn}] 蓝牙检测通过: 扫描到 {count} 个设备，"
+                    f"信号从强到弱:\n" + "\n".join(detail_lines)
+                )
             else:
-                result.set_failed("未扫描到设备", "蓝牙扫描结果为空")
-                logger.warning(f"[{self.sn}] 蓝牙检测失败")
+                raw_output = '\n\n--- 重试分隔 ---\n\n'.join(attempt_outputs).strip()
+                result.set_failed(
+                    "未扫描到设备",
+                    "蓝牙已自动扫描 2 次，结果均为空"
+                    + (f"\n\n原始输出:\n{raw_output}" if raw_output else ""),
+                )
+                logger.warning(f"[{self.sn}] 蓝牙检测失败，已自动重试 1 次")
         except Exception as e:
             result.set_failed("异常", str(e))
             logger.error(f"[{self.sn}] 蓝牙检测异常: {e}")
