@@ -4,30 +4,14 @@
 # 获取脚本第一个参数作为扫描时间
 # ${1:-10} 的意思是：如果参数1存在则使用参数1，否则默认为 10
 SCAN_DURATION=${1:-3}
-BLE_INIT_TIMEOUT=${BLE_INIT_TIMEOUT:-12}
 
 TOOL_CMD="bluetoothctrl"  # 你的交互工具路径
 DAEMON_CMD="bluetoothd"   # 你的后台服务路径
 EDGE_CORE_CMD="java"
-TOOL_LOG="/tmp/blescan_tool_$$.log"
-TOOL_INPUT="/tmp/blescan_tool_input_$$"
 # ===========================================
-
-trap 'rm -f "$TOOL_LOG" "$TOOL_INPUT"' EXIT
-
-if ! command -v "$TOOL_CMD" > /dev/null 2>&1; then
-    echo "[BLE_ERROR] 找不到蓝牙控制工具: $TOOL_CMD" >&2
-    exit 127
-fi
-
-if ! command -v "$DAEMON_CMD" > /dev/null 2>&1; then
-    echo "[BLE_ERROR] 找不到蓝牙后台服务: $DAEMON_CMD" >&2
-    exit 127
-fi
 
 echo "[$(date '+%H:%M:%S')] === 自动化扫描任务开始 ==="
 echo "[$(date '+%H:%M:%S')] >> 扫描持续时间设置为: ${SCAN_DURATION} 秒"
-echo "[$(date '+%H:%M:%S')] >> BLE 初始化最长等待时间: ${BLE_INIT_TIMEOUT} 秒"
 
 echo "[$(date '+%H:%M:%S')] --- [1/5] 检查并清理已存在的服务进程 ---"
 # 0. 停止Java进程
@@ -68,105 +52,32 @@ sleep 2
 
 echo "[$(date '+%H:%M:%S')] --- [3/5] 执行 AT 指令序列 ---"
 
-# 提示符只表示可以输入，不表示异步初始化已完成。
-prompt_count() {
-    grep -o 'bluetoothctrl>' "$TOOL_LOG" 2>/dev/null | wc -l | tr -d ' '
-}
+# 3. 通过管道发送指令序列
+(
+    # 初始化序列
+    echo "AT+BLEENABLE"
+    sleep 2
+    echo "AT+BLEGAPREGCBK"
+    sleep 1
+    echo "AT+BLESETSCANPAR=0x48,0x48,1,1,0"
+    sleep 1
 
-wait_for_prompt() {
-    target_count=$1
-    timeout_seconds=$2
-    stage_name=$3
-    start_time=$(date +%s)
+    # 开始扫描
+    echo "AT+BLESTARTSCAN"
 
-    while [ "$(prompt_count)" -lt "$target_count" ]; do
-        if ! kill -0 "$TOOL_PIPE_PID" 2>/dev/null; then
-            echo "[BLE_ERROR] $TOOL_CMD 在${stage_name}期间提前退出" >&2
-            return 1
-        fi
-        now=$(date +%s)
-        if [ $((now - start_time)) -ge "$timeout_seconds" ]; then
-            echo "[BLE_ERROR] ${stage_name}等待超时（${timeout_seconds}秒）" >&2
-            return 1
-        fi
-        sleep 0.2
-    done
-    return 0
-}
+    # === 动态等待时间 ===
+    # 这里使用变量来控制 sleep 的时长
+    sleep $SCAN_DURATION
 
-wait_for_stage() {
-    wait_seconds=$1
-    stage_name=$2
-    elapsed=0
+    # 停止扫描
+    echo "AT+BLESTOPSCAN"
+    sleep 1
 
-    while [ "$elapsed" -lt "$wait_seconds" ]; do
-        if ! kill -0 "$TOOL_PIPE_PID" 2>/dev/null; then
-            echo "[BLE_ERROR] $TOOL_CMD 在${stage_name}期间提前退出" >&2
-            return 1
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    return 0
-}
+    # 退出交互工具
+    echo "quit"
+    echo "exit"
 
-send_and_wait() {
-    command=$1
-    wait_seconds=$2
-    stage_name=$3
-    echo "[$(date '+%H:%M:%S')] >> 发送 ${command}，等待${stage_name} ${wait_seconds}秒"
-    echo "$command" >&3 || return 1
-    wait_for_stage "$wait_seconds" "$stage_name"
-}
-
-mkfifo "$TOOL_INPUT"
-set -o pipefail
-"$TOOL_CMD" < "$TOOL_INPUT" 2>&1 | tee "$TOOL_LOG" &
-TOOL_PIPE_PID=$!
-exec 3> "$TOOL_INPUT"
-
-CONTROL_STATUS=0
-if ! wait_for_prompt 1 5 "控制工具启动"; then
-    CONTROL_STATUS=21
-elif ! send_and_wait "AT+BLEENABLE" "$BLE_INIT_TIMEOUT" "BLE 初始化"; then
-    CONTROL_STATUS=20
-elif ! send_and_wait "AT+BLEGAPREGCBK" 1 "BLE 回调注册"; then
-    CONTROL_STATUS=22
-elif ! send_and_wait "AT+BLESETSCANPAR=0x48,0x48,1,1,0" 1 "BLE 扫描参数设置"; then
-    CONTROL_STATUS=23
-elif ! send_and_wait "AT+BLESTARTSCAN" 1 "BLE 启动扫描"; then
-    CONTROL_STATUS=24
-else
-    sleep "$SCAN_DURATION"
-    if ! send_and_wait "AT+BLESTOPSCAN" 1 "BLE 停止扫描"; then
-        CONTROL_STATUS=25
-    fi
-fi
-
-# 无论成功失败都让交互工具正常退出，并关闭 FIFO 写端。
-echo "quit" >&3
-echo "exit" >&3
-exec 3>&-
-wait "$TOOL_PIPE_PID"
-TOOL_STATUS=$?
-
-if [ "$CONTROL_STATUS" -ne 0 ]; then
-    TOOL_STATUS=$CONTROL_STATUS
-fi
-
-if [ "$TOOL_STATUS" -ne 0 ]; then
-    echo "[BLE_ERROR] $TOOL_CMD 异常退出，退出码: $TOOL_STATUS" >&2
-fi
-
-# bluetoothctrl 会为真正执行的命令输出“Starting AT+...”。若只有 BLEENABLE
-# 而没有 BLESTARTSCAN，说明初始化仍未完成，后续输入被丢弃，不能误报为零设备。
-if [ "$CONTROL_STATUS" -eq 0 ] \
-        && ! grep -Eq 'Starting[[:space:]]+AT\+BLESTARTSCAN|ScanResultCallback' "$TOOL_LOG"; then
-    echo "[BLE_ERROR] BLE 初始化未完成，AT+BLESTARTSCAN 未执行" >&2
-    if [ "$TOOL_STATUS" -eq 0 ]; then
-        TOOL_STATUS=20
-    fi
-fi
+) | $TOOL_CMD
 
 echo "[$(date '+%H:%M:%S')] --- [4/5] 扫描结束，清理工具进程 ---"
 # 强制确保 bluetoothctrl 退出
@@ -182,4 +93,3 @@ else
 fi
 
 echo "[$(date '+%H:%M:%S')] === 全部完成 ==="
-exit "$TOOL_STATUS"
