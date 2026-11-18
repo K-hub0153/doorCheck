@@ -63,7 +63,7 @@ printer:
   confirm_poe_unplugged: true
   cleanup_after_print: true
   # 底图只在 true 时打印；默认在预印标签上仅打印内容。
-  print_background: true
+  print_background: false
   background_image: config/标签打印底图.png
   # 路径相对工程根目录，打包后相对程序所在目录。
   label_templates:

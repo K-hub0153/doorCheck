@@ -24,7 +24,7 @@ printer:
   offset_x_mm: 0.1
   offset_y_mm: 0.2
   # 默认仅打印内容；设为 true 时同时打印统一底图。
-  print_background: true
+  print_background: false
   background_image: config/标签打印底图.png
   label_templates:
     door: config/label_door.yaml
