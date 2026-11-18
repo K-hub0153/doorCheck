@@ -7,7 +7,7 @@ design_dpi: 203
 font_path: assets/fonts/方正兰亭圆简体.TTF
 threshold: 160
 font_size_pt: 5.75
-bold_width_pt: 0.15
+bold_width_pt: 0
 line_spacing_pt: 9
 text_origin_y: 80
 fields:

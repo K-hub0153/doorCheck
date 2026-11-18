@@ -95,13 +95,13 @@ doorCheck/
 
 这两份上级配置中的 `printer.print_background` 默认均为 `false`，只打印配置字段；改为 `true` 时，同时打印 `config/标签打印底图.png`。纸张、DPI、协议及整体缩放和偏移在上级 `printer` 节点维护。主控、门控、音箱均沿用 `print_scale: 0.98`、`offset_x_mm: 0.1`、`offset_y_mm: 0.2`，先居中缩放整张标签，再向右 0.1mm / 向下 0.2mm 偏移，底图与内容一起变换，纸张尺寸不变；各自打印配置页的测试打印和正式打印均使用相同校准参数。所有资源路径相对工程根目录，打包后相对程序所在目录，也支持绝对路径。
 
-五份配置统一使用 `font_size_pt: 5.75`、`bold_width_pt: 0.15`、`line_spacing_pt: 9`。pt 为印刷单位（1/72 英寸），渲染时按打印机 DPI 换算；坐标仍以 `design_dpi: 203` 标定。`text_origin_y` 指定正文首行位置，字段的 `line` 指定行号；日期与“生产日期：”合并为第 2 行的同一字段，自动紧接标题渲染，SN 位于第 4 行，并设置 `offset_y_pt: 3.25`，使其与公司名称之间的留白为普通行间留白的两倍（6.5pt），不再保留整行空白。
+五份配置统一使用 `font_size_pt: 5.75`、`bold_width_pt: 0`、`line_spacing_pt: 9`。pt 为印刷单位（1/72 英寸），渲染时按打印机 DPI 换算；坐标仍以 `design_dpi: 203` 标定。`text_origin_y` 指定正文首行位置，字段的 `line` 指定行号；日期与“生产日期：”合并为第 2 行的同一字段，自动紧接标题渲染，SN 位于第 4 行，并设置 `offset_y_pt: 3.25`，使其与公司名称之间的留白为普通行间留白的两倍（6.5pt），不再保留整行空白。
 
 字段配置示例：
 
 ```yaml
 font_size_pt: 5.75
-bold_width_pt: 0.15
+bold_width_pt: 0
 line_spacing_pt: 9
 text_origin_y: 80
 fields:
