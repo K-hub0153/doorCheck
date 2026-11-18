@@ -15,12 +15,12 @@ LABEL_BACKGROUND = 'config/标签打印底图.png'
 
 
 def resize_print_bitmap(image: Image.Image, size: tuple) -> Image.Image:
-    """二值标签缩小时保留细线覆盖，避免最近邻跳过整条笔画。"""
+    """二值标签缩小时按最终输出阈值保留细线覆盖。"""
     if image.mode == '1' and (size[0] < image.width or size[1] < image.height):
         # 先计算黑点覆盖率再二值化；不能直接 resize(mode='1')，Pillow
-        # 会强制使用最近邻。205 保留约 20% 以上覆盖，不做抖动或描边。
+        # 会强制使用最近邻。与内容输出相同阈值，避免抗锯齿边缘额外增粗。
         coverage = image.convert('L').resize(size, Image.Resampling.BOX)
-        return coverage.point(lambda value: 255 if value >= 205 else 0, mode='1')
+        return coverage.point(lambda value: 255 if value >= 160 else 0, mode='1')
     return image.resize(size, Image.Resampling.NEAREST)
 
 

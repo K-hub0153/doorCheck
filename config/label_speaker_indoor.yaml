@@ -15,23 +15,23 @@ fields:
     value: 微店24室内音箱
     x: 27
     line: 0
-    text_threshold: 205
+    text_threshold: 160
   - type: text
     value: 型号：AUX-02-V1-IN
     x: 27
     line: 1
-    text_threshold: 205
+    text_threshold: 160
   - type: date
     label: '生产日期：'
     format: '%Y/%m/%d'
     x: 27
     line: 2
-    text_threshold: 205
+    text_threshold: 160
   - type: text
     value: 北京口袋时尚科技有限公司
     x: 27
     line: 3
-    text_threshold: 205
+    text_threshold: 160
   - type: text
     key: sn
     label: 'SN：'
@@ -39,7 +39,7 @@ fields:
     line: 4
     # 普通行间留白为 9 - 5.75 = 3.25pt；额外增加 3.25pt，形成双倍留白。
     offset_y_pt: 3.25
-    text_threshold: 205
+    text_threshold: 160
   - type: qrcode
     key: sn
     x: 253.75
