@@ -14,6 +14,16 @@ LABEL_FONT = 'assets/fonts/方正兰亭圆简体.TTF'
 LABEL_BACKGROUND = 'config/标签打印底图.png'
 
 
+def resize_print_bitmap(image: Image.Image, size: tuple) -> Image.Image:
+    """二值标签缩小时保留细线覆盖，避免最近邻跳过整条笔画。"""
+    if image.mode == '1' and (size[0] < image.width or size[1] < image.height):
+        # 先计算黑点覆盖率再二值化；不能直接 resize(mode='1')，Pillow
+        # 会强制使用最近邻。205 保留约 20% 以上覆盖，不做抖动或描边。
+        coverage = image.convert('L').resize(size, Image.Resampling.BOX)
+        return coverage.point(lambda value: 255 if value >= 205 else 0, mode='1')
+    return image.resize(size, Image.Resampling.NEAREST)
+
+
 def apply_print_transform(image: Image.Image, dpi: int, printer_config: dict) -> Image.Image:
     """沿用主控校准：整图居中缩放后按毫米偏移，纸张画布尺寸不变。"""
     scale = float(printer_config.get('print_scale', 1.0))
@@ -22,8 +32,8 @@ def apply_print_transform(image: Image.Image, dpi: int, printer_config: dict) ->
     background = 1 if image.mode == '1' else 'white'
     if abs(scale - 1.0) >= 1e-9:
         width, height = image.size
-        resized = image.resize((max(1, round(width * scale)), max(1, round(height * scale))),
-                               Image.Resampling.NEAREST)
+        resized = resize_print_bitmap(
+            image, (max(1, round(width * scale)), max(1, round(height * scale))))
         canvas = Image.new(image.mode, image.size, background)
         canvas.paste(resized, ((width - resized.width) // 2, (height - resized.height) // 2))
         image = canvas

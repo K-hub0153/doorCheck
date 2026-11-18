@@ -4,7 +4,8 @@ import sys
 from datetime import datetime
 from typing import Optional, Union
 
-from src.utils.label_template import load_product_template, render_template, tspl_bitmap
+from src.utils.label_template import (load_product_template, render_template,
+                                      resize_print_bitmap, tspl_bitmap)
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -149,7 +150,7 @@ class UniversalPrinter:
         width, height = image.size
         scaled_width = max(1, int(round(width * self.print_scale)))
         scaled_height = max(1, int(round(height * self.print_scale)))
-        scaled = image.resize((scaled_width, scaled_height), Image.Resampling.NEAREST)
+        scaled = resize_print_bitmap(image, (scaled_width, scaled_height))
 
         background = 1 if image.mode == '1' else 'white'
         canvas = Image.new(image.mode, image.size, background)
