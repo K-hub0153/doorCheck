@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # 使用统一的 logger，确保日志能被记录
 from ..utils.logger import logger
+from ..utils.label_template import load_product_template, render_template, tspl_bitmap
 
 # win32print 只在 Windows 存在，非 Windows 下置 None，由调用处报错
 if sys.platform == 'win32':
@@ -45,6 +46,7 @@ class UniversalPrinter:
         self.paper_height = 30
         self.tspl_layout = {}
         self.zpl_layout = {}
+        self.label_config = {}
 
         # 从配置加载参数
         if config is not None:
@@ -67,6 +69,8 @@ class UniversalPrinter:
 
     def _load_config(self, config):
         """从 Config 对象或字典加载配置"""
+        self.label_config = (config.get('printer', {}) if not isinstance(config, dict)
+                             else config.get('printer', config)) or {}
         # 区分 Config 对象和普通字典
         if hasattr(config, 'load_config') or hasattr(config, 'printer_config'):
             # Config 对象 - 使用点号路径
@@ -80,7 +84,7 @@ class UniversalPrinter:
             self.zpl_layout = config.get('printer.zpl_layout', {})
         elif isinstance(config, dict):
             # 普通字典
-            printer_cfg = config.get('printer', {})
+            printer_cfg = config.get('printer', config)
             self.printer_name = printer_cfg.get('printer_name', None)
             self.dpi = printer_cfg.get('dpi', 600)
             self.design_dpi = printer_cfg.get('design_dpi', 600) or 600
@@ -102,7 +106,8 @@ class UniversalPrinter:
         logger.warning(f"无法检测协议（打印机: '{self.printer_name}'），默认使用 ZPL")
         return 'zpl'
 
-    def print_label(self, sn: str, capacity: str = '', status: str = None) -> bool:
+    def print_label(self, sn: str, capacity: str = '', status: str = None,
+                    *, product_type: str = 'door') -> bool:
         """
         打印标签
         
@@ -115,6 +120,8 @@ class UniversalPrinter:
             打印是否成功
         """
         try:
+            if self.label_config.get('label_templates'):
+                return self._send_raw(self.build_label_commands(sn, product_type))
             if self.protocol == 'zpl':
                 return self._print_zpl(sn, capacity)
             else:
@@ -122,6 +129,14 @@ class UniversalPrinter:
         except Exception as e:
             logger.error(f"打印失败: {e}")
             return False
+
+    def build_label_commands(self, sn: str, product_type: str = 'door'):
+        """生成产品标签指令；产品选择保持为调用参数，支持并发打印不同型号。"""
+        image = self._render_label_bitmap(sn, product_type=product_type)
+        if self.protocol == 'tspl':
+            return tspl_bitmap(image, self.paper_width, self.paper_height)
+        return (f"^XA\n^PW{image.width}\n^LL{image.height}\n^FO0,0\n"
+                + self._bitmap_to_gfa(image) + "^FS\n^XZ\n")
 
     def _build_tspl_commands(self, sn: str, capacity: str = '') -> str:
         """构建 TSPL 打印指令"""
@@ -301,13 +316,18 @@ class UniversalPrinter:
         logger.warning(f"字体文件未找到: {font_path} (已尝试 {candidate})")
         return None
 
-    def _render_label_bitmap(self, sn: str):
+    def _render_label_bitmap(self, sn: str, *, product_type: str = 'door'):
         """用 PIL 渲染整张标签的可变内容(日期/SN/二维码)为 1-bit 位图
 
         返回 PIL Image(模式 '1')。zpl_layout 坐标按 design_dpi 标定，
         渲染时按 dpi/design_dpi 缩放到当前打印机分辨率。
         仅渲染可变字段，预印内容由标签纸自带。
         """
+        if self.label_config.get('label_templates'):
+            template = load_product_template(self.label_config, product_type)
+            return render_template(template, self.dpi, self.paper_width,
+                                   self.paper_height, sn)
+
         label_w = int(self.paper_width * self.dpi / 25.4)
         label_h = int(self.paper_height * self.dpi / 25.4)
 
@@ -511,14 +531,14 @@ class UniversalPrinter:
         logger.info(f"ZPL 指令:\n{zpl}")
         return self._send_raw(zpl)
 
-    def _send_raw(self, commands: str) -> bool:
+    def _send_raw(self, commands) -> bool:
         """发送原始打印指令"""
         if not self.printer_name:
             logger.error("打印机名称未设置")
             return False
 
         try:
-            data = commands.encode('utf-8')
+            data = commands if isinstance(commands, bytes) else commands.encode('utf-8')
             hPrinter = win32print.OpenPrinter(self.printer_name)
             try:
                 win32print.StartDocPrinter(hPrinter, 1, ("Label", None, "RAW"))

@@ -192,15 +192,22 @@ class BuildScript:
             self.print_error(f"扫码打印底图不存在: {qrcode_background}")
             all_exist = False
 
+        for name in ("标签打印底图.png", "label_master_hisi.yaml", "label_master_wdse.yaml",
+                     "label_speaker_indoor.yaml", "label_speaker_outdoor.yaml", "label_door.yaml"):
+            resource = self.project_root / "config" / name
+            if not resource.is_file():
+                self.print_error(f"产测标签资源不存在: {resource}")
+                all_exist = False
+
         # 主控配置和远端检测脚本随统一 config 目录发布
         for name in ("config.yaml", "blescan.sh", "slescan.sh"):
             resource = self.project_root / "config" / "master_control" / name
             if not resource.is_file():
                 self.print_error(f"主控资源不存在: {resource}")
                 all_exist = False
-        # 标签字体统一随 assets 目录打包进程序；缺少任一字体都应阻止构建，
+        # 标签统一使用方正兰亭圆简体；缺少字体应阻止构建，
         # 避免打包后主控标签静默回退到默认字体。
-        for font_name in ("label.ttf", "方正兰亭圆简体.TTF"):
+        for font_name in ("方正兰亭圆简体.TTF",):
             font_path = self.project_root / "assets" / "fonts" / font_name
             if not font_path.is_file():
                 self.print_error(f"标签字体不存在: {font_path}")

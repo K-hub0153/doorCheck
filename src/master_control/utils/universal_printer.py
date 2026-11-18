@@ -2,8 +2,9 @@ import os
 import socket
 import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Optional, Union
+
+from src.utils.label_template import load_product_template, render_template, tspl_bitmap
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -105,7 +106,7 @@ class UniversalPrinter:
         self.tspl_layout = cfg.get('tspl_layout', {}) or {}
         self.zpl_layout = cfg.get('zpl_layout', {}) or {}
 
-        # 产品固定内容由底图提供，更换产品只需修改 template.background_image。
+        # 产品字段由独立配置提供，按 SN 前缀选择。
         self.template = self._select_template(cfg)
 
     @staticmethod
@@ -165,7 +166,9 @@ class UniversalPrinter:
 
     @staticmethod
     def _select_template(cfg: dict) -> dict:
-        """读取单模板配置，并兼容早期的“模板名 + templates”结构。"""
+        """优先读取产品配置，并兼容旧版内嵌模板。"""
+        if cfg.get('label_templates'):
+            return load_product_template(cfg, 'hisi')
         template = cfg.get('template')
         if isinstance(template, dict):
             return template
@@ -191,23 +194,6 @@ class UniversalPrinter:
             max(1, round(width_mm * self.dpi / 25.4)),
             max(1, round(height_mm * self.dpi / 25.4)),
         )
-
-    def _resolve_template_image(self) -> Optional[Path]:
-        """解析相对 config/master_control 的模板底图路径。"""
-        image_name = self.template.get('background_image')
-        if not image_name:
-            return None
-
-        image_path = Path(str(image_name))
-        if image_path.is_absolute():
-            candidate = image_path
-        else:
-            from .paths import config_dir
-            candidate = config_dir() / image_path
-
-        if not candidate.is_file():
-            raise FileNotFoundError(f"标签模板底图不存在: {candidate}")
-        return candidate
 
     def _detect_protocol(self) -> str:
         """根据打印机名称检测协议"""
@@ -356,31 +342,9 @@ class UniversalPrinter:
         return tspl
 
     def _build_tspl_bitmap(self, sn: str, capacity: str = '') -> bytes:
-        """把模板整图作为 TSPL BITMAP 输出，条码内容与底图一次打印。"""
-        img = self._apply_print_transform(self._render_template_bitmap(sn, capacity))
-        width, height = img.size
-        width_bytes = (width + 7) // 8
-        pixels = img.load()
-        bitmap = bytearray(width_bytes * height)
-        for y in range(height):
-            for x in range(width):
-                if pixels[x, y] == 0:
-                    bitmap[y * width_bytes + x // 8] |= 0x80 >> (x % 8)
-
-        width_mm, height_mm = self._label_size_mm()
-        prefix = (
-            "CLS\n"
-            f"SIZE {width_mm:g} mm, {height_mm:g} mm\n"
-            "GAP 2 mm, 0 mm\n"
-            "DIRECTION 1\n"
-            "SPEED 4\n"
-            "DENSITY 10\n"
-            "REFERENCE 0,0\n"
-            "SET TEAR ON\n"
-            "CLS\n"
-            f"BITMAP 0,0,{width_bytes},{height},0,"
-        ).encode('ascii')
-        return prefix + bytes(bitmap) + b"\nPRINT 1,1\n"
+        """将完整模板位图发送到 TSPL 打印机。"""
+        image = self._apply_print_transform(self._render_template_bitmap(sn, capacity))
+        return tspl_bitmap(image, *self._label_size_mm())
 
     def _build_zpl_commands(self, sn: str, capacity: str = '') -> str:
         """构建 ZPL 打印指令
@@ -504,7 +468,7 @@ class UniversalPrinter:
 
     def _resolve_font_path(self, font_path: Optional[str] = None) -> Optional[str]:
         """解析字体文件路径（支持绝对路径、打包目录、exe 同级、工程根目录）"""
-        font_path = font_path or self.zpl_layout.get('font_path')
+        font_path = font_path or self.zpl_layout.get('font_path', 'assets/fonts/方正兰亭圆简体.TTF')
         if not font_path:
             return None
         if os.path.isabs(font_path) and os.path.exists(font_path):
@@ -627,118 +591,13 @@ class UniversalPrinter:
         return img
 
     def _render_template_bitmap(self, sn: str, capacity: str = ''):
-        """按模板设计尺寸渲染内容，再居中放入配置页指定的纸张画布。"""
-        label_w, label_h = self._label_pixels()
-        design_width_mm = float(self.template.get('paper_width', self.paper_width))
-        design_height_mm = float(self.template.get('paper_height', self.paper_height))
-        content_w = max(1, round(design_width_mm * self.dpi / 25.4))
-        content_h = max(1, round(design_height_mm * self.dpi / 25.4))
-        background_path = self._resolve_template_image()
-        if background_path:
-            with Image.open(background_path) as source:
-                source = source.convert('RGBA')
-                source.thumbnail((content_w, content_h), Image.Resampling.LANCZOS)
-                rgb = Image.new('RGB', (content_w, content_h), 'white')
-                rgb.paste(
-                    source,
-                    ((content_w - source.width) // 2, (content_h - source.height) // 2),
-                    source,
-                )
-        else:
-            rgb = Image.new('RGB', (content_w, content_h), 'white')
-
-        draw = ImageDraw.Draw(rgb)
-        design_dpi = float(self.template.get('design_dpi', 203) or 203)
-        scale = self.dpi / design_dpi
-        def scaled(value, minimum=0):
-            return max(minimum, int(round(float(value) * scale)))
-
-        def load_font(field):
-            size = scaled(field.get('font_size', 16), 1)
-            font_path = self._resolve_font_path(field.get('font_path'))
-            if font_path:
-                try:
-                    return ImageFont.truetype(font_path, size)
-                except Exception as exc:
-                    logger.error(f"加载字体失败({font_path}): {exc}")
-            return ImageFont.load_default()
-
-        for field in self.template.get('fields', []):
-            field_type = field.get('type')
-            x = scaled(field.get('x', 0))
-            y = scaled(field.get('y', 0))
-
-            if field_type == 'qrcode':
-                size_px = scaled(field.get('size', field.get('size_px', 80)), 1)
-                ecc_map = {
-                    'L': qrcode.constants.ERROR_CORRECT_L,
-                    'M': qrcode.constants.ERROR_CORRECT_M,
-                    'Q': qrcode.constants.ERROR_CORRECT_Q,
-                    'H': qrcode.constants.ERROR_CORRECT_H,
-                }
-                ecc = ecc_map.get(
-                    str(field.get('error_correction', 'M')).upper(),
-                    qrcode.constants.ERROR_CORRECT_M,
-                )
-                rgb.paste(self._render_qr_fixed_size(sn, size_px, ecc).convert('RGB'), (x, y))
-                continue
-
-            if field_type == 'date':
-                content = datetime.now().strftime(field.get('format', '%Y/%m/%d'))
-            elif field_type == 'text':
-                content = f"{field.get('label', '')}{sn}"
-            elif field_type == 'disk_size':
-                if not capacity:
-                    continue
-                content = f"{field.get('label', '')}{capacity}"
-            elif field_type == 'model':
-                content = str(field.get('value', ''))
-            else:
-                logger.warning(f"忽略未知模板字段类型: {field_type}")
-                continue
-
-            font = load_font(field)
-            bold_width = scaled(field.get('bold_width', 1 if field.get('bold') else 0))
-            anchor = {
-                'center': 'mt',
-                'right': 'rt',
-            }.get(str(field.get('align', '')).lower())
-            text_threshold = field.get('text_threshold')
-            if text_threshold is None:
-                draw.text(
-                    (x, y), content, font=font, fill='black',
-                    stroke_width=bold_width, stroke_fill='black',
-                    anchor=anchor,
-                )
-            else:
-                # 203 DPI 下 1 点描边会显得过粗。单独渲染灰度文字，再用字段阈值
-                # 吸收部分抗锯齿边缘，可获得介于原字重和 1 点描边之间的效果。
-                text_mask = Image.new('L', (content_w, content_h), 255)
-                ImageDraw.Draw(text_mask).text(
-                    (x, y), content, font=font, fill=0,
-                    stroke_width=bold_width, stroke_fill=0,
-                    anchor=anchor,
-                )
-                threshold = max(0, min(255, int(text_threshold)))
-                ink_mask = text_mask.point(
-                    lambda value: 255 if value < threshold else 0,
-                    mode='L',
-                )
-                rgb.paste('black', mask=ink_mask)
-
-        threshold = int(self.template.get('threshold', 160))
-        rendered = rgb.convert('L').point(
-            lambda value: 255 if value >= threshold else 0,
-            mode='1',
-        )
-        if rendered.size == (label_w, label_h):
-            return rendered
-
-        # 纸张尺寸只改变打印画布；模板内容保持其设计物理尺寸，整体大小由
-        # print_scale 单独控制，避免修改纸张后背景和动态字段缩放比例不一致。
-        canvas = Image.new('1', (label_w, label_h), 1)
-        canvas.paste(rendered, ((label_w - content_w) // 2, (label_h - content_h) // 2))
-        return canvas
+        """按 SN 选择产品模板，保留配置页纸张、缩放和偏移行为。"""
+        template = self.template
+        if self.config.get('label_templates'):
+            product = 'wdse' if sn.lower().startswith('wdse') else 'hisi'
+            template = load_product_template(self.config, product)
+        return render_template(template, self.dpi, self.paper_width,
+                               self.paper_height, sn, capacity)
 
     def _qr_target_px(self, qr_cfg: dict, scale: float) -> int:
         """二维码目标外框边长(点)

@@ -2331,7 +2331,8 @@ class TestWindowPanel(QFrame):
                     # 传入质检类型
                     upload_service.upload_records(records, self.main_window.check_type)
 
-            success = self.main_window.label_printer.print_label(self.device.sn, "PASSED")
+            success = self.main_window.label_printer.print_label(
+                self.device.sn, status="PASSED", product_type=self.speaker_type)
             if success:
                 logger.info(f"窗口{self.panel_id + 1}标签打印成功")
             else:
@@ -3543,7 +3544,11 @@ class SpeakerTestWindow(QMainWindow):
                 upload_service.upload_records(records, self.check_type)
 
                 # 打印标签
-                success = self.label_printer.print_label(device.sn, "PASSED")
+                product_type = ('indoor' if device.is_indoor_speaker() else
+                                'outdoor' if device.is_outdoor_speaker() else
+                                self.current_speaker_type)
+                success = self.label_printer.print_label(
+                    device.sn, status="PASSED", product_type=product_type)
                 if success:
                     success_count += 1
                     logger.info(f"设备 {device.sn} 标签打印成功 ({i}/{total})")

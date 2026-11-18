@@ -42,7 +42,7 @@ doorCheck/
 │       ├── config.yaml             # 主控独立配置
 │       ├── blescan.sh              # 主控蓝牙检测脚本
 │       └── slescan.sh              # 主控星闪检测脚本
-├── assets/fonts/label.ttf          # 各工具共用标签字体
+├── assets/fonts/方正兰亭圆简体.TTF          # 各工具共用标签字体
 ├── certs/                          # SSL 证书
 ├── src/
 │   ├── ui/                         # 模式选择、门控及音箱界面，含 icon/
@@ -78,6 +78,45 @@ doorCheck/
 ## 配置与数据
 
 门控、音箱使用 `config/config.yaml`；扫码打印使用 `config/printer/config.yaml`；主控使用 `config/master_control/config.yaml`，支持配置热加载。各工具保持独立的业务模块、打印配置和数据库，字体与日志目录共用。
+
+### 产测标签打印
+
+五款产品的文字、日期格式、SN 前缀、字号和坐标分别在以下文件维护：
+
+| 产品 | 标签配置 |
+| --- | --- |
+| 4 代主控（hisi） | `config/label_master_hisi.yaml` |
+| 3S 主控（wdse） | `config/label_master_wdse.yaml` |
+| 室内音箱 | `config/label_speaker_indoor.yaml` |
+| 室外音箱 | `config/label_speaker_outdoor.yaml` |
+| 门控 | `config/label_door.yaml` |
+
+主控在 `config/master_control/config.yaml` 的 `printer.label_templates` 中引用两份配置，按 SN 前缀选择（与设备识别一致，未知前缀沿用 hisi）。门控、音箱在 `config/config.yaml` 的同名节点引用另外三份配置，音箱逐台及批量打印按实际设备类型选择。每次打印重新读取产品文件，保存后下一次打印生效。
+
+这两份上级配置中的 `printer.print_background` 默认均为 `false`，只打印配置字段；改为 `true` 时，同时打印 `config/标签打印底图.png`。纸张、DPI、协议及主控缩放和偏移仍在上级 `printer` 节点维护。所有资源路径相对工程根目录，打包后相对程序所在目录，也支持绝对路径。
+
+字段配置示例（坐标及字号按 `design_dpi: 203` 标定）：
+
+```yaml
+- type: text
+  value: 微店24室内音箱     # 固定内容；value: '' 表示空行
+  x: 27
+  y: 80
+  font_size: 16
+- type: date
+  format: '%Y/%m/%d'      # 打印时自动获取日期
+  x: 105
+  y: 128
+  font_size: 15
+- type: text
+  key: sn
+  label: 'SN：'           # 主控此处为空，音箱/门控保留 SN 前缀
+  x: 27
+  y: 181
+  font_size: 15
+```
+
+二维码编码原始 SN，主控容量仍取原硬盘检测结果。各工具（含扫码打印的预览、编辑器和打印）统一使用 `assets/fonts/方正兰亭圆简体.TTF`。扫码打印工具继续在自己的配置中维护模板。
 
 所有工具的应用版本号及打包版本统一在 `config/config.yaml` 的 `app.version` 中维护。
 

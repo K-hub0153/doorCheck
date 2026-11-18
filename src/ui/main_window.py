@@ -934,7 +934,7 @@ class MainWindow(QMainWindow):
                 return
 
         try:
-            success = self.label_printer.print_label(sn, "PASSED")
+            success = self.label_printer.print_label(sn, status="PASSED", product_type="door")
             if success:
                 self.device_detail_panel.append_log("标签打印成功")
             else:

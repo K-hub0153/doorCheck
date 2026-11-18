@@ -236,22 +236,15 @@ class PrinterConfigDialog(QDialog):
         dpi = self.dpi_spin.value()
         
         # 构建临时配置
-        test_config = {
-            'printer': {
-                'printer_name': printer_name,
-                'protocol': protocol,
-                'dpi': dpi,
-                'paper_width': self.current_config.get('printer', {}).get('paper_width', 50),
-                'paper_height': self.current_config.get('printer', {}).get('paper_height', 30),
-                'tspl_layout': self.current_config.get('printer', {}).get('tspl_layout', {}),
-                'zpl_layout': self.current_config.get('printer', {}).get('zpl_layout', {}),
-            }
-        }
-        
+        test_printer = dict(self.current_config.get('printer', {}))
+        test_printer.update(printer_name=printer_name, protocol=protocol, dpi=dpi)
+        test_config = {'printer': test_printer}
+
         try:
             from ..hardware.universal_printer import UniversalPrinter
             printer = UniversalPrinter(test_config)
-            success = printer.print_label('TEST123456', '', 'TEST')
+            product_type = getattr(self.parent(), 'current_speaker_type', 'door')
+            success = printer.print_label('TEST123456', status='TEST', product_type=product_type)
             
             if success:
                 QMessageBox.information(self, '成功', '测试打印已发送！\n请检查打印机输出。')

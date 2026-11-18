@@ -1,6 +1,6 @@
 app:
   name: 智能设备产测工具
-  version: '2.3.12'
+  version: '2.3.13'
 device:
   heartbeat_interval: 30
   product_id: '1696'
@@ -19,6 +19,13 @@ mqtt:
   require_certificate: false
   use_identity_as_username: false
 printer:
+  # 默认仅打印内容；设为 true 时同时打印统一底图。
+  print_background: false
+  background_image: config/标签打印底图.png
+  label_templates:
+    door: config/label_door.yaml
+    indoor: config/label_speaker_indoor.yaml
+    outdoor: config/label_speaker_outdoor.yaml
   dpi: 600
   enabled: true
   paper_height: 30
@@ -53,7 +60,7 @@ printer:
   design_dpi: 600
   zpl_layout:
     render_mode: bitmap
-    font_path: assets/fonts/label.ttf
+    font_path: assets/fonts/方正兰亭圆简体.TTF
     bold_width: 1
     date:
       font_size: 49

@@ -1,0 +1,57 @@
+# 微店24室内音箱；固定文字填 value，动态字段填 key/type。
+# 坐标及字号以 203 DPI 为基准，打印时按实际 DPI 等比缩放。
+# 底图开关、打印机参数在上级 printer 配置中维护。
+paper_width: 50
+paper_height: 30
+design_dpi: 203
+font_path: assets/fonts/方正兰亭圆简体.TTF
+threshold: 160
+fields:
+  - type: text
+    value: 微店24室内音箱
+    x: 27
+    y: 80
+    font_size: 16
+  - type: text
+    value: 型号：AUX-02-V1-IN
+    x: 27
+    y: 104
+    font_size: 14
+  - type: text
+    value: 生产日期：
+    x: 27
+    y: 128
+    font_size: 15
+  - type: date
+    format: '%Y/%m/%d'
+    x: 105
+    y: 128
+    font_size: 16.58
+    bold: false
+    bold_width: 0.34
+    text_threshold: 205
+  - type: text
+    value: 北京口袋时尚科技有限公司
+    x: 27
+    y: 152
+    font_size: 14
+  # 空行，不产生任何墨点。
+  - type: text
+    value: ''
+    x: 27
+    y: 173
+  - type: text
+    key: sn
+    label: 'SN：'
+    x: 27
+    y: 181
+    font_size: 17.93
+    bold: false
+    bold_width: 0.34
+    text_threshold: 205
+  - type: qrcode
+    key: sn
+    x: 253.75
+    y: 74.43
+    size: 106.3
+    error_correction: M

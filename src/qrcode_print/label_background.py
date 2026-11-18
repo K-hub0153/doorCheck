@@ -76,7 +76,7 @@ def import_background(config_path: str, source_path: str, template: dict) -> str
 
 
 def label_font_path() -> Path:
-    path = Path(get_resource_path('assets/fonts/label.ttf'))
+    path = Path(get_resource_path('assets/fonts/方正兰亭圆简体.TTF'))
     if not path.is_file():
         raise FileNotFoundError(f"扫码打印字体不存在: {path}")
     return path

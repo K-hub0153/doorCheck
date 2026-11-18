@@ -39,7 +39,7 @@ printer:
       font_size: 49
       x: 300
       y: 340
-    font_path: assets/fonts/label.ttf
+    font_path: assets/fonts/方正兰亭圆简体.TTF
     qrcode:
       error_correction: M
       size_mm: 13.3

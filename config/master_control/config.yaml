@@ -62,49 +62,13 @@ printer:
   require_all_passed: true
   confirm_poe_unplugged: true
   cleanup_after_print: true
-  # 产品名称、型号等固定内容由底图提供；更换产品时只需修改 background_image。
-  template:
-    background_image: 主机3S物料模板.png
-    # 模板设计基准尺寸；实际打印纸张大小以上面的 paper_width/paper_height 为准。
-    paper_width: 50
-    paper_height: 30
-    # 以下坐标和字号以 203 DPI 为基准，打印时会按实际 DPI 等比缩放。
-    design_dpi: 203
-    threshold: 160
-    fields:
-      - type: date
-        format: '%Y/%m/%d'
-        x: 105
-        y: 128
-        font_size: 15
-        bold: false
-        # 600 DPI 下约为 1 个打印点的细描边，补强日期数字的细笔画。
-        # 配合 205 阈值比单纯提高阈值更稳定，缩放后不容易出现断笔。
-        bold_width: 0.45
-        font_path: assets/fonts/方正兰亭圆简体.TTF
-        text_threshold: 205
-      - type: text
-        key: sn
-        x: 27
-        y: 181
-        font_size: 15
-        bold: false
-        # SN 字符较长，保持原字号和字体，只增加约 1 个打印点的细描边。
-        bold_width: 0.45
-        font_path: assets/fonts/方正兰亭圆简体.TTF
-        text_threshold: 205
-      - type: qrcode
-        key: sn
-        x: 250
-        y: 90
-        size: 110
-        error_correction: M
-      - type: disk_size
-        x: 306
-        y: 208
-        align: center
-        font_size: 22
-        bold: false
+  # 底图只在 true 时打印；默认在预印标签上仅打印内容。
+  print_background: false
+  background_image: config/标签打印底图.png
+  # 路径相对工程根目录，打包后相对程序所在目录。
+  label_templates:
+    hisi: config/label_master_hisi.yaml
+    wdse: config/label_master_wdse.yaml
   tspl_layout:
     border:
       thickness: 2
@@ -151,7 +115,7 @@ printer:
       font_size: 65
       x: 897
       y: 620
-    font_path: assets/fonts/label.ttf
+    font_path: assets/fonts/方正兰亭圆简体.TTF
     qrcode:
       error_correction: M
       size_mm: 14
