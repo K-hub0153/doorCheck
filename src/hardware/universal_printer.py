@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # 使用统一的 logger，确保日志能被记录
 from ..utils.logger import logger
-from ..utils.label_template import load_product_template, render_template, tspl_bitmap
+from ..utils.label_template import apply_print_transform, load_product_template, render_template, tspl_bitmap
 
 # win32print 只在 Windows 存在，非 Windows 下置 None，由调用处报错
 if sys.platform == 'win32':
@@ -132,7 +132,8 @@ class UniversalPrinter:
 
     def build_label_commands(self, sn: str, product_type: str = 'door'):
         """生成产品标签指令；产品选择保持为调用参数，支持并发打印不同型号。"""
-        image = self._render_label_bitmap(sn, product_type=product_type)
+        image = apply_print_transform(
+            self._render_label_bitmap(sn, product_type=product_type), self.dpi, self.label_config)
         if self.protocol == 'tspl':
             return tspl_bitmap(image, self.paper_width, self.paper_height)
         return (f"^XA\n^PW{image.width}\n^LL{image.height}\n^FO0,0\n"

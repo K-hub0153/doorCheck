@@ -14,6 +14,28 @@ LABEL_FONT = 'assets/fonts/方正兰亭圆简体.TTF'
 LABEL_BACKGROUND = 'config/标签打印底图.png'
 
 
+def apply_print_transform(image: Image.Image, dpi: int, printer_config: dict) -> Image.Image:
+    """沿用主控校准：整图居中缩放后按毫米偏移，纸张画布尺寸不变。"""
+    scale = float(printer_config.get('print_scale', 1.0))
+    if scale <= 0:
+        raise ValueError('print_scale 必须大于 0')
+    background = 1 if image.mode == '1' else 'white'
+    if abs(scale - 1.0) >= 1e-9:
+        width, height = image.size
+        resized = image.resize((max(1, round(width * scale)), max(1, round(height * scale))),
+                               Image.Resampling.NEAREST)
+        canvas = Image.new(image.mode, image.size, background)
+        canvas.paste(resized, ((width - resized.width) // 2, (height - resized.height) // 2))
+        image = canvas
+    offset = (round(float(printer_config.get('offset_x_mm', 0)) * dpi / 25.4),
+              round(float(printer_config.get('offset_y_mm', 0)) * dpi / 25.4))
+    if offset != (0, 0):
+        canvas = Image.new(image.mode, image.size, background)
+        canvas.paste(image, offset)
+        image = canvas
+    return image
+
+
 def load_product_template(printer_config: dict, product: str) -> dict:
     """每次打印重新读取产品文件，路径相对应用根目录（兼容外置配置）。"""
     references = printer_config.get('label_templates', {})
@@ -97,6 +119,7 @@ def render_template(template: dict, dpi: int, paper_width: float,
         y = (scaled(template.get('text_origin_y', 0))
              + round(float(field['line']) * float(template['line_spacing_pt']) * dpi / 72.0)
              if 'line' in field else scaled(field.get('y', 0)))
+        y += round(float(field.get('offset_y_pt', 0)) * dpi / 72.0)
         if field.get('type') == 'qrcode':
             qr = render_qrcode(sn, scaled(field.get('size', 80), 1),
                                str(field.get('error_correction', 'M')))

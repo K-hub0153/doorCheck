@@ -93,9 +93,9 @@ doorCheck/
 
 主控在 `config/master_control/config.yaml` 的 `printer.label_templates` 中引用两份配置，按 SN 前缀选择（与设备识别一致，未知前缀沿用 hisi）。门控、音箱在 `config/config.yaml` 的同名节点引用另外三份配置，音箱逐台及批量打印按实际设备类型选择。每次打印重新读取产品文件，保存后下一次打印生效。
 
-这两份上级配置中的 `printer.print_background` 默认均为 `false`，只打印配置字段；改为 `true` 时，同时打印 `config/标签打印底图.png`。纸张、DPI、协议及主控缩放和偏移仍在上级 `printer` 节点维护。所有资源路径相对工程根目录，打包后相对程序所在目录，也支持绝对路径。
+这两份上级配置中的 `printer.print_background` 默认均为 `false`，只打印配置字段；改为 `true` 时，同时打印 `config/标签打印底图.png`。纸张、DPI、协议及整体缩放和偏移在上级 `printer` 节点维护。主控、门控、音箱均沿用 `print_scale: 0.98`、`offset_x_mm: -0.8`、`offset_y_mm: -0.7`，先居中缩放整张标签，再向左/向上偏移，底图与内容一起变换，纸张尺寸不变；各自打印配置页的测试打印和正式打印均使用相同校准参数。所有资源路径相对工程根目录，打包后相对程序所在目录，也支持绝对路径。
 
-五份配置统一使用 `font_size_pt: 5.75`、`bold_width_pt: 0.15`、`line_spacing_pt: 9`。pt 为印刷单位（1/72 英寸），渲染时按打印机 DPI 换算；坐标仍以 `design_dpi: 203` 标定。`text_origin_y` 指定正文首行位置，字段的 `line` 指定行号；日期与标题共用第 2 行，SN 前的第 4 行留空。
+五份配置统一使用 `font_size_pt: 5.75`、`bold_width_pt: 0.15`、`line_spacing_pt: 9`。pt 为印刷单位（1/72 英寸），渲染时按打印机 DPI 换算；坐标仍以 `design_dpi: 203` 标定。`text_origin_y` 指定正文首行位置，字段的 `line` 指定行号；日期与标题共用第 2 行，SN 位于第 4 行，并设置 `offset_y_pt: 3.25`，使其与公司名称之间的留白为普通行间留白的两倍（6.5pt），不再保留整行空白。
 
 字段配置示例：
 
@@ -117,7 +117,8 @@ fields:
     key: sn
     label: 'SN：'           # 主控此处为空，音箱/门控保留 SN 前缀
     x: 27
-    line: 5
+    line: 4
+    offset_y_pt: 3.25
 ```
 
 二维码编码原始 SN，主控容量仍取原硬盘检测结果。各工具（含扫码打印的预览、编辑器和打印）统一使用 `assets/fonts/方正兰亭圆简体.TTF`。扫码打印工具继续在自己的配置中维护模板。

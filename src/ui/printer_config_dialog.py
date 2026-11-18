@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QComboBox, QPushButton, QGroupBox, QFormLayout,
-                             QSpinBox, QMessageBox)
+                             QSpinBox, QDoubleSpinBox, QMessageBox)
 from PyQt5.QtCore import Qt
 import win32print
 import yaml
@@ -75,6 +75,25 @@ class PrinterConfigDialog(QDialog):
         protocol_group.setLayout(protocol_layout)
         layout.addWidget(protocol_group)
 
+        calibration_group = QGroupBox('标签位置与缩放')
+        calibration_layout = QFormLayout()
+        self.scale_spin = QDoubleSpinBox()
+        self.scale_spin.setRange(0.01, 3.0)
+        self.scale_spin.setDecimals(2)
+        self.scale_spin.setSingleStep(0.01)
+        calibration_layout.addRow('整体缩放（1.0 = 100%）:', self.scale_spin)
+        self.offset_x_spin = QDoubleSpinBox()
+        self.offset_y_spin = QDoubleSpinBox()
+        for spin in (self.offset_x_spin, self.offset_y_spin):
+            spin.setRange(-50, 50)
+            spin.setDecimals(1)
+            spin.setSingleStep(0.1)
+            spin.setSuffix(' mm')
+        calibration_layout.addRow('水平偏移（+右 / -左）:', self.offset_x_spin)
+        calibration_layout.addRow('垂直偏移（+下 / -上）:', self.offset_y_spin)
+        calibration_group.setLayout(calibration_layout)
+        layout.addWidget(calibration_group)
+
         # 检测信息标签
         self.info_label = QLabel()
         self.info_label.setWordWrap(True)
@@ -107,6 +126,9 @@ class PrinterConfigDialog(QDialog):
     def _load_current_settings(self):
         """加载当前保存的设置"""
         printer_cfg = self.current_config.get('printer', {})
+        self.scale_spin.setValue(float(printer_cfg.get('print_scale', 1.0)))
+        self.offset_x_spin.setValue(float(printer_cfg.get('offset_x_mm', 0)))
+        self.offset_y_spin.setValue(float(printer_cfg.get('offset_y_mm', 0)))
         
         # 加载 DPI
         dpi = printer_cfg.get('dpi', 600)
@@ -237,7 +259,10 @@ class PrinterConfigDialog(QDialog):
         
         # 构建临时配置
         test_printer = dict(self.current_config.get('printer', {}))
-        test_printer.update(printer_name=printer_name, protocol=protocol, dpi=dpi)
+        test_printer.update(
+            printer_name=printer_name, protocol=protocol, dpi=dpi,
+            print_scale=self.scale_spin.value(),
+            offset_x_mm=self.offset_x_spin.value(), offset_y_mm=self.offset_y_spin.value())
         test_config = {'printer': test_printer}
 
         try:
@@ -278,6 +303,9 @@ class PrinterConfigDialog(QDialog):
         self.current_config['printer']['printer_name'] = printer_name
         self.current_config['printer']['protocol'] = protocol
         self.current_config['printer']['dpi'] = dpi
+        self.current_config['printer']['print_scale'] = self.scale_spin.value()
+        self.current_config['printer']['offset_x_mm'] = self.offset_x_spin.value()
+        self.current_config['printer']['offset_y_mm'] = self.offset_y_spin.value()
         
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:

@@ -36,16 +36,13 @@ fields:
     x: 27
     line: 3
     text_threshold: 205
-  # 空行，不产生任何墨点。
-  - type: text
-    value: ''
-    x: 27
-    line: 4
   - type: text
     key: sn
     label: 'SN：'
     x: 27
-    line: 5
+    line: 4
+    # 普通行间留白为 9 - 5.75 = 3.25pt；额外增加 3.25pt，形成双倍留白。
+    offset_y_pt: 3.25
     text_threshold: 205
   - type: qrcode
     key: sn
