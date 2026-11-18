@@ -53,8 +53,8 @@ printer:
   # 标签内容整体缩放：1.0=原始大小，0.8=80%，1.2=120%（纸张尺寸不变）。
   print_scale: 0.98
   # 整体打印位置校准（毫米）：正数向右/向下，负数向左/向上。
-  offset_x_mm: -0.8
-  offset_y_mm: -0.7
+  offset_x_mm: 0.1
+  offset_y_mm: 0.2
   printer_ip: null
   printer_name: ZDesigner 110Xi4 600 dpi (1)
   printer_port: null

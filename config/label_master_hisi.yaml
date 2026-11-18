@@ -21,14 +21,10 @@ fields:
     x: 27
     line: 1
     text_threshold: 205
-  - type: text
-    value: 生产日期：
-    x: 27
-    line: 2
-    text_threshold: 205
   - type: date
+    label: '生产日期：'
     format: '%Y/%m/%d'
-    x: 120
+    x: 27
     line: 2
     text_threshold: 205
   - type: text
@@ -47,7 +43,7 @@ fields:
   - type: qrcode
     key: sn
     x: 250
-    y: 90
+    y: 94
     size: 110
     error_correction: M
   - type: disk_size
