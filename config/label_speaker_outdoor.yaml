@@ -43,6 +43,6 @@ fields:
   - type: qrcode
     key: sn
     x: 253.75
-    y: 78.43
+    y: 85
     size: 106.3
     error_correction: M
