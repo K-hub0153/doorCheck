@@ -14,7 +14,7 @@ from copy import deepcopy
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFormLayout,
                              QSpinBox, QDoubleSpinBox, QMessageBox, QTextEdit, QRadioButton,
-                             QButtonGroup)
+                             QButtonGroup, QScrollArea, QWidget, QLayout)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
@@ -150,12 +150,22 @@ class PrinterConfigDialog(QDialog):
         # 先加载已保存设置，再扫描打印机。扫描结果（尤其是实际 DPI）应当拥有
         # 最终优先级，避免识别出 600 DPI 后又被旧配置里的 203 覆盖。
         self.scan_printers()
+        screen_height = self.screen().availableGeometry().height()
+        self.resize(640, max(self.minimumHeight(), min(820, screen_height - 80)))
     
     def init_ui(self):
         """初始化UI"""
-        layout = QVBoxLayout()
+        outer_layout = QVBoxLayout(self)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(15)
-        self.setLayout(layout)
+        # 内容按实际最小尺寸排布；空间不足时滚动，不压缩表单行。
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
+        scroll_area.setWidget(content)
+        outer_layout.addWidget(scroll_area, 1)
         
         # 标题
         title_label = QLabel('🖨️ 打印机配置')
@@ -225,6 +235,9 @@ class PrinterConfigDialog(QDialog):
         dpi_group.setFont(QFont('Microsoft YaHei', 10, QFont.Bold))
         dpi_layout = QFormLayout()
         dpi_group.setLayout(dpi_layout)
+        dpi_layout.setVerticalSpacing(10)
+        dpi_layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        dpi_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         
         self.dpi_combo = QComboBox()
         self.dpi_combo.addItems(['203', '300', '600'])
@@ -266,6 +279,11 @@ class PrinterConfigDialog(QDialog):
         self.offset_y_spin.setSuffix(' mm')
         self.offset_y_spin.setToolTip('正数向下移动，负数向上移动')
         dpi_layout.addRow('垂直偏移（+下 / -上）:', self.offset_y_spin)
+
+        for control in (self.dpi_combo, self.width_spin, self.height_spin,
+                        self.scale_spin, self.offset_x_spin, self.offset_y_spin):
+            control.setMinimumHeight(max(32, control.sizeHint().height()))
+        dpi_group.setMinimumHeight(dpi_group.minimumSizeHint().height())
 
         self.dpi_combo.currentTextChanged.connect(self.update_preview)
         self.width_spin.valueChanged.connect(self.update_preview)
@@ -327,7 +345,7 @@ class PrinterConfigDialog(QDialog):
         self.cancel_button.clicked.connect(self.reject)
         button_layout.addWidget(self.cancel_button)
         
-        layout.addLayout(button_layout)
+        outer_layout.addLayout(button_layout)
         
     def scan_printers(self):
         """扫描系统打印机"""
