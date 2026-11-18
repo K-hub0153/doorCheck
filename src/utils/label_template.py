@@ -1,7 +1,6 @@
 """产测标签配置与位图渲染；所有坐标按模板 design_dpi 标定。"""
 
 from datetime import datetime
-from math import ceil, floor
 from pathlib import Path
 
 import qrcode
@@ -93,28 +92,6 @@ def render_qrcode(data: str, size: int, error_correction: str) -> Image.Image:
     return image
 
 
-def _text_mask(content: str, font_path: str, font_size: float,
-               stroke: float, anchor):
-    """先绘制完整字形再扩展笔画，保留不足一个打印点的 pt 描边。"""
-    supersample = 4
-    font = ImageFont.truetype(font_path, max(1, round(font_size * supersample)))
-    radius = max(0, round(stroke * supersample))
-    bounds = font.getbbox(content, anchor=anchor)
-    # 向整打印点对齐边界，保证缩小后粘贴坐标和原有文字锚点一致。
-    left, top = (floor((value - radius) / supersample) for value in bounds[:2])
-    right, bottom = (ceil((value + radius) / supersample) for value in bounds[2:])
-    mask = Image.new('L', (max(1, right - left) * supersample,
-                           max(1, bottom - top) * supersample), 255)
-    ImageDraw.Draw(mask).text((-left * supersample, -top * supersample),
-                              content, font=font, fill=0, anchor=anchor)
-    if radius:
-        # 从填充位图扩展描边，避免字体轮廓描边改变原有笔画。
-        mask = mask.filter(ImageFilter.MinFilter(radius * 2 + 1))
-    mask = mask.resize((max(1, right - left), max(1, bottom - top)),
-                       Image.Resampling.LANCZOS)
-    return mask, (left, top)
-
-
 def render_template(template: dict, dpi: int, paper_width: float,
                     paper_height: float, sn: str, capacity: str = '') -> Image.Image:
     """底图开关只影响底图；固定文字、动态字段与二维码始终渲染。"""
@@ -153,19 +130,24 @@ def render_template(template: dict, dpi: int, paper_width: float,
             continue
         font_path = get_resource_path(field.get('font_path', template.get('font_path', LABEL_FONT)))
         font_size_pt = field.get('font_size_pt', template.get('font_size_pt'))
-        font_size = (float(font_size_pt) * dpi / 72.0
+        font_size = (round(float(font_size_pt) * dpi / 72.0)
                      if font_size_pt is not None
                      else scaled(field.get('font_size', 16), 1))
         bold_width_pt = field.get('bold_width_pt', template.get('bold_width_pt'))
-        stroke = (float(bold_width_pt) * dpi / 72.0
+        stroke = (round(float(bold_width_pt) * dpi / 72.0)
                   if bold_width_pt is not None
                   else scaled(field.get('bold_width', 1 if field.get('bold') else 0)))
         anchor = {'center': 'mt', 'right': 'rt'}.get(field.get('align'))
-        mask, (left, top) = _text_mask(content, font_path, font_size, stroke, anchor)
+        font = ImageFont.truetype(font_path, max(1, font_size))
+        # 按实际 DPI 单次绘制完整字形，不放大缩小文字，避免插值产生边缘杂点。
+        mask = Image.new('L', content_size, 255)
+        ImageDraw.Draw(mask).text((x, y), content, font=font, fill=0, anchor=anchor)
         threshold = int(field.get('text_threshold', template.get('threshold', 160)))
-        rgb.paste('black', (x + left, y + top, x + left + mask.width,
-                           y + top + mask.height),
-                  mask.point(lambda value: 255 if value < threshold else 0))
+        mask = mask.point(lambda value: 255 if value >= threshold else 0)
+        if stroke > 0:
+            # 在二值字形上扩展整点描边，保留原笔画且不引入灰度边缘。
+            mask = mask.filter(ImageFilter.MinFilter(stroke * 2 + 1))
+        rgb.paste('black', mask=mask.point(lambda value: 255 - value))
 
     threshold = int(template.get('threshold', 160))
     rendered = rgb.convert('L').point(lambda value: 255 if value >= threshold else 0, mode='1')
