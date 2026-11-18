@@ -20,7 +20,7 @@ mqtt:
   use_identity_as_username: false
 printer:
   # 默认仅打印内容；设为 true 时同时打印统一底图。
-  print_background: false
+  print_background: true
   background_image: config/标签打印底图.png
   label_templates:
     door: config/label_door.yaml

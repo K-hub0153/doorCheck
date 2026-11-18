@@ -95,25 +95,29 @@ doorCheck/
 
 这两份上级配置中的 `printer.print_background` 默认均为 `false`，只打印配置字段；改为 `true` 时，同时打印 `config/标签打印底图.png`。纸张、DPI、协议及主控缩放和偏移仍在上级 `printer` 节点维护。所有资源路径相对工程根目录，打包后相对程序所在目录，也支持绝对路径。
 
-字段配置示例（坐标及字号按 `design_dpi: 203` 标定）：
+五份配置统一使用 `font_size_pt: 5.75`、`bold_width_pt: 0.15`、`line_spacing_pt: 9`。pt 为印刷单位（1/72 英寸），渲染时按打印机 DPI 换算；坐标仍以 `design_dpi: 203` 标定。`text_origin_y` 指定正文首行位置，字段的 `line` 指定行号；日期与标题共用第 2 行，SN 前的第 4 行留空。
+
+字段配置示例：
 
 ```yaml
-- type: text
-  value: 微店24室内音箱     # 固定内容；value: '' 表示空行
-  x: 27
-  y: 80
-  font_size: 16
-- type: date
-  format: '%Y/%m/%d'      # 打印时自动获取日期
-  x: 105
-  y: 128
-  font_size: 15
-- type: text
-  key: sn
-  label: 'SN：'           # 主控此处为空，音箱/门控保留 SN 前缀
-  x: 27
-  y: 181
-  font_size: 15
+font_size_pt: 5.75
+bold_width_pt: 0.15
+line_spacing_pt: 9
+text_origin_y: 80
+fields:
+  - type: text
+    value: 微店24室内音箱
+    x: 27
+    line: 0
+  - type: date
+    format: '%Y/%m/%d'
+    x: 120
+    line: 2
+  - type: text
+    key: sn
+    label: 'SN：'           # 主控此处为空，音箱/门控保留 SN 前缀
+    x: 27
+    line: 5
 ```
 
 二维码编码原始 SN，主控容量仍取原硬盘检测结果。各工具（含扫码打印的预览、编辑器和打印）统一使用 `assets/fonts/方正兰亭圆简体.TTF`。扫码打印工具继续在自己的配置中维护模板。

@@ -1,53 +1,51 @@
 # 微店24主机3S；固定文字填 value，动态字段填 key/type。
-# 坐标及字号以 203 DPI 为基准，打印时按实际 DPI 等比缩放。
+# 坐标以 203 DPI 为基准；字号、描边和行距以 pt（1/72 英寸）为单位。
 # 底图开关、打印机参数在上级 printer 配置中维护。
 paper_width: 50
 paper_height: 30
 design_dpi: 203
 font_path: assets/fonts/方正兰亭圆简体.TTF
 threshold: 160
+font_size_pt: 5.75
+bold_width_pt: 0.15
+line_spacing_pt: 9
+text_origin_y: 80
 fields:
   - type: text
     value: 微店24主机3S
     x: 27
-    y: 80
-    font_size: 16
+    line: 0
+    text_threshold: 205
   - type: text
     value: 型号：SRV-03-V4
     x: 27
-    y: 104
-    font_size: 14
+    line: 1
+    text_threshold: 205
   - type: text
     value: 生产日期：
     x: 27
-    y: 128
-    font_size: 15
+    line: 2
+    text_threshold: 205
   - type: date
     format: '%Y/%m/%d'
-    x: 105
-    y: 128
-    font_size: 15
-    bold: false
-    bold_width: 0.45
+    x: 120
+    line: 2
     text_threshold: 205
   - type: text
     value: 北京口袋时尚科技有限公司
     x: 27
-    y: 152
-    font_size: 14
+    line: 3
+    text_threshold: 205
   # 空行，不产生任何墨点。
   - type: text
     value: ''
     x: 27
-    y: 173
+    line: 4
   - type: text
     key: sn
     label: ''
     x: 27
-    y: 181
-    font_size: 15
-    bold: false
-    bold_width: 0.45
+    line: 5
     text_threshold: 205
   - type: qrcode
     key: sn
@@ -59,5 +57,3 @@ fields:
     x: 306
     y: 208
     align: center
-    font_size: 22
-    bold: false

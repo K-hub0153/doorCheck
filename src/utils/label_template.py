@@ -93,7 +93,10 @@ def render_template(template: dict, dpi: int, paper_width: float,
 
     now = datetime.now()
     for field in template['fields']:
-        x, y = scaled(field.get('x', 0)), scaled(field.get('y', 0))
+        x = scaled(field.get('x', 0))
+        y = (scaled(template.get('text_origin_y', 0))
+             + round(float(field['line']) * float(template['line_spacing_pt']) * dpi / 72.0)
+             if 'line' in field else scaled(field.get('y', 0)))
         if field.get('type') == 'qrcode':
             qr = render_qrcode(sn, scaled(field.get('size', 80), 1),
                                str(field.get('error_correction', 'M')))
@@ -103,8 +106,15 @@ def render_template(template: dict, dpi: int, paper_width: float,
         if not content:
             continue
         font_path = get_resource_path(field.get('font_path', template.get('font_path', LABEL_FONT)))
-        font = ImageFont.truetype(font_path, scaled(field.get('font_size', 16), 1))
-        stroke = scaled(field.get('bold_width', 1 if field.get('bold') else 0))
+        font_size_pt = field.get('font_size_pt', template.get('font_size_pt'))
+        font_size = (round(float(font_size_pt) * dpi / 72.0)
+                     if font_size_pt is not None
+                     else scaled(field.get('font_size', 16), 1))
+        font = ImageFont.truetype(font_path, max(1, font_size))
+        bold_width_pt = field.get('bold_width_pt', template.get('bold_width_pt'))
+        stroke = (round(float(bold_width_pt) * dpi / 72.0)
+                  if bold_width_pt is not None
+                  else scaled(field.get('bold_width', 1 if field.get('bold') else 0)))
         anchor = {'center': 'mt', 'right': 'rt'}.get(field.get('align'))
         mask = Image.new('L', content_size, 255)
         ImageDraw.Draw(mask).text((x, y), content, font=font, fill=0,
