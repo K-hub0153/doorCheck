@@ -263,6 +263,13 @@ class BuildScript:
                 cmd.extend(["--add-data", f"{assets_path}:assets"])
 
         # 不再通过 --add-data 打包 certs/config，改为复制到 dist 目录
+        # 设备端 zipapp 由同份源代码构建，冻结后仍能独立上传，不依赖开发机路径。
+        from src.master_aging.adapters.ssh_transport import agent_bundle
+        agent_path = self.build_dir / 'master_aging_agent.pyz'
+        agent_path.parent.mkdir(parents=True, exist_ok=True)
+        agent_path.write_bytes(agent_bundle())
+        separator = ';' if self.system == 'Windows' else ':'
+        cmd.extend(['--add-data', str(agent_path) + separator + '.'])
 
         # 添加隐藏导入
         for module in self.hidden_imports:

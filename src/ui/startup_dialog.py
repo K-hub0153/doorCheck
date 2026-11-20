@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGridLayout, QPushButton, QLabel
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGridLayout, QPushButton, QLabel, QScrollArea, QWidget
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QIcon
 import os
@@ -23,7 +23,8 @@ class StartupDialog(QDialog):
 
     def init_ui(self):
         self.setWindowTitle('智能设备产测工具 - 选择模式')
-        self.setFixedSize(700, 560)
+        self.setMinimumSize(700, 560)
+        self.resize(700, 640)
 
         # 设置窗口图标
         icon_path = self._get_icon_path()
@@ -80,6 +81,7 @@ class StartupDialog(QDialog):
             ('🌳  智能室外音箱产测工具', 'speaker_outdoor'),
             ('📦  扫码打印工具', 'qrcode_print'),
             ('🔎  音箱设备序列号比对工具', 'speaker_sn_compare'),
+            ('⏱️  主控设备老化工具', 'master_aging'),
         ]
         for index, (text, mode) in enumerate(tools):
             button = QPushButton(text)
@@ -88,7 +90,13 @@ class StartupDialog(QDialog):
             button.setCursor(Qt.PointingHandCursor)
             button.clicked.connect(lambda checked=False, selected_mode=mode: self.select_mode(selected_mode))
             tools_grid.addWidget(button, index // 2, index % 2)
-        layout.addLayout(tools_grid)
+        tools_container = QWidget()
+        tools_container.setLayout(tools_grid)
+        tools_scroll = QScrollArea()
+        tools_scroll.setWidgetResizable(True)
+        tools_scroll.setFrameShape(QScrollArea.NoFrame)
+        tools_scroll.setWidget(tools_container)
+        layout.addWidget(tools_scroll)
 
         self.setLayout(layout)
 

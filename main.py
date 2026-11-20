@@ -71,6 +71,11 @@ def main():
             app.setApplicationName("MC Checker")
             app.setOrganizationName("Weidian")
             window = MasterControlWindow()
+        elif mode == 'master_aging':
+            from src.master_aging.gui.main_window import MainWindow as MasterAgingWindow
+
+            logger.info("启动主控设备老化工具")
+            window = MasterAgingWindow()
         elif mode == 'speaker_indoor':
             logger.info("启动智能室内音箱产测工具")
             window = SpeakerTestWindow(speaker_type='indoor')

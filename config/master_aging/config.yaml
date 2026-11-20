@@ -1,0 +1,60 @@
+schema_version: 1
+sample_interval_s: 10
+max_parallel_devices: 4
+max_sample_gap_s: 40
+min_free_space_mib: 256
+max_log_mib: 64
+environment:
+  chamber_id: null
+  set_temperature_c: null
+  set_humidity_pct: null
+  measured_source: none
+  measured_temperature: null
+  measured_humidity: null
+items:
+  cpu: {enabled: true, duration_min: 120, target_busy_pct: 95, grace_s: 60}
+  ddr: {enabled: true, duration_min: 120, max_memory_pct: 50, reserve_mib: 256}
+  storage:
+    enabled: false
+    duration_min: 120
+    targets: []
+    write_budget_gib: 8
+    chunk_mib: 256
+    rounds: 31
+    log_reserve_mib: 64
+    metadata_reserve_mib: 64
+    cumulative_write_budget_gib: null
+    direct: true
+  lte:
+    enabled: false
+    duration_min: 120
+    data_interface: ''
+    probe_targets: []
+    at_port: ''
+    diagnostic_port_confirmed: false
+  battery:
+    enabled: false
+    duration_min: 240
+    charge_duration_min: 120
+    discharge_duration_min: 120
+    cycles: 1
+    completion_mode: fixed_duration
+    configure_shutdown: false
+    current_direction_confirmed: false
+    start_current_ma: 100
+    stop_current_ma: 50
+    start_confirm_samples: 3
+    stop_confirm_samples: 6
+    start_timeout_min: 10
+    max_read_failures: 3
+  usb: {enabled: false, duration_min: 120, min_speed_mbps: 5000, fixture_confirmed: false}
+  hdmi: {enabled: false, duration_min: 120, display_confirmed: false}
+protection:
+  # 必须按两款主控及实际电池的批准规格填写；null 会阻止启动。
+  cpu_stop_temperature_c: null
+  battery_charge_temperature_range_c: null
+  battery_discharge_temperature_range_c: null
+  battery_min_voltage_mv: null
+  battery_max_voltage_mv: null
+  battery_max_abs_current_ma: null
+  discharge_min_soc_pct: null
