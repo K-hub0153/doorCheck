@@ -28,7 +28,8 @@ def validate_plan(plan):
     if not enabled or any(k not in ITEMS for k in enabled):
         raise ValueError('至少选择一项已知测试项目')
     for key in enabled:
-        number(items[key].get('duration_min'), 1, 43200, ITEMS[key] + '分钟数', True)
+        maximum = 2 * 43200 * 1000 if key == 'battery' else 43200
+        number(items[key].get('duration_min'), 1, maximum, ITEMS[key] + '分钟数', True)
     number(plan.get('sample_interval_s'), 1, 60, '采样间隔', True)
     number(plan.get('max_parallel_devices'), 1, 32, '并行设备数', True)
     number(plan.get('min_free_space_mib'), 64, 1048576, '最小剩余空间 MiB', True)

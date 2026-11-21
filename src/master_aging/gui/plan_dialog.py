@@ -37,9 +37,12 @@ class PlanDialog(QDialog):
             check = QCheckBox()
             check.setChecked(plan['items'][key]['enabled'])
             duration = QSpinBox()
-            duration.setRange(1, 43200)
+            duration.setRange(1, 2 * 43200 * 1000 if key == 'battery' else 43200)
             duration.setValue(plan['items'][key]['duration_min'])
-            duration.setEnabled(key != 'battery')
+            if key == 'battery':
+                duration.setReadOnly(True)
+                duration.setButtonSymbols(QSpinBox.NoButtons)
+                duration.setToolTip('由充电分钟、放电分钟和循环数自动计算')
             self.table.setCellWidget(row, 0, check)
             cell = QTableWidgetItem(label)
             cell.setFlags(Qt.ItemIsEnabled)
@@ -53,6 +56,9 @@ class PlanDialog(QDialog):
         self.charge = self.integer(plan['items']['battery']['charge_duration_min'], 1, 43200)
         self.discharge = self.integer(plan['items']['battery']['discharge_duration_min'], 1, 43200)
         self.cycles = self.integer(plan['items']['battery']['cycles'], 1, 1000)
+        for widget in (self.charge, self.discharge, self.cycles):
+            widget.valueChanged.connect(self.update_battery_duration)
+        self.update_battery_duration()
         battery_row = QHBoxLayout()
         for label, widget in [('充电分钟', self.charge), ('放电分钟', self.discharge), ('循环数', self.cycles)]:
             battery_row.addWidget(QLabel(label))
@@ -182,6 +188,10 @@ class PlanDialog(QDialog):
         widget.setValue(value)
         return widget
 
+    def update_battery_duration(self):
+        """电池有效时长是阶段时长与循环数的派生值，禁止单独编辑。"""
+        self.durations['battery'].setValue((self.charge.value() + self.discharge.value()) * self.cycles.value())
+
     def save_plan(self):
         try:
             plan = deepcopy(self.plan)
@@ -189,6 +199,7 @@ class PlanDialog(QDialog):
                 plan['items'][key].update(enabled=self.checks[key].isChecked(), duration_min=self.durations[key].value())
             plan['items']['battery'].update(charge_duration_min=self.charge.value(),
                 discharge_duration_min=self.discharge.value(), cycles=self.cycles.value(),
+                duration_min=(self.charge.value() + self.discharge.value()) * self.cycles.value(),
                 current_direction_confirmed=self.direction.isChecked(), completion_mode=self.completion.currentData())
             plan['max_parallel_devices'] = self.parallel.value()
             plan['sample_interval_s'] = self.interval.value()
