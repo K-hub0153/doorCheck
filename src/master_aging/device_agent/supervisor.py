@@ -139,6 +139,8 @@ class Supervisor:
         self.battery = {'index': 0, 'phase': self.battery_phases[0] if self.battery_phases else 'charge',
                         'state': 'WAIT_OPERATOR', 'confirmed': False,
                         'start_count': 0, 'stop_count': 0, 'failures': 0, 'segments': [],
+                        'start_required': battery['start_confirm_samples'],
+                        'start_current_ma': battery['start_current_ma'],
                         'charge_mah': 0.0, 'discharge_mah': 0.0, 'charge_wh': 0.0, 'discharge_wh': 0.0}
         self.previous_battery = None
         self.timed_out = set()
@@ -175,7 +177,8 @@ class Supervisor:
                     item = self.status['items'].get(name)
                     process = self.processes.get(name)
                     if item and process and item['result'] is None and name not in self.timed_out:
-                        if time.monotonic() - item['started_monotonic'] >= item['planned_s']:
+                        # stress-ng 自身按计划到时退出，留出汇总和回收 worker 的时间。
+                        if time.monotonic() - item['started_monotonic'] >= item['planned_s'] + 5:
                             self.timed_out.add(name)
                             process.request_stop()
                 for path in [ROOT] + [Path(t['directory']) for t in self.info.get('storage_targets', [])]:
@@ -247,7 +250,9 @@ class Supervisor:
                 else:
                     args += ['--vm', '1', '--vm-bytes', str(self.info['ddr_bytes']), '--vm-method', 'all', '--vm-keep']
                     item['scope'] = 'DDR 正确性压力；带宽基线需另行使用已验证的 STREAM 工具测量'
-                args += ['--timeout', str(config['duration_min'] * 60 + 30) + 's']
+                    # 在启动负载前记录基线，不能把系统原有 swap 占用当作本轮换出。
+                    item['swap_baseline'] = self.swap_snapshot(collectors.memory(), collectors.read('/proc/vmstat'))
+                args += ['--timeout', str(config['duration_min'] * 60) + 's']
                 self.processes[key] = runners.Process(args, self.directory, key)
                 item['started_monotonic'] = time.monotonic()
                 item['pid'] = self.processes[key].process.pid
@@ -380,6 +385,7 @@ class Supervisor:
                 confirmation.unlink()
                 if value.get('token') == b['index'] and value.get('phase') == b['phase']:
                     b['state'], b['wait_started'] = 'WAIT_CURRENT', now
+                    b['confirmed'] = True
                     self.emit('operator', value)
             return
         sign = 1 if b['phase'] == 'charge' else -1
@@ -433,9 +439,15 @@ class Supervisor:
             self.finish_item('battery', 'PASS', '所有已配置的电池阶段完成')
             return
         b.update(phase=self.battery_phases[b['index'] % len(self.battery_phases)],
-                 state='WAIT_OPERATOR', start_count=0, stop_count=0)
+                 state='WAIT_OPERATOR', confirmed=False, start_count=0, stop_count=0)
         self.previous_battery = None
         self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'WAIT_OPERATOR', 'token': b['index']})
+
+    @staticmethod
+    def swap_snapshot(memory, vmstat):
+        counters = dict(line.split() for line in vmstat.splitlines() if len(line.split()) == 2)
+        return {'used_bytes': max(0, memory.get('SwapTotal', 0) - memory.get('SwapFree', 0)),
+                'pswpout': int(counters['pswpout']) if 'pswpout' in counters else None}
 
     def sample(self):
         now = time.monotonic()
@@ -460,15 +472,25 @@ class Supervisor:
                 item['effective_s'] = min(elapsed, item['planned_s'])
             if key in ('cpu', 'ddr'):
                 code = self.processes[key].poll()
-                if key in self.timed_out and elapsed >= item['planned_s']:
-                    # stress-ng 在 SIGTERM 后先汇总校验结果。非零退出不能通过。
-                    self.finish_item(key, 'PASS', '到时正常结束')
+                swapping = False
+                if key == 'ddr':
+                    baseline = item['swap_baseline']
+                    latest_swap = self.swap_snapshot(data['memory'], data.get('vmstat', ''))
+                    item['swap_latest'] = latest_swap
+                    swapping = (latest_swap['used_bytes'] > baseline['used_bytes'] or
+                                (latest_swap['pswpout'] is not None and baseline['pswpout'] is not None
+                                 and latest_swap['pswpout'] > baseline['pswpout']))
+                if swapping:
+                    self.finish_item(key, 'INCOMPLETE', '本轮 DDR 压测期间出现新增 swap 换出，无法保证工作集驻留内存')
+                elif elapsed >= item['planned_s']:
+                    # 正常到时先等 stress-ng 汇总；非零退出和清理失败仍不能通过。
+                    if code is not None or key in self.timed_out or elapsed >= item['planned_s'] + 5:
+                        self.finish_item(key, 'PASS', '计划时长已到，已核验压测退出和进程清理')
+                    continue
                 elif code is not None:
                     self.finish_item(key, 'FAIL' if code else 'INCOMPLETE', '压测进程提前退出: %s' % code)
                 elif key == 'cpu' and elapsed > cfg['grace_s'] and data['cpu']['busy_pct'] is not None and data['cpu']['busy_pct'] < cfg['target_busy_pct']:
                     self.finish_item(key, 'FAIL', 'CPU 有效计算忙碌率未达到目标')
-                elif key == 'ddr' and data['memory'].get('SwapFree', 0) < data['memory'].get('SwapTotal', 0):
-                    self.finish_item(key, 'INCOMPLETE', '检测到 swap 使用，无法保证 DDR 工作集驻留内存')
             elif key == 'battery':
                 pass  # 电池采样与保护在上方执行，包括项目完成后的剩余综合负载阶段。
             elif key in ('usb', 'hdmi', 'lte'):
@@ -502,9 +524,10 @@ class Supervisor:
         self.last_sample = time.monotonic()
         self.status['latest'] = data
         self.status['wall_s'] = self.last_sample - self.started
-        self.status['state'] = ('WAIT_OPERATOR' if self.status['items'].get('battery', {}).get('result') is None
-                                and self.plan['items']['battery']['enabled'] and self.battery['state'] == 'WAIT_OPERATOR'
-                                else 'RUNNING')
+        self.status['state'] = (self.battery['state']
+                                if self.status['items'].get('battery', {}).get('result') is None
+                                and self.plan['items']['battery']['enabled']
+                                and self.battery['state'] in ('WAIT_OPERATOR', 'WAIT_CURRENT') else 'RUNNING')
         self.emit('metric', data)
 
     def run(self):

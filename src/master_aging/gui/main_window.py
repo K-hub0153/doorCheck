@@ -145,7 +145,7 @@ class MainWindow(QMainWindow):
             [('配置计划', self.configure, None), ('读取设备信息', self.probe_selected, 'secondary'),
              ('开始选中设备', self.start, 'start')],
             [('停止选中设备', self.stop_selected, 'danger'), ('停止整批', self.stop_all, 'danger'),
-             ('确认电源切换', self.confirm_battery, 'confirm')]]):
+             ('确认电源已就绪', self.confirm_battery, 'confirm')]]):
             for col, (text, action, role) in enumerate(specs):
                 button = QPushButton(text)
                 if role:
@@ -395,18 +395,45 @@ class MainWindow(QMainWindow):
         self.log('已请求停止全部本地活动运行')
 
     def confirm_battery(self):
-        operator, accepted = QInputDialog.getText(self, '电源切换确认', '请填写本次确认人')
-        if not accepted or not operator.strip():
+        devices = self.selected()
+        if not devices and self.device_list.current_ip in self.devices:
+            devices = [self.devices[self.device_list.current_ip]]
+        waiting = [(device, self.statuses.get(device.get('run_id'), {})) for device in devices]
+        waiting = [(device, status) for device, status in waiting
+                   if status.get('state') not in ('FINISHED', 'BLOCKED', 'STOPPING')
+                   and 'battery' in status.get('items', {})
+                   and status['items']['battery'].get('result') is None
+                   and status.get('battery', {}).get('state') == 'WAIT_OPERATOR']
+        if not waiting:
+            QMessageBox.information(self, '电源确认', '所选设备没有等待电源确认的电池阶段。若显示“等待充放电电流”，表示已确认，正在检测实际电流，无需重复点击。')
             return
-        for device in self.selected():
-            run_id = device.get('run_id')
-            status = self.statuses.get(run_id, {})
-            b = status.get('battery', {})
-            if status.get('state') != 'WAIT_OPERATOR' or b.get('state') != 'WAIT_OPERATOR':
-                continue
+        for device, status in waiting:
+            b = status['battery']
             operation = '接入适配器' if b['phase'] == 'charge' else '拔除适配器，确认放电负载'
-            if QMessageBox.question(self, '电源切换确认', '%s (%s)\n请%s，然后确认。' % (device['sn'], device['ip'], operation)) == QMessageBox.Yes:
-                self.service.confirm(run_id, b['phase'], b['index'], operator.strip())
+            if QMessageBox.question(self, '电源确认', '%s (%s)\n请%s，然后确认。\n确认后会检测实际电流，满足条件才开始计时。' % (device['sn'], device['ip'], operation)) == QMessageBox.Yes:
+                self.service.confirm(device['run_id'], b['phase'], b['index'])
+                self.log('%s：已提交电源确认，等待设备检测实际电流' % device['sn'])
+
+    @staticmethod
+    def battery_hint(status):
+        b = status.get('battery', {})
+        item = status.get('items', {}).get('battery')
+        if item is None or item.get('result') is not None or status.get('state') in ('FINISHED', 'BLOCKED', 'STOPPING'):
+            return ''
+        if b.get('state') == 'WAIT_OPERATOR':
+            operation = '接入适配器' if b.get('phase') == 'charge' else '拔除适配器并接好放电负载'
+            return '电池：请%s，再点击“确认电源已就绪”' % operation
+        if b.get('state') == 'WAIT_CURRENT':
+            phase = '充电' if b.get('phase') == 'charge' else '放电'
+            current = status.get('latest', {}).get('battery', {}).get('current_ma')
+            value = '当前 %s mA，' % current if current is not None else ''
+            threshold = b.get('start_current_ma')
+            target = '' if threshold is None else '目标 %s %s mA，' % (
+                '≥' if b.get('phase') == 'charge' else '≤',
+                threshold if b.get('phase') == 'charge' else -threshold)
+            return '电池：已确认，等待%s电流；%s%s连续达标 %s/%s 次，暂不计时' % (
+                phase, value, target, b.get('start_count', 0), b.get('start_required', '?'))
+        return ''
 
     def show_details(self, ip=None):
         ip = ip or self.device_list.current_ip
@@ -416,6 +443,9 @@ class MainWindow(QMainWindow):
             status = self.statuses.get(device.get('run_id'), device)
             state = status.get('result') or STATES.get(status.get('state'), status.get('state', '待配置'))
             self.device_info.setText('SN: %s    IP: %s    状态: %s' % (device.get('sn', '待读取'), ip, state))
+            hint = self.battery_hint(status)
+            if hint:
+                self.device_info.setText(self.device_info.text() + '\n' + hint)
             self.detail.setPlainText(json.dumps(status, ensure_ascii=False, indent=2))
 
     def load_history(self):
@@ -525,6 +555,9 @@ class MainWindow(QMainWindow):
                 busy = latest.get('cpu', {}).get('busy_pct')
                 busy_text = ('%.1f%%' % busy) if busy is not None else '未采到'
                 live = reason if status['state'] in ('DEPLOYING', 'READY') else 'CPU %s · %s\n%s' % (busy_text, temperature, remaining)
+                hint = self.battery_hint(status)
+                if hint:
+                    live += '\n' + hint
                 self.device_list.cards[ip].update_status(status, live)
                 if self.device_list.current_ip == ip:
                     self.show_details(ip)

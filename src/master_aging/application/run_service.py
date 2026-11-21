@@ -94,7 +94,7 @@ class RunService:
             if run_id in self.active:
                 self.active[run_id]['stop'].set()
 
-    def confirm(self, run_id, phase, token, operator):
+    def confirm(self, run_id, phase, token, operator=''):
         with self._lock:
             if run_id in self.active:
                 self.active[run_id]['commands'].put({'phase': phase, 'token': token, 'operator': operator})

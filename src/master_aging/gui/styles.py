@@ -39,7 +39,8 @@ QProgressBar::chunk { background: #90caf9; border-radius: 3px; }
 '''
 
 STATES = {'DISCOVERED': '待配置', 'DEPLOYING': '准备环境', 'READY': '准备就绪', 'PREFLIGHT': '预检中', 'RUNNING': '老化中',
-          'WAIT_OPERATOR': '等待电源切换', 'RECONNECTING': '等待重连', 'FINISHED': '已结束',
+          'WAIT_OPERATOR': '等待电源确认', 'WAIT_CURRENT': '等待充放电电流',
+          'RECONNECTING': '等待重连', 'FINISHED': '已结束',
           'BLOCKED': '预检未通过', 'STOPPING': '停止中'}
 
 
@@ -50,6 +51,6 @@ def status_color(state):
         return '#e53935'
     if state in ('RUNNING', 'PREFLIGHT'):
         return '#2196f3'
-    if state in ('ABORTED', 'INCOMPLETE', 'WAIT_OPERATOR', 'RECONNECTING', 'STOPPING'):
+    if state in ('ABORTED', 'INCOMPLETE', 'WAIT_OPERATOR', 'WAIT_CURRENT', 'RECONNECTING', 'STOPPING'):
         return '#ff9800'
     return '#78909c'
