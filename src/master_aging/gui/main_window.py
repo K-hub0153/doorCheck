@@ -125,7 +125,7 @@ class MainWindow(QMainWindow):
         self.device_info.setObjectName('deviceInfo')
         self.device_info.setWordWrap(True)
         content_layout.addWidget(self.device_info)
-        self.plan_label = QLabel('尚未配置计划 · 请设置老化项目、时长和保护门限')
+        self.plan_label = QLabel('尚未配置计划 · 请选择老化项目和时长')
         self.plan_label.setObjectName('planSummary')
         self.plan_label.setWordWrap(True)
         content_layout.addWidget(self.plan_label)

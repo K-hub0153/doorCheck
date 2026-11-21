@@ -1,5 +1,4 @@
 """PC 与设备端共同执行的计划校验，所有单位在边界处显式转换。"""
-import ipaddress
 import json
 import math
 import re
@@ -36,8 +35,8 @@ def validate_plan(plan):
     number(plan.get('max_log_mib'), 8, 4096, '日志上限 MiB', True)
     number(plan.get('max_sample_gap_s'), plan['sample_interval_s'] * 2, 600, '最大采样缺口秒数')
     protection = plan.get('protection', {})
-    # 即使只测接口也可能运行于温箱内，设备必须有可验证的本地温度保护。
-    number(protection.get('cpu_stop_temperature_c'), 1, 150, 'CPU 停止温度 ℃')
+    if protection.get('cpu_stop_temperature_c') is not None:
+        number(protection['cpu_stop_temperature_c'], 1, 150, 'CPU 停止温度 ℃')
     if 'cpu' in enabled:
         number(items['cpu'].get('target_busy_pct'), 1, 100, 'CPU 利用率目标 %')
         number(items['cpu'].get('grace_s'), 0, 600, 'CPU 启动宽限秒数')
@@ -65,17 +64,11 @@ def validate_plan(plan):
             raise ValueError('首期存储校验要求已验证的 direct I/O，不自动降级为缓存模式')
     if 'lte' in enabled:
         lte = items['lte']
-        if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,32}', lte.get('data_interface', '')):
-            raise ValueError('4G 必须指定蜂窝数据接口')
-        if not re.fullmatch(r'/dev/tty(?:USB|ACM)\d+', lte.get('at_port', '')) or not lte.get('diagnostic_port_confirmed'):
-            raise ValueError('4G 需要确认独占诊断 AT 口，不能占用拨号服务串口')
-        if not lte.get('probe_targets') or len(lte['probe_targets']) > 4:
-            raise ValueError('4G 需要 1～4 个已批准的 IPv4 探测目标')
-        for target in lte['probe_targets']:
-            ipaddress.IPv4Address(target)
+        # 留空沿用产测内置模组表；运行时核验串口占用，不要求蜂窝联网配置。
+        port = lte.get('at_port')
+        if port not in (None, '') and (not isinstance(port, str) or not re.fullmatch(r'/dev/tty(?:USB|ACM)\d+', port)):
+            raise ValueError('4G AT 口必须为 /dev/ttyUSB数字 或 /dev/ttyACM数字，留空自动识别')
     if 'usb' in enabled:
-        if not items['usb'].get('fixture_confirmed'):
-            raise ValueError('请确认已连接 USB 3.x 测试夹具')
         number(items['usb'].get('min_speed_mbps'), 5000, 40000, 'USB 最低速率 Mbps')
     if 'battery' in enabled:
         battery = items['battery']
@@ -87,24 +80,30 @@ def validate_plan(plan):
         for key in ('start_confirm_samples', 'stop_confirm_samples', 'max_read_failures'):
             number(battery.get(key), 1, 60, key, True)
         number(battery.get('start_timeout_min'), 1, 120, '电流启动等待分钟数')
-        if not battery.get('current_direction_confirmed'):
-            raise ValueError('电池正负电流方向必须经样机接电/拔电验证')
         if battery.get('completion_mode') not in ('fixed_duration', 'stop_node'):
             raise ValueError('未知电池完成模式')
-        for key in ('battery_charge_temperature_range_c', 'battery_discharge_temperature_range_c'):
+        for key, label in (('battery_charge_temperature_range_c', '电池充电温度范围 ℃'),
+                           ('battery_discharge_temperature_range_c', '电池放电温度范围 ℃')):
             limits = protection.get(key)
+            if limits is None:
+                continue
             if not isinstance(limits, list) or len(limits) != 2:
-                raise ValueError('缺少电池温度范围: ' + key)
-            number(limits[0], -50, 100, key)
-            number(limits[1], limits[0] + 0.1, 120, key)
-        number(protection.get('battery_min_voltage_mv'), 1, 100000, '电池最低电压 mV')
-        number(protection.get('battery_max_voltage_mv'), protection['battery_min_voltage_mv'] + 1, 100001, '电池最高电压 mV')
-        number(protection.get('battery_max_abs_current_ma'), 1, 100000, '电池最大电流 mA')
-        number(protection.get('discharge_min_soc_pct'), 1, 99, '放电保护 SOC %')
+                raise ValueError(label + '需填写最低和最高温度')
+            number(limits[0], -50, 100, label + '下限')
+            number(limits[1], limits[0] + 0.1, 120, label + '上限')
+        for key, low, high, label in (
+                ('battery_min_voltage_mv', 1, 100000, '电池最低电压 mV'),
+                ('battery_max_voltage_mv', 1, 100001, '电池最高电压 mV'),
+                ('battery_max_abs_current_ma', 1, 100000, '电池最大电流 mA'),
+                ('discharge_min_soc_pct', 1, 99, '放电保护 SOC %')):
+            if protection.get(key) is not None:
+                number(protection[key], low, high, label)
+        minimum = protection.get('battery_min_voltage_mv')
+        maximum = protection.get('battery_max_voltage_mv')
+        if minimum is not None and maximum is not None and maximum <= minimum:
+            raise ValueError('电池最高电压必须大于最低电压')
         if battery.get('configure_shutdown'):
             raise ValueError('尚未确认上锁回读规范，老化流程禁止写入电池休眠配置')
-    if not plan.get('station_isolation_confirmed'):
-        raise ValueError('请确认设备未被其他程序占用，避免并发操作设备')
     return plan
 
 

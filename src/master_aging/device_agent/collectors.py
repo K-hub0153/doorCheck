@@ -78,7 +78,7 @@ def probe():
             'fingerprint': hashlib.sha256((sn + stable_board + read('/etc/machine-id') + platform.machine()).encode()).hexdigest(),
             'memory': memory(), 'disks': disks, 'temperatures': temperatures(),
             'hdmi_paths': glob.glob('/sys/class/drm/*HDMI*/status'),
-            'tools': {k: shutil.which(k) for k in ('stress-ng', 'fio', 'i2cget', 'ip', 'ping')},
+            'tools': {k: shutil.which(k) for k in ('stress-ng', 'fio', 'i2cget')},
             'python': platform.python_version(), 'libc': platform.libc_ver(),
             'utc': datetime.now(timezone.utc).isoformat(),
             'cpu_count': os.cpu_count() or 1}

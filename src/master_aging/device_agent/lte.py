@@ -1,12 +1,10 @@
-"""独占诊断串口，原始 AT 证据及绑定蜂窝接口的有限 ICMP 流量。"""
+"""沿用主控产测的 AT 模组识别、信号解析与统一阈值。"""
 import fcntl
 import os
-import re
 import select
 import termios
 import time
 from pathlib import Path
-from .collectors import command, read
 
 
 def at(fd, text):
@@ -22,13 +20,8 @@ def at(fd, text):
     return data.decode('utf-8', errors='replace')
 
 
-def sample(settings):
-    # 纯解析模块在部署时随 zipapp 发布，PC 运行时使用同一份源文件。
-    try:
-        from lte_decode import load_modules, identify_module, decode, judge
-    except ImportError:
-        from src.master_control.core.lte_signal import load_modules, identify_module, decode, judge
-    port = os.path.realpath(settings['at_port'])
+def read_at(port, text):
+    port = os.path.realpath(port)
     for process in Path('/proc').glob('[0-9]*'):
         if process.name == str(os.getpid()):
             continue
@@ -38,7 +31,7 @@ def sample(settings):
                     raise RuntimeError('诊断 AT 口正被 PID %s 使用，不抢占现有服务' % process.name)
             except OSError:
                 continue
-    fd = os.open(settings['at_port'], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     original = None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -50,32 +43,65 @@ def sample(settings):
         attrs[6][termios.VMIN] = 0
         attrs[6][termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        raw = {'ati': at(fd, 'ATI'), 'sim': at(fd, 'AT+CPIN?'), 'registration': at(fd, 'AT+CEREG?')}
-        spec, _ = identify_module(raw['ati'], load_modules())
-        if not spec:
-            return {'ok': False, 'reason': '未知模组', 'raw': raw}
-        raw['signal'] = at(fd, spec.at_command)
-        decoded = decode(spec, raw['signal'])
-        signal_ok, _, reason = judge(decoded.metrics)
-        interface = settings['data_interface']
-        routes, probes = {}, {}
-        for target in settings['probe_targets']:
-            routes[target] = command(['ip', '-4', 'route', 'get', target, 'oif', interface])
-            if not re.search(r'\bdev\s+' + re.escape(interface) + r'\b', routes[target]):
-                raise RuntimeError('蜂窝路由未验证')
-            try:
-                probes[target] = {'ok': True, 'raw': command(['ping', '-n', '-I', interface, '-c', '1', '-W', '1', '-s', '16', target], 2)}
-            except Exception as exc:
-                probes[target] = {'ok': False, 'raw': str(exc)}
-        registered = bool(re.search(r'\+CEREG:\s*\d+,\s*[15](?:\s|,|$)', raw['registration']))
-        sim = 'READY' in raw['sim']
-        return {'ok': decoded.ok and signal_ok and registered and sim and all(v['ok'] for v in probes.values()),
-                'raw': raw, 'signal': {m.key: m.value for m in decoded.metrics}, 'reason': reason,
-                'registered': registered, 'sim_ready': sim, 'routes': routes, 'probes': probes,
-                'rx_bytes': read('/sys/class/net/%s/statistics/rx_bytes' % interface),
-                'tx_bytes': read('/sys/class/net/%s/statistics/tx_bytes' % interface),
-                'scope': 'AT/SIM/注册/信号/绑定蜂窝的ICMP；不包含DNS、TCP或HTTPS吞吐判定'}
+        return at(fd, text)
     finally:
-        if original is not None:
-            termios.tcsetattr(fd, termios.TCSANOW, original)
-        os.close(fd)
+        try:
+            if original is not None:
+                termios.tcsetattr(fd, termios.TCSANOW, original)
+        finally:
+            os.close(fd)
+
+
+def sample(settings):
+    # 纯解析模块在部署时随 zipapp 发布，PC 运行时使用同一份源文件。
+    try:
+        from lte_decode import DEFAULT_AT_PORT, load_modules, identify_module, decode, judge
+    except ImportError:
+        from src.master_control.core.lte_signal import DEFAULT_AT_PORT, load_modules, identify_module, decode, judge
+    override = settings.get('at_port') or None
+    modules = load_modules(at_port=override)
+    raw = {'ati': '', 'attempts': []}
+    result = {'ok': False, 'raw': raw, 'signal': {},
+              'scope': '沿用产测 AT 模组识别及 RSRP/RSRQ/SINR 阈值，周期检测信号'}
+    try:
+        raw['ati'] = read_at(override or DEFAULT_AT_PORT, 'ATI')
+    except (OSError, RuntimeError) as exc:
+        raw['ati_error'] = str(exc)
+    spec, model = identify_module(raw['ati'], modules)
+
+    def read_signal(candidate):
+        attempt = {'module': candidate.name, 'at_port': candidate.at_port,
+                   'command': candidate.at_command}
+        raw['attempts'].append(attempt)
+        try:
+            attempt['signal'] = read_at(candidate.at_port, candidate.at_command)
+        except (OSError, RuntimeError) as exc:
+            attempt['error'] = str(exc)
+        return decode(candidate, attempt.get('signal', ''))
+
+    if spec is not None:
+        decoded = read_signal(spec)
+        note = 'ATI 型号识别'
+    else:
+        # 与产测一致：ATI 未识别时，按各厂商端口和响应格式依次试读。
+        for candidate in modules:
+            decoded = read_signal(candidate)
+            if decoded.ok:
+                spec = candidate
+                break
+            raw['attempts'][-1]['reason'] = decoded.reason
+        if spec is None:
+            reasons = ['%s: %s' % (a['module'], a.get('error') or a['reason'])
+                       for a in raw['attempts']]
+            result['reason'] = '模组厂商识别失败（' + '; '.join(reasons) + '）'
+            return result
+        note = 'ATI 未识别，按响应格式判定'
+    signal_ok, checks, reason = judge(decoded.metrics)
+    failed = ', '.join(key.upper() for key, passed in checks.items() if not passed)
+    result.update(ok=decoded.ok and signal_ok, module=spec.name, model=model,
+                  at_port=spec.at_port, identify_note=note, checks=checks,
+                  signal={m.key: m.value for m in decoded.metrics},
+                  reason=raw['attempts'][-1].get('error') or decoded.reason or reason or
+                         ('4G 信号不达标: ' + failed if failed else ''))
+    raw['signal'] = raw['attempts'][-1].get('signal', '')
+    return result

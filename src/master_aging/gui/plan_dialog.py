@@ -1,9 +1,8 @@
 from copy import deepcopy
-import yaml
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-                             QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                             QPlainTextEdit, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
+                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                             QScrollArea, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
                              QVBoxLayout, QWidget)
 from ..domain.models import ITEMS
 from ..domain.policies import validate_plan
@@ -22,12 +21,11 @@ class PlanDialog(QDialog):
         self.resize(880, 760)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel('项目并行运行；电池充放电串行。准备、人工等待与数据缺口不计有效时长。'))
-        tabs = QTabWidget()
+        tabs = self.tabs = QTabWidget()
         layout.addWidget(tabs)
-        general, safety, advanced = QWidget(), QWidget(), QWidget()
-        tabs.addTab(general, '项目与环境')
-        tabs.addTab(safety, '保护与夹具')
-        tabs.addTab(advanced, '详细参数')
+        general = self.tab(tabs, '项目与环境')
+        settings = self.tab(tabs, '项目设置')
+        safety = self.tab(tabs, '保护与夹具（选填）')
         form = QFormLayout(general)
         self.table = QTableWidget(len(ITEMS), 3)
         self.table.setHorizontalHeaderLabels(['启用', '项目', '有效时长（分钟）'])
@@ -67,12 +65,47 @@ class PlanDialog(QDialog):
         form.addRow('温箱设定温度 ℃（可空）', self.temperature)
         form.addRow('温箱设定湿度 %（可空）', self.humidity)
         form.addRow(QLabel('温箱设定值仅作为条件记录；实际温湿度无传感器时留空。'))
-        protection = plan['protection']
+        options = QVBoxLayout(settings)
+        execution = QFormLayout()
+        self.parallel = self.integer(plan['max_parallel_devices'], 1, 32)
+        self.interval = self.integer(plan['sample_interval_s'], 1, 60)
+        execution.addRow('同时老化台数', self.parallel)
+        execution.addRow('数据采集间隔（秒）', self.interval)
+        options.addLayout(execution)
+        cpu_form = self.project_group(options, 'CPU 负载', 'cpu')
+        self.cpu_target = self.integer(plan['items']['cpu']['target_busy_pct'], 1, 100)
+        cpu_form.addRow('目标利用率（%）', self.cpu_target)
+        ddr_form = self.project_group(options, 'DDR 负载', 'ddr')
+        self.ddr_ratio = self.integer(plan['items']['ddr']['max_memory_pct'], 1, 70)
+        ddr_form.addRow('内存使用比例（%）', self.ddr_ratio)
+        storage_form = self.project_group(options, 'SSD/eMMC 读写', 'storage')
+        storage = plan['items']['storage']
+        self.storage_targets = QLineEdit(', '.join(storage.get('targets') or []))
+        self.storage_targets.setPlaceholderText('例如 /data 或 /mnt/emmc；多个目录用英文逗号分隔')
+        self.storage_budget = QDoubleSpinBox()
+        self.storage_budget.setRange(0.01, 4096)
+        self.storage_budget.setDecimals(2)
+        self.storage_budget.setValue(storage.get('write_budget_gib', 8))
+        self.storage_chunk = self.integer(storage.get('chunk_mib', 256), 1, 4096)
+        self.storage_rounds = self.integer(storage.get('rounds', 31), 1, 100000)
+        storage_form.addRow('设备上的测试目录', self.storage_targets)
+        storage_form.addRow('每盘写入上限（GiB）', self.storage_budget)
+        storage_form.addRow('每轮测试容量（MiB）', self.storage_chunk)
+        storage_form.addRow('写入轮数', self.storage_rounds)
+        battery_form = self.project_group(options, '电池判定', 'battery')
+        self.completion = QComboBox()
+        self.completion.addItem('按设定时长完成', 'fixed_duration')
+        self.completion.addItem('等待充放电停止节点（设定时长为上限）', 'stop_node')
+        self.completion.setCurrentIndex(max(0, self.completion.findData(plan['items']['battery']['completion_mode'])))
+        battery_form.addRow('完成方式', self.completion)
+        options.addWidget(QLabel('4G 自动识别模组并按产测标准检测信号。'))
+        options.addStretch()
+        protection = plan.get('protection', {})
         controls = QFormLayout(safety)
-        controls.addRow(QLabel('请按已批准的板卡/电池规格填写保护门限，缺失时不能启动。'))
-        self.protection_fields = {}
+        controls.addRow(QLabel('保护门限和人工确认均为选填；留空或不勾选时仍可执行对应老化项目。'))
+        self.protection_fields, self.protection_enabled = {}, {}
         for key, label, low, high in [
-            ('cpu_stop_temperature_c', 'CPU 停止温度 ℃ *', 0, 150),
+            ('cpu_stop_temperature_c', 'CPU 停止温度 ℃（可选）', 0, 150),
             ('battery_min_voltage_mv', '电池最低电压 mV', 0, 100000),
             ('battery_max_voltage_mv', '电池最高电压 mV', 0, 100001),
             ('battery_max_abs_current_ma', '电池最大净电流绝对值 mA', 0, 100000),
@@ -80,38 +113,66 @@ class PlanDialog(QDialog):
             spin = QDoubleSpinBox()
             spin.setRange(low, high)
             spin.setValue(protection.get(key) or 0)
-            spin.setSpecialValueText('待填写')
+            spin.setSpecialValueText('请输入')
             self.protection_fields[key] = spin
-            controls.addRow(label, spin)
+            toggle = QCheckBox(label.replace('（可选）', ''))
+            toggle.setChecked(protection.get(key) is not None)
+            toggle.toggled.connect(spin.setEnabled)
+            spin.setEnabled(toggle.isChecked())
+            self.protection_enabled[key] = toggle
+            controls.addRow(toggle, spin)
         self.ranges = {}
         for key, label in [('battery_charge_temperature_range_c', '充电温度范围 ℃'),
                            ('battery_discharge_temperature_range_c', '放电温度范围 ℃')]:
-            field = QLineEdit('' if protection.get(key) is None else ', '.join(map(str, protection[key])))
-            field.setPlaceholderText('最低温度, 最高温度')
-            controls.addRow(label, field)
-            self.ranges[key] = field
+            limits = protection.get(key)
+            lower = QLineEdit('' if limits is None else str(limits[0]))
+            upper = QLineEdit('' if limits is None else str(limits[1]))
+            lower.setPlaceholderText('最低温度')
+            upper.setPlaceholderText('最高温度')
+            row = QHBoxLayout()
+            row.addWidget(lower)
+            row.addWidget(QLabel('至'))
+            row.addWidget(upper)
+            toggle = QCheckBox(label)
+            toggle.setChecked(limits is not None)
+            for field in (lower, upper):
+                toggle.toggled.connect(field.setEnabled)
+                field.setEnabled(toggle.isChecked())
+            self.protection_enabled[key] = toggle
+            controls.addRow(toggle, row)
+            self.ranges[key] = (lower, upper, label)
         self.fixture = QCheckBox('已插入 USB 3.x 测试夹具，并确认线材/接口条件')
         self.fixture.setChecked(plan['items']['usb'].get('fixture_confirmed', False))
         self.display = QCheckBox('已人工确认 HDMI 显示测试图案（四代主控无此接口）')
         self.display.setChecked(plan['items']['hdmi'].get('display_confirmed', False))
         self.direction = QCheckBox('已验证电池净电流：充电为正，放电为负')
         self.direction.setChecked(plan['items']['battery'].get('current_direction_confirmed', False))
-        self.isolation = QCheckBox('已确认设备未被其他程序占用，运行期间不启动其他测试任务')
-        for widget in (self.fixture, self.display, self.direction, self.isolation):
+        for widget in (self.fixture, self.display, self.direction):
             controls.addRow(widget)
-        controls.addRow(QLabel('电池不写入 Auto Ship/休眠配置；电源适配器由操作者逐设备切换。'))
-        controls.addRow(QLabel('本地保护只能停止软件负载；电池保护后需人工接回适配器。'))
-        detail = QVBoxLayout(advanced)
-        label = QLabel('配置存储目录/预算/轮数、4G 接口/诊断口/目标等。项目勾选、时长、保护门限以上方表单为准。\n存储完成固定写入轮次后只读观察至到时；不做无限覆写。')
-        label.setWordWrap(True)
-        detail.addWidget(label)
-        self.yaml = QPlainTextEdit(yaml.safe_dump(plan, allow_unicode=True, sort_keys=False))
-        detail.addWidget(self.yaml)
+        controls.addRow(QLabel('电池阶段切换时，按主界面提示接入或断开电源适配器。'))
+        controls.addRow(QLabel('已启用的电池保护触发后，请按提示接回适配器。'))
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText('保存计划')
+        buttons.button(QDialogButtonBox.Cancel).setText('取消')
         buttons.accepted.connect(self.save_plan)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    @staticmethod
+    def tab(tabs, title):
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        page = QWidget()
+        area.setWidget(page)
+        tabs.addTab(area, title)
+        return page
+
+    def project_group(self, layout, title, key):
+        group = QGroupBox(title)
+        group.setEnabled(self.checks[key].isChecked())
+        self.checks[key].toggled.connect(group.setEnabled)
+        layout.addWidget(group)
+        return QFormLayout(group)
 
     @staticmethod
     def integer(value, low, high):
@@ -122,33 +183,43 @@ class PlanDialog(QDialog):
 
     def save_plan(self):
         try:
-            plan = yaml.safe_load(self.yaml.toPlainText())
-            if not isinstance(plan, dict):
-                raise ValueError('配置必须为字典')
-            plan.pop('operator', None)
-            plan.pop('station', None)
+            plan = deepcopy(self.plan)
             for key in ITEMS:
                 plan['items'][key].update(enabled=self.checks[key].isChecked(), duration_min=self.durations[key].value())
             plan['items']['battery'].update(charge_duration_min=self.charge.value(),
                 discharge_duration_min=self.discharge.value(), cycles=self.cycles.value(),
-                current_direction_confirmed=self.direction.isChecked())
+                current_direction_confirmed=self.direction.isChecked(), completion_mode=self.completion.currentData())
+            plan['max_parallel_devices'] = self.parallel.value()
+            plan['sample_interval_s'] = self.interval.value()
+            plan['max_sample_gap_s'] = max(plan['max_sample_gap_s'], self.interval.value() * 2)
+            plan['items']['cpu']['target_busy_pct'] = self.cpu_target.value()
+            plan['items']['ddr']['max_memory_pct'] = self.ddr_ratio.value()
             plan['items']['usb']['fixture_confirmed'] = self.fixture.isChecked()
             plan['items']['hdmi']['display_confirmed'] = self.display.isChecked()
+            storage = plan['items']['storage']
+            storage['targets'] = [target.strip() for target in self.storage_targets.text().split(',') if target.strip()]
+            storage['write_budget_gib'] = self.storage_budget.value()
+            storage['chunk_mib'] = self.storage_chunk.value()
+            storage['rounds'] = self.storage_rounds.value()
+            protection = plan.setdefault('protection', {})
             for key, widget in self.protection_fields.items():
-                plan['protection'][key] = widget.value() or None
-            for key, widget in self.ranges.items():
-                plan['protection'][key] = [float(p.strip()) for p in widget.text().split(',')] if widget.text().strip() else None
+                protection[key] = widget.value() if self.protection_enabled[key].isChecked() else None
+            for key, (lower, upper, label) in self.ranges.items():
+                protection[key] = None
+                if self.protection_enabled[key].isChecked():
+                    try:
+                        protection[key] = [float(lower.text()), float(upper.text())]
+                    except ValueError:
+                        raise ValueError(label + '需填写最低和最高温度')
+            plan.pop('station_isolation_confirmed', None)
             env = plan.setdefault('environment', {})
             env.update(chamber_id=self.chamber.text().strip() or None,
                 set_temperature_c=float(self.temperature.text()) if self.temperature.text().strip() else None,
                 set_humidity_pct=float(self.humidity.text()) if self.humidity.text().strip() else None)
             if env['set_humidity_pct'] is not None and not 0 <= env['set_humidity_pct'] <= 100:
                 raise ValueError('湿度需为 0～100%')
-            if not self.isolation.isChecked():
-                raise ValueError('请确认设备未被其他程序占用，运行期间不启动其他测试任务')
-            plan['station_isolation_confirmed'] = True
             validate_plan(plan)
             self.plan = plan
             self.accept()
-        except (ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             QMessageBox.warning(self, '计划不完整', str(exc))

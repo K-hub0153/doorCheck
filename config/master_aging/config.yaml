@@ -28,10 +28,8 @@ items:
   lte:
     enabled: false
     duration_min: 120
-    data_interface: ''
-    probe_targets: []
+    # 留空沿用产测模组表：移远 /dev/ttyUSB2，龙尚 /dev/ttyACM1。
     at_port: ''
-    diagnostic_port_confirmed: false
   battery:
     enabled: false
     duration_min: 240
@@ -50,7 +48,7 @@ items:
   usb: {enabled: false, duration_min: 120, min_speed_mbps: 5000, fixture_confirmed: false}
   hdmi: {enabled: false, duration_min: 120, display_confirmed: false}
 protection:
-  # 必须按两款主控及实际电池的批准规格填写；null 会阻止启动。
+  # 选填；null 表示不启用对应保护项，填写后按门限执行。
   cpu_stop_temperature_c: null
   battery_charge_temperature_range_c: null
   battery_discharge_temperature_range_c: null

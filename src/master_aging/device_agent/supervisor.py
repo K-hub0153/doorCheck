@@ -50,10 +50,12 @@ def preflight(plan, expected):
         raise ValueError('真实硬件与 SN 机型无法核验一致；请确认设备树/固件')
     if expected.get('fingerprint') and info['fingerprint'] != expected['fingerprint']:
         raise ValueError('设备指纹发生变化')
-    if not info['temperatures']:
-        raise ValueError('未发现可读 thermal zone，无法启用本地温度保护')
-    if max(info['temperatures'].values()) >= plan['protection']['cpu_stop_temperature_c']:
-        raise ValueError('当前温度已到保护停止点')
+    temperature_limit = plan.get('protection', {}).get('cpu_stop_temperature_c')
+    if temperature_limit is not None:
+        if not info['temperatures']:
+            raise ValueError('未发现可读 thermal zone，无法启用本地温度保护')
+        if max(info['temperatures'].values()) >= temperature_limit:
+            raise ValueError('当前温度已到保护停止点')
     items = plan['items']
     for key in ('cpu', 'ddr'):
         if items[key]['enabled'] and not info['tools']['stress-ng']:
@@ -101,13 +103,9 @@ def preflight(plan, expected):
     if items['usb']['enabled'] and not collectors.usb_sample(items['usb']['min_speed_mbps'])['ok']:
         raise ValueError('未发现达到最低速率的 USB 夹具')
     if items['hdmi']['enabled'] and info['chip'] != 'hisi':
-        if not items['hdmi'].get('display_confirmed'):
-            raise ValueError('3S 主控需要操作者确认 HDMI 显示测试图案')
         if not collectors.hdmi_sample(info['hdmi_paths'])['ok']:
             raise ValueError('未发现已连接的 HDMI')
     if items['lte']['enabled']:
-        if not info['tools']['ip'] or not info['tools']['ping']:
-            raise ValueError('4G 需要 ip 和支持接口绑定的 ping')
         result = lte.sample(items['lte'])
         if not result['ok']:
             raise ValueError('4G 预检失败: ' + json.dumps(result, ensure_ascii=False))
@@ -160,11 +158,13 @@ class Supervisor:
     def guard(self):
         while not self.guard_stop.wait(1):
             try:
-                temps = collectors.temperatures()
-                if not temps:
-                    raise RuntimeError('CPU 温度传感器失效')
-                if max(temps.values()) >= self.plan['protection']['cpu_stop_temperature_c']:
-                    raise RuntimeError('CPU 超温')
+                temperature_limit = self.plan.get('protection', {}).get('cpu_stop_temperature_c')
+                if temperature_limit is not None:
+                    temps = collectors.temperatures()
+                    if not temps:
+                        raise RuntimeError('CPU 温度传感器失效')
+                    if max(temps.values()) >= temperature_limit:
+                        raise RuntimeError('CPU 超温')
                 if time.monotonic() - self.last_sample > self.plan['max_sample_gap_s']:
                     raise RuntimeError('采样/调度超时，保护停止')
                 for name in ('cpu', 'ddr'):
@@ -247,6 +247,10 @@ class Supervisor:
             elif key == 'battery':
                 item['planned_s'] = (config['charge_duration_min'] + config['discharge_duration_min']) * 60 * config['cycles']
                 self.emit('event', {'item': 'battery', 'reason': '请逐设备接入适配器并确认', 'token': 0})
+            elif key == 'lte':
+                item['scope'] = '沿用产测 AT 模组识别及 RSRP/RSRQ/SINR 阈值，周期检测信号'
+            elif key == 'hdmi':
+                item['scope'] = 'HDMI 连接、EDID 与模式；人工显示确认：' + ('已记录' if config.get('display_confirmed') else '未记录')
         self.status['state'] = 'RUNNING'
         self.emit('event', {'state': 'RUNNING', 'hardware': self.info})
 
@@ -324,7 +328,7 @@ class Supervisor:
 
     def battery_tick(self, sample, now):
         item = self.status['items']['battery']
-        b, cfg, protection = self.battery, self.plan['items']['battery'], self.plan['protection']
+        b, cfg, protection = self.battery, self.plan['items']['battery'], self.plan.get('protection', {})
         if not sample['valid']:
             b['failures'] += 1
             self.previous_battery = None
@@ -334,11 +338,16 @@ class Supervisor:
             return
         b['failures'] = 0
         current, voltage, temperature = sample['current_ma'], sample['voltage_mv'], sample['temperature_c']
-        limits = protection['battery_%s_temperature_range_c' % b['phase']]
-        if (not limits[0] <= temperature <= limits[1] or
-                not protection['battery_min_voltage_mv'] <= voltage <= protection['battery_max_voltage_mv'] or
-                abs(current) > protection['battery_max_abs_current_ma'] or
-                (b['phase'] == 'discharge' and sample['soc_pct'] <= protection['discharge_min_soc_pct'])):
+        limits = protection.get('battery_%s_temperature_range_c' % b['phase'])
+        minimum = protection.get('battery_min_voltage_mv')
+        maximum = protection.get('battery_max_voltage_mv')
+        max_current = protection.get('battery_max_abs_current_ma')
+        min_soc = protection.get('discharge_min_soc_pct')
+        if ((limits is not None and not limits[0] <= temperature <= limits[1]) or
+                (minimum is not None and voltage < minimum) or
+                (maximum is not None and voltage > maximum) or
+                (max_current is not None and abs(current) > max_current) or
+                (min_soc is not None and b['phase'] == 'discharge' and sample['soc_pct'] <= min_soc)):
             self.safety_reason = '电池温度/电压/电流/SOC 达到保护线；请接回适配器'
             return
         if item['result'] is not None:
@@ -384,7 +393,7 @@ class Supervisor:
         b['stop_count'] = b['stop_count'] + 1 if abs(current) <= cfg['stop_current_ma'] else 0
         natural = b['stop_count'] >= cfg['stop_confirm_samples'] and (
             (b['phase'] == 'charge' and sample['soc_pct'] >= 99) or
-            (b['phase'] == 'discharge' and sample['soc_pct'] <= protection['discharge_min_soc_pct'] + 2))
+            (b['phase'] == 'discharge' and (min_soc is None or sample['soc_pct'] <= min_soc + 2)))
         if elapsed < duration and not natural:
             return
         if natural and elapsed < duration and cfg['completion_mode'] == 'fixed_duration':
