@@ -35,6 +35,7 @@ class RunService:
 
     def start(self, devices, plan):
         plan = deepcopy(validate_plan(plan))
+        plan.pop('max_parallel_devices', None)
         if not devices or len({d['sn'] for d in devices}) != len(devices):
             raise ValueError('请选择设备，且同批 SN 不得重复')
         if len({d['ip'] for d in devices}) != len(devices):
@@ -48,8 +49,12 @@ class RunService:
         unfinished = {row['sn'] for row in self.repository.runs(unfinished=True)}
         if any(device['sn'] in busy | unfinished for device in devices):
             raise ValueError('所选设备存在未结束运行，请先恢复补采并停止原运行')
+        # 本批勾选多少台就同时执行多少台，不再通过计划字段限制或排队。
+        previous_pool = self.pool
+        self.pool = ThreadPoolExecutor(max_workers=len(devices), thread_name_prefix='master-aging')
+        previous_pool.shutdown(wait=False)
         batch_id = new_id()
-        gate = threading.Semaphore(plan['max_parallel_devices'])
+        gate = threading.Semaphore(len(devices))
         ids = []
         for device in devices:
             run_id = new_id()

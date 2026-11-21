@@ -17,6 +17,7 @@ class PlanDialog(QDialog):
         self.plan = deepcopy(plan)
         self.plan.pop('operator', None)
         self.plan.pop('station', None)
+        self.plan.pop('max_parallel_devices', None)
         plan = self.plan
         self.setWindowTitle('配置主控老化计划')
         self.resize(880, 760)
@@ -37,7 +38,7 @@ class PlanDialog(QDialog):
             check = QCheckBox()
             check.setChecked(plan['items'][key]['enabled'])
             duration = QSpinBox()
-            duration.setRange(1, 2 * 43200 * 1000 if key == 'battery' else 43200)
+            duration.setRange(0 if key == 'battery' else 1, 2 * 43200 * 1000 if key == 'battery' else 43200)
             duration.setValue(plan['items'][key]['duration_min'])
             if key == 'battery':
                 duration.setReadOnly(True)
@@ -53,8 +54,8 @@ class PlanDialog(QDialog):
         select = QCheckBox('全选项目（无 HDMI 的四代主控自动标记不适用）')
         select.toggled.connect(lambda value: [c.setChecked(value) for c in self.checks.values()])
         form.addRow(select)
-        self.charge = self.integer(plan['items']['battery']['charge_duration_min'], 1, 43200)
-        self.discharge = self.integer(plan['items']['battery']['discharge_duration_min'], 1, 43200)
+        self.charge = self.integer(plan['items']['battery']['charge_duration_min'], 0, 43200)
+        self.discharge = self.integer(plan['items']['battery']['discharge_duration_min'], 0, 43200)
         self.cycles = self.integer(plan['items']['battery']['cycles'], 1, 1000)
         for widget in (self.charge, self.discharge, self.cycles):
             widget.valueChanged.connect(self.update_battery_duration)
@@ -64,6 +65,7 @@ class PlanDialog(QDialog):
             battery_row.addWidget(QLabel(label))
             battery_row.addWidget(widget)
         form.addRow('电池串行阶段', battery_row)
+        form.addRow(QLabel('充电分钟为 0 时只放电，放电分钟为 0 时只充电；两者不能同时为 0。'))
         env = plan.get('environment', {})
         self.chamber = QLineEdit(str(env.get('chamber_id') or ''))
         self.temperature = QLineEdit('' if env.get('set_temperature_c') is None else str(env['set_temperature_c']))
@@ -74,9 +76,7 @@ class PlanDialog(QDialog):
         form.addRow(QLabel('温箱设定值仅作为条件记录；实际温湿度无传感器时留空。'))
         options = QVBoxLayout(settings)
         execution = QFormLayout()
-        self.parallel = self.integer(plan['max_parallel_devices'], 1, 32)
         self.interval = self.integer(plan['sample_interval_s'], 1, 60)
-        execution.addRow('同时老化台数', self.parallel)
         execution.addRow('数据采集间隔（秒）', self.interval)
         options.addLayout(execution)
         cpu_form = self.project_group(options, 'CPU 负载', 'cpu')
@@ -201,7 +201,6 @@ class PlanDialog(QDialog):
                 discharge_duration_min=self.discharge.value(), cycles=self.cycles.value(),
                 duration_min=(self.charge.value() + self.discharge.value()) * self.cycles.value(),
                 current_direction_confirmed=self.direction.isChecked(), completion_mode=self.completion.currentData())
-            plan['max_parallel_devices'] = self.parallel.value()
             plan['sample_interval_s'] = self.interval.value()
             plan['max_sample_gap_s'] = max(plan['max_sample_gap_s'], self.interval.value() * 2)
             plan['items']['cpu']['target_busy_pct'] = self.cpu_target.value()

@@ -21,11 +21,13 @@ def config_path():
 def load_config():
     with config_path().open(encoding='utf-8') as stream:
         result = yaml.safe_load(stream)
+    result.pop('max_parallel_devices', None)
     return deepcopy(result)
 
 
 def save_config(plan):
     plan = deepcopy(validate_plan(plan))
+    plan.pop('max_parallel_devices', None)
     path = config_path()
     temporary = None
     try:

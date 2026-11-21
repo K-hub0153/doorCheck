@@ -1,6 +1,5 @@
 schema_version: 1
 sample_interval_s: 10
-max_parallel_devices: 4
 max_sample_gap_s: 40
 min_free_space_mib: 256
 max_log_mib: 64

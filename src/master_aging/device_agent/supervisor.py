@@ -133,7 +133,11 @@ class Supervisor:
                        'pid': os.getpid(),
                        'created_at': utc_now(), 'items': {}, 'write_ledger': {},
                        'config_hash': digest(self.plan), 'seq': 0, 'latest': {}}
-        self.battery = {'index': 0, 'phase': 'charge', 'state': 'WAIT_OPERATOR', 'confirmed': False,
+        battery = self.plan['items']['battery']
+        self.battery_phases = [phase for phase in ('charge', 'discharge')
+                               if battery[phase + '_duration_min'] > 0]
+        self.battery = {'index': 0, 'phase': self.battery_phases[0] if self.battery_phases else 'charge',
+                        'state': 'WAIT_OPERATOR', 'confirmed': False,
                         'start_count': 0, 'stop_count': 0, 'failures': 0, 'segments': [],
                         'charge_mah': 0.0, 'discharge_mah': 0.0, 'charge_wh': 0.0, 'discharge_wh': 0.0}
         self.previous_battery = None
@@ -260,7 +264,9 @@ class Supervisor:
                         raise ValueError('无法预留存储日志和元数据预算')
             elif key == 'battery':
                 item['planned_s'] = (config['charge_duration_min'] + config['discharge_duration_min']) * 60 * config['cycles']
-                self.emit('event', {'item': 'battery', 'reason': '请逐设备接入适配器并确认', 'token': 0})
+                operation = '接入适配器' if self.battery['phase'] == 'charge' else '拔除适配器，确认放电负载'
+                self.emit('event', {'item': 'battery', 'phase': self.battery['phase'],
+                                    'reason': '请逐设备' + operation + '并确认', 'token': 0})
             elif key == 'lte':
                 item['scope'] = '沿用产测 AT 模组识别及 RSRP/RSRQ/SINR 阈值，周期检测信号'
             elif key == 'hdmi':
@@ -393,6 +399,9 @@ class Supervisor:
                 self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'RUNNING'})
             return
         duration = cfg[b['phase'] + '_duration_min'] * 60
+        # 仅配置单一方向时将所有循环合并，持续充/放电，不要求中途重复切电确认。
+        if len(self.battery_phases) == 1:
+            duration *= cfg['cycles']
         elapsed = b.get('phase_effective_s', 0)
         if self.previous_battery:
             previous_time, previous_current, previous_voltage = self.previous_battery
@@ -419,10 +428,12 @@ class Supervisor:
         b['segments'].append({'phase': b['phase'], 'index': b['index'], 'effective_s': min(elapsed, duration),
                               'end_soc': sample['soc_pct'], 'stop_reason': '停止节点' if natural else '到时'})
         b['index'] += 1
-        if b['index'] >= cfg['cycles'] * 2:
-            self.finish_item('battery', 'PASS', '所有充放电阶段完成')
+        phase_count = cfg['cycles'] * len(self.battery_phases) if len(self.battery_phases) > 1 else 1
+        if b['index'] >= phase_count:
+            self.finish_item('battery', 'PASS', '所有已配置的电池阶段完成')
             return
-        b.update(phase='discharge' if b['index'] % 2 else 'charge', state='WAIT_OPERATOR', start_count=0, stop_count=0)
+        b.update(phase=self.battery_phases[b['index'] % len(self.battery_phases)],
+                 state='WAIT_OPERATOR', start_count=0, stop_count=0)
         self.previous_battery = None
         self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'WAIT_OPERATOR', 'token': b['index']})
 

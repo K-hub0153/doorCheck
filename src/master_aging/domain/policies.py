@@ -28,10 +28,9 @@ def validate_plan(plan):
     if not enabled or any(k not in ITEMS for k in enabled):
         raise ValueError('至少选择一项已知测试项目')
     for key in enabled:
-        maximum = 2 * 43200 * 1000 if key == 'battery' else 43200
-        number(items[key].get('duration_min'), 1, maximum, ITEMS[key] + '分钟数', True)
+        if key != 'battery':
+            number(items[key].get('duration_min'), 1, 43200, ITEMS[key] + '分钟数', True)
     number(plan.get('sample_interval_s'), 1, 60, '采样间隔', True)
-    number(plan.get('max_parallel_devices'), 1, 32, '并行设备数', True)
     number(plan.get('min_free_space_mib'), 64, 1048576, '最小剩余空间 MiB', True)
     number(plan.get('max_log_mib'), 8, 4096, '日志上限 MiB', True)
     number(plan.get('max_sample_gap_s'), plan['sample_interval_s'] * 2, 600, '最大采样缺口秒数')
@@ -74,7 +73,10 @@ def validate_plan(plan):
     if 'battery' in enabled:
         battery = items['battery']
         for field in ('charge_duration_min', 'discharge_duration_min'):
-            number(battery.get(field), 1, 43200, field, True)
+            number(battery.get(field), 0, 43200, field, True)
+        if battery['charge_duration_min'] == 0 and battery['discharge_duration_min'] == 0:
+            raise ValueError('电池充电分钟和放电分钟不能同时为 0，至少保留一个阶段')
+        number(battery.get('duration_min'), 1, 2 * 43200 * 1000, '电池分钟数', True)
         number(battery.get('cycles'), 1, 1000, '电池循环数', True)
         number(battery.get('start_current_ma'), 1, 100000, '电池启动电流 mA')
         number(battery.get('stop_current_ma'), 0, battery['start_current_ma'] - 1, '电池停止电流 mA')
