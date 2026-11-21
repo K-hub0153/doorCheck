@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QD
                              QVBoxLayout, QWidget)
 from ..domain.models import ITEMS
 from ..domain.policies import validate_plan
+from ..infrastructure.config import save_config
 from .styles import STYLE
 
 
@@ -219,7 +220,10 @@ class PlanDialog(QDialog):
             if env['set_humidity_pct'] is not None and not 0 <= env['set_humidity_pct'] <= 100:
                 raise ValueError('湿度需为 0～100%')
             validate_plan(plan)
+            save_config(plan)
             self.plan = plan
             self.accept()
+        except OSError as exc:
+            QMessageBox.warning(self, '计划保存失败', '无法写入计划配置，请检查配置目录的写入权限：\n' + str(exc))
         except (ValueError, KeyError, TypeError) as exc:
             QMessageBox.warning(self, '计划不完整', str(exc))

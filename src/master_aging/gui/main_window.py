@@ -14,7 +14,7 @@ from ..adapters.discovery import Discovery
 from ..adapters.ssh_transport import SSHTransport
 from ..application.run_service import RunService
 from ..domain.models import ITEMS
-from ..domain.policies import planned_seconds
+from ..domain.policies import planned_seconds, validate_plan
 from ..infrastructure.config import load_config, runtime_dir
 from ..infrastructure.repository import Repository
 from ..infrastructure.report import export_report
@@ -36,6 +36,12 @@ class MainWindow(QMainWindow):
         self.service = RunService(self.repository)
         self.plan = load_config()
         self.plan_valid = False
+        plan_error = None
+        try:
+            validate_plan(self.plan)
+            self.plan_valid = True
+        except (ValueError, KeyError, TypeError) as exc:
+            plan_error = str(exc)
         self.devices, self.run_devices, self.statuses = {}, {}, {}
         self.jobs, self.work_pool = [], ThreadPoolExecutor(max_workers=4, thread_name_prefix='aging-discovery')
         self.probing, self.job_messages = set(), queue.Queue()
@@ -44,6 +50,7 @@ class MainWindow(QMainWindow):
         self.closing = False
         self.detached = False
         self._build_ui()
+        self.update_plan_summary()
         self.discovery = Discovery()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -51,6 +58,8 @@ class MainWindow(QMainWindow):
         self.load_history()
         unfinished = self.repository.runs(unfinished=True)
         self.log('本地目录：' + str(runtime_dir()))
+        if plan_error:
+            self.log('已读取的计划需要重新配置：' + plan_error)
         if unfinished:
             self.log('发现 %s 条未结束运行，可在历史记录中选择“恢复补采”；恢复不会重复启动负载。' % len(unfinished))
 
@@ -346,6 +355,11 @@ class MainWindow(QMainWindow):
         if dialog.exec_():
             self.plan = dialog.plan
             self.plan_valid = True
+            self.update_plan_summary()
+            self.log('计划已保存，下次启动自动恢复')
+
+    def update_plan_summary(self):
+        if self.plan_valid:
             selected = ', '.join(ITEMS[k] for k, v in self.plan['items'].items() if v['enabled'])
             self.plan_label.setText('项目：%s · 并行计划约 %.0f 分钟（另计人工等待）' %
                                     (selected, planned_seconds(self.plan) / 60))

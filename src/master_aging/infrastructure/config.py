@@ -1,7 +1,10 @@
 from copy import deepcopy
+import os
 from pathlib import Path
 import sys
+import tempfile
 import yaml
+from ..domain.policies import validate_plan
 
 
 def app_dir():
@@ -11,11 +14,31 @@ def app_dir():
     return Path(__file__).resolve().parents[3]
 
 
+def config_path():
+    return app_dir() / 'config/master_aging/config.yaml'
+
+
 def load_config():
-    path = app_dir() / 'config/master_aging/config.yaml'
-    with path.open(encoding='utf-8') as stream:
+    with config_path().open(encoding='utf-8') as stream:
         result = yaml.safe_load(stream)
     return deepcopy(result)
+
+
+def save_config(plan):
+    plan = deepcopy(validate_plan(plan))
+    path = config_path()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix=path.name + '.', suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            yaml.safe_dump(plan, stream, allow_unicode=True, sort_keys=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def runtime_dir():

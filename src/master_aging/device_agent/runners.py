@@ -4,13 +4,24 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
 # 独立 wrapper 在 exec 前设置 Linux parent-death 信号，避免 supervisor 意外退出后遗留负载。
 # 不使用多线程进程中不安全的 preexec_fn。
 PARENT_GUARD = '''import ctypes, os, signal, subprocess, sys
 libc = ctypes.CDLL(None, use_errno=True)
 signal.signal(signal.SIGUSR1, lambda signum, frame: os.killpg(0, signal.SIGKILL))
-signal.signal(signal.SIGTERM, lambda signum, frame: None)
+child = None
+stopping = False
+def stop(signum, frame):
+    global stopping
+    stopping = True
+    if child is not None:
+        try:
+            child.terminate()
+        except ProcessLookupError:
+            pass
+signal.signal(signal.SIGTERM, stop)
 if libc.prctl(1, signal.SIGUSR1, 0, 0, 0) != 0:
     raise OSError(ctypes.get_errno(), 'PR_SET_PDEATHSIG failed')
 if libc.prctl(36, 1, 0, 0, 0) != 0:
@@ -18,6 +29,8 @@ if libc.prctl(36, 1, 0, 0, 0) != 0:
 if os.getppid() != int(sys.argv[1]):
     os.killpg(0, signal.SIGKILL)
 child = subprocess.Popen(sys.argv[2:])
+if stopping:
+    stop(signal.SIGTERM, None)
 result = child.wait()
 while True:
     try:
@@ -48,23 +61,58 @@ class Process:
     def poll(self):
         return self.process.poll()
 
-    def stop(self):
+    def request_stop(self):
+        # 先由 wrapper 通知负载主进程正常收尾，避免直接终止 stress-ng worker。
         if self.process.poll() is None:
             try:
-                os.killpg(self.process.pid, signal.SIGTERM)
+                self.process.terminate()
             except ProcessLookupError:
                 pass
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+
+    def group_running(self):
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # 进程组存在但当前用户无权探测时，不能把它当成已停止。
+            return True
+        # SIGKILL 后孤儿可能短暂成为僵尸；僵尸不再执行负载，不能据此判残留压测。
+        proc = Path('/proc')
+        if proc.is_dir():
+            for path in proc.glob('[0-9]*/stat'):
+                try:
+                    fields = path.read_text().rsplit(')', 1)[1].split()
+                    if int(fields[2]) == self.process.pid and fields[0] not in ('Z', 'X'):
+                        return True
+                except FileNotFoundError:
+                    continue
+            return False
+        return True
+
+    def stop(self):
+        try:
+            self.request_stop()
+            deadline = time.monotonic() + 5
+            while self.group_running() and time.monotonic() < deadline:
+                self.process.poll()
+                time.sleep(0.05)
+            # 即使 wrapper 已退出，也要回收同组残留的 worker/fio 子进程。
+            if self.group_running():
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                self.process.wait(timeout=5)
-        self.out.close()
-        self.err.close()
-        return self.process.returncode
+            self.process.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while self.group_running():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('压测进程组 %s 仍有运行进程，停止尚未确认' % self.process.pid)
+                time.sleep(0.05)
+            return self.process.returncode
+        finally:
+            self.out.close()
+            self.err.close()
 
 
 def fio_args(path, size, output):

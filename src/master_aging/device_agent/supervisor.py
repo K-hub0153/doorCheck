@@ -173,10 +173,7 @@ class Supervisor:
                     if item and process and item['result'] is None and name not in self.timed_out:
                         if time.monotonic() - item['started_monotonic'] >= item['planned_s']:
                             self.timed_out.add(name)
-                            try:
-                                os.killpg(process.process.pid, signal.SIGTERM)
-                            except ProcessLookupError:
-                                pass
+                            process.request_stop()
                 for path in [ROOT] + [Path(t['directory']) for t in self.info.get('storage_targets', [])]:
                     if shutil.disk_usage(path).free < self.plan['min_free_space_mib'] * 2**20:
                         raise RuntimeError('剩余空间低于保护线')
@@ -189,26 +186,43 @@ class Supervisor:
                 # 不依赖 PC 或主采样循环：只停止本 supervisor 创建的进程组。
                 for process in list(self.processes.values()):
                     try:
-                        if process.poll() is None:
-                            os.killpg(process.process.pid, signal.SIGKILL)
+                        os.killpg(process.process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                 return
+
+    def stop_process(self, name):
+        process = self.processes[name]
+        evidence = {'pgid': process.process.pid, 'confirmed': False}
+        self.status.setdefault('process_cleanup', {})[name] = evidence
+        try:
+            code = process.stop()
+        except Exception as exc:
+            evidence['error'] = str(exc)
+            raise
+        evidence.update(confirmed=True, exit_code=code, checked_at=utc_now())
+        # 停止未确认时保留引用，最终清理仍可重试，不能遗漏该进程组。
+        self.processes.pop(name)
+        return code
 
     def finish_item(self, key, result, reason):
         item = self.status['items'][key]
         if item.get('result') is not None:
             return
-        process = self.processes.pop(key, None)
-        if process:
-            item['exit_code'] = process.stop()
-            if result == 'PASS' and item['exit_code'] != 0:
-                result, reason = 'INCOMPLETE', '压测退出码不是 0: %s' % item['exit_code']
-        # 存储进程按目标单独持有。
+        names = [key] if key in self.processes else []
         if key == 'storage':
-            for name in list(self.processes):
-                if name.startswith('storage_'):
-                    self.processes.pop(name).stop()
+            names += [name for name in self.processes if name.startswith('storage_')]
+        for name in names:
+            try:
+                code = self.stop_process(name)
+                if name == key:
+                    item['exit_code'] = code
+                if result == 'PASS' and code != 0:
+                    result, reason = 'INCOMPLETE', '压测退出码不是 0: %s' % code
+            except Exception as exc:
+                if result == 'PASS':
+                    result = 'INCOMPLETE'
+                reason += '；压测进程停止未确认: ' + str(exc)
         item.update(result=result, stop_reason=reason, finished_at=utc_now())
         self.emit('event', {'item': key, 'result': result, 'reason': reason})
 
@@ -287,7 +301,7 @@ class Supervisor:
             if task['pending']:
                 process = self.processes[name]
                 if process.poll() is not None:
-                    code = self.processes.pop(name).stop()
+                    code = self.stop_process(name)
                     if code:
                         self.finish_item('storage', 'FAIL', 'fio 非零退出；保留未决预留量')
                         return
@@ -437,10 +451,7 @@ class Supervisor:
                 code = self.processes[key].poll()
                 if key in self.timed_out and elapsed >= item['planned_s']:
                     # stress-ng 在 SIGTERM 后先汇总校验结果。非零退出不能通过。
-                    process = self.processes[key]
-                    exit_code = process.stop()
-                    self.finish_item(key, 'PASS' if exit_code == 0 else 'INCOMPLETE',
-                                     '到时正常结束' if exit_code == 0 else '到时停止未取得成功退出码: %s' % exit_code)
+                    self.finish_item(key, 'PASS', '到时正常结束')
                 elif code is not None:
                     self.finish_item(key, 'FAIL' if code else 'INCOMPLETE', '压测进程提前退出: %s' % code)
                 elif key == 'cpu' and elapsed > cfg['grace_s'] and data['cpu']['busy_pct'] is not None and data['cpu']['busy_pct'] < cfg['target_busy_pct']:
@@ -528,9 +539,9 @@ class Supervisor:
             if hasattr(self, 'guard_thread'):
                 self.guard_thread.join(timeout=3)
             cleanup_errors = []
-            for name, process in list(self.processes.items()):
+            for name in list(self.processes):
                 try:
-                    process.stop()
+                    self.stop_process(name)
                 except Exception as exc:
                     cleanup_errors.append(name + ': ' + str(exc))
             self.status['cleanup_errors'] = cleanup_errors
