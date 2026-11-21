@@ -61,6 +61,35 @@ class Process:
     def poll(self):
         return self.process.poll()
 
+    def memory_snapshot(self):
+        """读取本进程组的内存证据，区分控制进程与实际执行校验的 worker。"""
+        proc = Path('/proc')
+        if not proc.is_dir():
+            raise OSError('无法读取 /proc 进程内存信息')
+        members = []
+        for path in proc.glob('[0-9]*/stat'):
+            try:
+                fields = path.read_text().rsplit(')', 1)[1].split()
+                if int(fields[2]) != self.process.pid or fields[0] in ('Z', 'X'):
+                    continue
+                status = dict(line.split(':', 1) for line in
+                              (path.parent / 'status').read_text().splitlines() if ':' in line)
+                if 'VmSwap' not in status or 'VmRSS' not in status:
+                    # worker 退出过程中可能已释放地址空间，不计入运行工作集。
+                    current = path.read_text().rsplit(')', 1)[1].split()
+                    if current[0] in ('Z', 'X'):
+                        continue
+                    raise ValueError('进程 %s 缺少 VmSwap/VmRSS' % path.parent.name)
+                members.append({'pid': int(path.parent.name), 'ppid': int(fields[1]),
+                                'name': status.get('Name', '').strip(),
+                                'rss_bytes': int(status['VmRSS'].split()[0]) * 1024,
+                                'swap_bytes': int(status['VmSwap'].split()[0]) * 1024})
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # 采样时自然退出的进程。
+        return {'pgid': self.process.pid, 'processes': members,
+                'rss_bytes': sum(p['rss_bytes'] for p in members),
+                'swap_bytes': sum(p['swap_bytes'] for p in members)}
+
     def request_stop(self):
         # 先由 wrapper 通知负载主进程正常收尾，避免直接终止 stress-ng worker。
         if self.process.poll() is None:

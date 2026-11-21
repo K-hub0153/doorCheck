@@ -40,6 +40,17 @@ def run_path(run_id):
     return ROOT / run_id
 
 
+def ddr_allocation(memory, config):
+    available = memory['MemAvailable']
+    # 除固定保留空间外，为并行项目和设备业务保留至少 30% 当前可用内存。
+    reserve = max(config['reserve_mib'] * 2**20, (available * 30 + 99) // 100)
+    allocation = int(min(memory['MemTotal'] * config['max_memory_pct'] // 100,
+                         available - reserve))
+    if allocation < 16 * 2**20:
+        raise ValueError('DDR 可用内存不足，无法保留系统保护空间')
+    return {'bytes': allocation, 'available_bytes': available, 'reserve_bytes': reserve}
+
+
 def preflight(plan, expected):
     validate_plan(plan)
     info = collectors.probe()
@@ -63,12 +74,8 @@ def preflight(plan, expected):
     if items['cpu']['enabled'] or items['ddr']['enabled']:
         info['tool_versions']['stress-ng'] = collectors.command(['stress-ng', '--version'])
     if items['ddr']['enabled']:
-        cfg = items['ddr']
-        allocation = min(info['memory']['MemTotal'] * cfg['max_memory_pct'] // 100,
-                         info['memory']['MemAvailable'] - cfg['reserve_mib'] * 2**20)
-        if allocation < 16 * 2**20:
-            raise ValueError('DDR 可用内存不足，无法保留系统保护空间')
-        info['ddr_bytes'] = int(allocation)
+        info['ddr_allocation'] = ddr_allocation(info['memory'], items['ddr'])
+        info['ddr_bytes'] = info['ddr_allocation']['bytes']
     if items['storage']['enabled']:
         if not info['tools']['fio'] or not collectors.command(['fio', '--version']).startswith('fio-'):
             raise ValueError('设备缺少真正的 fio 工具')
@@ -246,10 +253,16 @@ class Supervisor:
                 if key == 'cpu':
                     args += ['--cpu', str(self.info['cpu_count']), '--cpu-method', 'all']
                 else:
+                    # 预检后可能已启动其他负载，按实际启动时的可用内存重新限额。
+                    memory = collectors.memory()
+                    budget = ddr_allocation(memory, config)
+                    self.info['ddr_bytes'] = min(self.info['ddr_bytes'], budget['bytes'])
+                    budget['bytes'] = self.info['ddr_bytes']
+                    self.info['ddr_allocation'] = item['allocation'] = budget
                     args += ['--vm', '1', '--vm-bytes', str(self.info['ddr_bytes']), '--vm-method', 'all', '--vm-keep']
                     item['scope'] = 'DDR 正确性压力；带宽基线需另行使用已验证的 STREAM 工具测量'
                     # 在启动负载前记录基线，不能把系统原有 swap 占用当作本轮换出。
-                    item['swap_baseline'] = self.swap_snapshot(collectors.memory(), collectors.read('/proc/vmstat'))
+                    item['swap_baseline'] = self.swap_snapshot(memory, collectors.read('/proc/vmstat'))
                 args += ['--timeout', str(config['duration_min'] * 60) + 's']
                 self.processes[key] = runners.Process(args, self.directory, key)
                 item['started_monotonic'] = time.monotonic()
@@ -466,14 +479,22 @@ class Supervisor:
                 code = self.processes[key].poll()
                 swapping = False
                 if key == 'ddr':
-                    baseline = item['swap_baseline']
                     latest_swap = self.swap_snapshot(data['memory'], data.get('vmstat', ''))
                     item['swap_latest'] = latest_swap
-                    swapping = (latest_swap['used_bytes'] > baseline['used_bytes'] or
-                                (latest_swap['pswpout'] is not None and baseline['pswpout'] is not None
-                                 and latest_swap['pswpout'] > baseline['pswpout']))
+                    try:
+                        group = self.processes[key].memory_snapshot()
+                    except (OSError, ValueError) as exc:
+                        self.finish_item(key, 'INCOMPLETE', 'DDR 进程内存采样失败: ' + str(exc))
+                        continue
+                    # wrapper 和 stress-ng 主进程不执行 VM 校验，其闲置页可正常被换出。
+                    # VM worker 是组内孙进程；名称同时覆盖退出时重挂到 wrapper 的 worker。
+                    workers = [p for p in group['processes'] if p['pid'] != item['pid'] and
+                               (p['ppid'] != item['pid'] or p['name'].startswith('stress-ng-vm'))]
+                    group['worker_swap_bytes'] = sum(p['swap_bytes'] for p in workers)
+                    item['memory_latest'] = data['ddr_process_memory'] = group
+                    swapping = group['worker_swap_bytes'] > 0
                 if swapping:
-                    self.finish_item(key, 'INCOMPLETE', '本轮 DDR 压测期间出现新增 swap 换出，无法保证工作集驻留内存')
+                    self.finish_item(key, 'INCOMPLETE', 'DDR 压测 worker 出现 swap 换出，需降低内存负载后重试')
                 elif elapsed >= item['planned_s']:
                     # 正常到时先等 stress-ng 汇总；非零退出和清理失败仍不能通过。
                     if code is not None or key in self.timed_out or elapsed >= item['planned_s'] + 5:

@@ -11,8 +11,8 @@ environment:
   measured_temperature: null
   measured_humidity: null
 items:
-  cpu: {enabled: true, duration_min: 120, target_busy_pct: 95, grace_s: 60}
-  ddr: {enabled: true, duration_min: 120, max_memory_pct: 50, reserve_mib: 256}
+  cpu: {enabled: false, duration_min: 120, target_busy_pct: 95, grace_s: 60}
+  ddr: {enabled: false, duration_min: 120, max_memory_pct: 50, reserve_mib: 256}
   storage:
     enabled: false
     duration_min: 120
