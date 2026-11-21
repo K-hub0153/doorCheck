@@ -38,7 +38,7 @@ QProgressBar { border: none; background: #e3f2fd; border-radius: 3px; text-align
 QProgressBar::chunk { background: #90caf9; border-radius: 3px; }
 '''
 
-STATES = {'DISCOVERED': '待配置', 'PREFLIGHT': '预检中', 'RUNNING': '老化中',
+STATES = {'DISCOVERED': '待配置', 'DEPLOYING': '准备环境', 'READY': '准备就绪', 'PREFLIGHT': '预检中', 'RUNNING': '老化中',
           'WAIT_OPERATOR': '等待电源切换', 'RECONNECTING': '等待重连', 'FINISHED': '已结束',
           'BLOCKED': '预检未通过', 'STOPPING': '停止中'}
 

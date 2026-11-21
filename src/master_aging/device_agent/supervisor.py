@@ -59,7 +59,7 @@ def preflight(plan, expected):
     items = plan['items']
     for key in ('cpu', 'ddr'):
         if items[key]['enabled'] and not info['tools']['stress-ng']:
-            raise ValueError('设备缺少经过验证的 stress-ng，请按架构离线部署')
+            raise ValueError('设备缺少 stress-ng，自动部署后仍不可用，请查看环境部署日志')
     if items['cpu']['enabled'] or items['ddr']['enabled']:
         info['tool_versions']['stress-ng'] = collectors.command(['stress-ng', '--version'])
     if items['ddr']['enabled']:

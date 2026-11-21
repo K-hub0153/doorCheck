@@ -7,6 +7,7 @@ import queue
 import threading
 
 from ..adapters.ssh_transport import SSHTransport
+from ..adapters.environment import DeploymentCancelled
 from ..domain.models import conclusion, digest, new_id, safe_sn, utc_now
 from ..domain.policies import validate_plan
 from ..infrastructure.report import export_report, export_batch
@@ -98,7 +99,7 @@ class RunService:
         (directory / 'summary.json').write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
         with (directory / 'controller.log').open('a', encoding='utf-8') as stream:
             stream.write('%s %s result=%s seq=%s %s\n' % (utc_now(), status['state'], status.get('result'),
-                status.get('seq'), status.get('error') or status.get('connection_error') or ''))
+                status.get('seq'), status.get('error') or status.get('connection_error') or status.get('environment_message') or ''))
         self.notify(run_id, status)
 
     def _ingest(self, transport, run_id, directory):
@@ -153,7 +154,14 @@ class RunService:
                 try:
                     if transport is None:
                         transport = self.transport_factory(device)
-                        info = transport.probe()
+                        def progress(message):
+                            if not launched:
+                                last_status.update(state='DEPLOYING', environment_message=message)
+                                self._store(run_id, last_status, directory)
+                        transport.progress = progress
+                        transport.cancelled = lambda: not launched and (control['stop'].is_set() or self.detaching.is_set())
+                        progress('正在连接设备并检查运行环境')
+                        info = transport.probe(bootstrap=not launched)
                         if info['sn'] != device['sn']:
                             raise ValueError('重连设备 SN 不一致')
                         if last_status.get('hardware', {}).get('fingerprint') and info['fingerprint'] != last_status['hardware']['fingerprint']:
@@ -162,12 +170,22 @@ class RunService:
                                                 and last_status['boot_id'] != info['boot_id'])
                         self.repository.update_ip(run_id, device['ip'])
                         if not launched:
+                            if info['chip'] == 'unknown' or info['chip'] != info['sn_chip']:
+                                raise ValueError('真实硬件与 SN 机型无法核验一致，未部署老化依赖')
+                            fingerprint = info['fingerprint']
+                            last_status['hardware'] = info
+                            info = transport.prepare(plan)
+                            if info['sn'] != device['sn'] or info['fingerprint'] != fingerprint:
+                                raise ValueError('环境部署后设备身份发生变化，未启动老化')
+                            if control['stop'].is_set() or self.detaching.is_set():
+                                raise DeploymentCancelled('环境准备期间已取消，未启动老化负载')
                             request = {'run_id': run_id, 'device': dict(device, fingerprint=info['fingerprint']), 'plan': plan}
                             (directory / 'manifest.json').write_text(json.dumps({'run_id': run_id, 'device': info,
                                 'created_at': utc_now(), 'config_hash': digest(plan), 'agent_sha256': transport.agent.rsplit('-', 1)[-1][:-4]},
                                 ensure_ascii=False, indent=2), encoding='utf-8')
                             # 在提交启动之前持久化意图。命令响应丢失后只查询原 run_id。
-                            last_status.update(state='READY', hardware=info, launch_requested=True)
+                            last_status.update(state='READY', hardware=info, launch_requested=True,
+                                               environment_message='环境准备完成，正在启动老化预检')
                             self._store(run_id, last_status, directory)
                             launched = True
                             transport.launch(request)
@@ -180,6 +198,8 @@ class RunService:
                     status = transport.action('status', run_id)
                     if last_status.get('hardware') and not status.get('hardware'):
                         status['hardware'] = last_status['hardware']
+                    elif last_status.get('hardware', {}).get('environment_deployment'):
+                        status['hardware']['environment_deployment'] = last_status['hardware']['environment_deployment']
                     if status.get('run_id') != run_id:
                         raise ValueError('设备状态运行身份不匹配')
                     if status['state'] == 'MISSING':
@@ -218,6 +238,10 @@ class RunService:
                                                error='最终日志缺段，不能确认数据完整')
                             self._store(run_id, last_status, directory)
                         return
+                except DeploymentCancelled as exc:
+                    last_status.update(state='FINISHED', result='ABORTED', error=str(exc), cleanup_confirmed=True)
+                    self._store(run_id, last_status, directory)
+                    return
                 except ValueError as exc:
                     if validated_status and validated_status['state'] in ('FINISHED', 'BLOCKED'):
                         last_status = validated_status

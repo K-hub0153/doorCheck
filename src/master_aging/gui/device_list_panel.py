@@ -54,7 +54,7 @@ class DeviceCard(QFrame):
         state, result = status['state'], status.get('result')
         self.status.setText(STATES.get(state, state) + (' · ' + result if result else ''))
         self.status.setStyleSheet('color:%s;font-weight:bold' % status_color(result or state))
-        self.status.setToolTip(status.get('error') or status.get('connection_error') or status.get('safety_stop') or '')
+        self.status.setToolTip(status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or '')
         self.live.setText(live)
 
     def set_active(self, active):

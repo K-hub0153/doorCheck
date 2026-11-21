@@ -8,6 +8,7 @@ import zipfile
 import errno
 
 import paramiko
+from .environment import EnvironmentDeployer, workload_tools
 from ..infrastructure.config import ssh_settings
 
 REMOTE_ROOT = '/var/tmp/master-aging'
@@ -37,11 +38,17 @@ def agent_bundle():
 
 class SSHTransport:
     """只执行有超时的短控制命令，SFTP 增量获取日志；不调用原产测初始化。"""
-    def __init__(self, device, settings=None):
+    def __init__(self, device, settings=None, progress=None):
         self.device = device
         self.settings = settings if settings is not None else ssh_settings()
+        self.progress = progress or (lambda message: None)
+        self.cancelled = lambda: False
+        self.deployment = []
         self.client = None
         self.agent = None
+
+    def report(self, message):
+        self.progress(message)
 
     def connect(self):
         self.close()
@@ -84,13 +91,25 @@ class SSHTransport:
                 time.sleep(0.01)
             code = channel.recv_exit_status()
             if code:
-                raise RuntimeError(errors.decode('utf-8', errors='replace')[-1500:] or '远端控制命令失败')
+                detail = (errors or data).decode('utf-8', errors='replace')[-1500:]
+                raise RuntimeError(detail.strip() or '远端控制命令失败（退出码 %s）' % code)
             return data.decode('utf-8')
         finally:
             stdin.close()
             channel.close()
 
+    def environment(self):
+        return EnvironmentDeployer(self.command, self.report, self.cancelled)
+
+    def prepare(self, plan):
+        self.report('检查所选老化项目的运行环境')
+        self.deployment.append(self.environment().ensure(workload_tools(plan)))
+        info = self.action('probe')
+        info['environment_deployment'] = list(self.deployment)
+        return info
+
     def deploy(self):
+        self.report('正在部署老化执行器')
         bundle = agent_bundle()
         signature = hashlib.sha256(bundle).hexdigest()
         self.agent = REMOTE_ROOT + '/agent-' + signature + '.pyz'
@@ -118,8 +137,15 @@ class SSHTransport:
             args += ['--' + key.replace('_', '-'), str(value)]
         return json.loads(self.command(args))
 
-    def probe(self):
+    def probe(self, bootstrap=True):
         self.connect()
+        # Python 缺失时也能先通过 shell 核验 SN，再使用现有软件源补齐。
+        sn = self.command(['cat', '/etc/serial-id']).strip()
+        if not sn or (self.device.get('sn') and sn != self.device['sn']):
+            raise ValueError('设备 SN 与所选身份不一致，未部署环境')
+        if bootstrap:
+            self.report('检查设备 Python 运行环境')
+            self.deployment.append(self.environment().ensure(['python3']))
         self.deploy()
         return self.action('probe')
 

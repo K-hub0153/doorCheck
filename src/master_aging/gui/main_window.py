@@ -38,6 +38,7 @@ class MainWindow(QMainWindow):
         self.plan_valid = False
         self.devices, self.run_devices, self.statuses = {}, {}, {}
         self.jobs, self.work_pool = [], ThreadPoolExecutor(max_workers=4, thread_name_prefix='aging-discovery')
+        self.probing, self.job_messages = set(), queue.Queue()
         self.scan_progress = queue.Queue(maxsize=1)
         self.scanning = False
         self.closing = False
@@ -142,6 +143,9 @@ class MainWindow(QMainWindow):
                     button.setProperty('role', role)
                 button.clicked.connect(action)
                 actions.addWidget(button, row, col)
+                if text == '读取设备信息':
+                    self.probe_button = button
+                    button.setToolTip('读取设备 SN、机型、内存、存储和工具状态；开始老化时会自动读取。勾选可批量读取，未勾选时读取当前查看的设备。')
         content_layout.addLayout(actions)
         self.tabs = QTabWidget()
         content_layout.addWidget(self.tabs, 1)
@@ -283,30 +287,58 @@ class MainWindow(QMainWindow):
                 break
 
     def probe(self, device):
+        ip = device['ip']
+        if ip in self.probing:
+            return
+        self.probing.add(ip)
+        self.update_probe_button()
+        self.log('正在读取设备信息：%s (%s)' % (device.get('sn', ''), ip))
         def read():
-            transport = SSHTransport(device)
+            transport = SSHTransport(device, progress=lambda message: self.job_messages.put('%s：%s' % (ip, message)))
             try:
                 return dict(transport.probe(), ip=device['ip'])
             finally:
                 transport.close()
         def completed(info):
+            self.finish_probe(ip)
             if not info['sn']:
                 self.error('设备 /etc/serial-id 为空，不能作为老化设备')
                 return
-            self.found(info)
-            entry = self.devices[info['ip']]
-            entry.update(info)
-            entry['hardware_text'] = info['chip'] + ' / ' + info['kernel']
+            self.apply_device_info(info)
             size = info.get('memory', {}).get('MemTotal', 0) / 2**30
-            disks = ', '.join('%s %.1f GiB' % (d['name'], d['size_bytes'] / 2**30) for d in info['disks'])
-            entry['storage_text'] = '%.1f GiB / %s' % (size, disks)
-            self.device_list.upsert(entry)
+            self.log('设备信息读取完成：%s (%s)，机型 %s，内存 %.1f GiB' % (info['sn'], ip, info['chip'], size))
             if self.device_list.current_ip == info['ip']:
                 self.show_details(info['ip'])
-        self.job(read, completed)
+        def failed(exc):
+            self.finish_probe(ip)
+            self.error('读取 %s 设备信息失败：%s' % (ip, exc))
+        self.job(read, completed, failed)
+
+    def apply_device_info(self, info):
+        self.found(info)
+        entry = self.devices[info['ip']]
+        entry['hardware_text'] = info['chip'] + ' / ' + info['kernel']
+        size = info.get('memory', {}).get('MemTotal', 0) / 2**30
+        disks = ', '.join('%s %.1f GiB' % (d['name'], d['size_bytes'] / 2**30) for d in info['disks'])
+        entry['storage_text'] = '%.1f GiB / %s' % (size, disks)
+        self.device_list.upsert(entry)
+
+    def finish_probe(self, ip):
+        self.probing.discard(ip)
+        self.update_probe_button()
+
+    def update_probe_button(self):
+        self.probe_button.setText('正在读取（%s）' % len(self.probing) if self.probing else '读取设备信息')
+        self.probe_button.setEnabled(not self.probing)
 
     def probe_selected(self):
-        for device in self.selected():
+        devices = self.selected()
+        if not devices and self.device_list.current_ip in self.devices:
+            devices = [self.devices[self.device_list.current_ip]]
+        if not devices:
+            QMessageBox.information(self, '读取设备信息', '请先扫描并添加设备，再点击设备卡片或勾选需要读取的设备。')
+            return
+        for device in devices:
             self.probe(device)
 
     def configure(self):
@@ -323,6 +355,8 @@ class MainWindow(QMainWindow):
             devices = self.selected()
             if not devices:
                 raise ValueError('请勾选要运行的设备')
+            if any(device['ip'] in self.probing for device in devices):
+                raise ValueError('所选设备正在读取信息，请等待完成后开始老化')
             if not self.plan_valid:
                 self.configure()
                 if not self.plan_valid:
@@ -332,7 +366,7 @@ class MainWindow(QMainWindow):
                 self.run_devices[run_id] = device['ip']
                 self.devices[device['ip']]['run_id'] = run_id
             self.load_history()
-            self.log('已提交 %s 台设备，正在设备端预检' % len(ids))
+            self.log('已提交 %s 台设备，正在检查环境并自动部署缺失依赖，完成后开始老化' % len(ids))
         except Exception as exc:
             self.error(exc)
 
@@ -432,6 +466,11 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, '操作未完成', str(error))
 
     def tick(self):
+        while True:
+            try:
+                self.log(self.job_messages.get_nowait())
+            except queue.Empty:
+                break
         if self.scanning:
             try:
                 scanned, total = self.scan_progress.get_nowait()
@@ -458,9 +497,12 @@ class MainWindow(QMainWindow):
             self.metrics.update_status(run_id, status)
             ip = self.run_devices.get(run_id)
             if ip in self.devices:
-                reason = status.get('error') or status.get('connection_error') or status.get('safety_stop') or ''
-                if (status['state'], reason) != (previous.get('state'), previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or ''):
-                    self.log('%s：%s %s' % (self.devices[ip]['sn'], status['state'], reason))
+                reason = status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
+                previous_reason = previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or previous.get('environment_message') or ''
+                if (status['state'], reason) != (previous.get('state'), previous_reason):
+                    self.log('%s：%s %s' % (self.devices[ip]['sn'], STATES.get(status['state'], status['state']), reason))
+                if status.get('hardware') and status['hardware'] != previous.get('hardware'):
+                    self.apply_device_info(dict(status['hardware'], ip=ip))
                 latest = status.get('latest', {})
                 temps = list(latest.get('temperature_c', {}).values())
                 remaining = ', '.join('%s %.0fm' % (ITEMS.get(key, key), max(0, item.get('planned_s', 0) - item.get('effective_s', 0)) / 60)
@@ -468,7 +510,8 @@ class MainWindow(QMainWindow):
                 temperature = ('%.1f℃' % max(temps)) if temps else '温度未采到'
                 busy = latest.get('cpu', {}).get('busy_pct')
                 busy_text = ('%.1f%%' % busy) if busy is not None else '未采到'
-                self.device_list.cards[ip].update_status(status, 'CPU %s · %s\n%s' % (busy_text, temperature, remaining))
+                live = reason if status['state'] in ('DEPLOYING', 'READY') else 'CPU %s · %s\n%s' % (busy_text, temperature, remaining)
+                self.device_list.cards[ip].update_status(status, live)
                 if self.device_list.current_ip == ip:
                     self.show_details(ip)
             changed = True
