@@ -390,9 +390,6 @@ class Supervisor:
             return
         sign = 1 if b['phase'] == 'charge' else -1
         directed = current * sign
-        if directed < -cfg['stop_current_ma']:
-            self.finish_item('battery', 'INCOMPLETE', '电流方向异常，需核验电源/负载条件')
-            return
         if b['state'] == 'WAIT_CURRENT':
             b['start_count'] = b['start_count'] + 1 if directed >= cfg['start_current_ma'] else 0
             if now - b['wait_started'] > cfg['start_timeout_min'] * 60:
@@ -403,6 +400,9 @@ class Supervisor:
                 b['phase_effective_s'] = 0
                 self.previous_battery = (now, current, voltage)
                 self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'RUNNING'})
+            return
+        if directed < -cfg['stop_current_ma']:
+            self.finish_item('battery', 'INCOMPLETE', '电流方向异常，需核验电源/负载条件')
             return
         duration = cfg[b['phase'] + '_duration_min'] * 60
         # 仅配置单一方向时将所有循环合并，持续充/放电，不要求中途重复切电确认。
@@ -439,9 +439,12 @@ class Supervisor:
             self.finish_item('battery', 'PASS', '所有已配置的电池阶段完成')
             return
         b.update(phase=self.battery_phases[b['index'] % len(self.battery_phases)],
-                 state='WAIT_OPERATOR', confirmed=False, start_count=0, stop_count=0)
+                 state='WAIT_CURRENT', wait_started=now, start_count=0, stop_count=0)
         self.previous_battery = None
-        self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'WAIT_OPERATOR', 'token': b['index']})
+        operation = '接入适配器' if b['phase'] == 'charge' else '拔除适配器并接好放电负载'
+        self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'WAIT_CURRENT',
+                            'reason': '本次测试已确认，请' + operation + '，等待实际电流达标，无需再次确认',
+                            'token': b['index']})
 
     @staticmethod
     def swap_snapshot(memory, vmstat):

@@ -199,7 +199,12 @@ class RunService:
                         stop_sent = True
                     while not control['commands'].empty():
                         confirmation = control['commands'].get_nowait()
-                        transport.action('confirm', run_id, **confirmation)
+                        try:
+                            transport.action('confirm', run_id, **confirmation)
+                        except Exception:
+                            # 人工每次运行只确认一次，发送失败必须保留命令待重连补发。
+                            control['commands'].put(confirmation)
+                            raise
                     status = transport.action('status', run_id)
                     if last_status.get('hardware') and not status.get('hardware'):
                         status['hardware'] = last_status['hardware']

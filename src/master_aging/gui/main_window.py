@@ -19,6 +19,7 @@ from ..infrastructure.config import load_config, runtime_dir
 from ..infrastructure.repository import Repository
 from ..infrastructure.report import export_report
 from .plan_dialog import PlanDialog
+from .power_confirmation_dialog import PowerConfirmationDialog
 from .metrics_panel import MetricsPanel
 from .device_list_panel import DeviceListPanel
 from .discovery_dialogs import DeviceSelectionDialog, InterfaceDialog
@@ -49,6 +50,10 @@ class MainWindow(QMainWindow):
         self.scanning = False
         self.closing = False
         self.detached = False
+        self.power_submitted, self.power_deferred, self.power_stopping = set(), set(), set()
+        self.power_dialog = PowerConfirmationDialog(self)
+        self.power_dialog.confirmed.connect(self.confirm_battery)
+        self.power_dialog.rejected.connect(self.defer_power_confirmation)
         self._build_ui()
         self.update_plan_summary()
         self.discovery = Discovery()
@@ -115,6 +120,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.selection_label)
         self.device_list = DeviceListPanel()
         self.device_list.activated.connect(self.show_details)
+        self.device_list.activated.connect(self.show_power_confirmation)
         self.device_list.selection_changed.connect(self.update_selection_count)
         left_layout.addWidget(self.device_list, 1)
         splitter.addWidget(left)
@@ -144,8 +150,7 @@ class MainWindow(QMainWindow):
         for row, specs in enumerate([
             [('配置计划', self.configure, None), ('读取设备信息', self.probe_selected, 'secondary'),
              ('开始选中设备', self.start, 'start')],
-            [('停止选中设备', self.stop_selected, 'danger'), ('停止整批', self.stop_all, 'danger'),
-             ('确认电源已就绪', self.confirm_battery, 'confirm')]]):
+            [('停止选中设备', self.stop_selected, 'danger'), ('停止整批', self.stop_all, 'danger')]]):
             for col, (text, action, role) in enumerate(specs):
                 button = QPushButton(text)
                 if role:
@@ -388,31 +393,62 @@ class MainWindow(QMainWindow):
         for device in self.selected():
             if device.get('run_id'):
                 self.service.stop(device['run_id'])
+                self.power_stopping.add(device['run_id'])
+        self.refresh_power_confirmation()
         self.log('已请求停止选中设备；离线设备会在重连后接收，设备本地保护继续生效')
 
     def stop_all(self):
         self.service.shutdown()
+        self.power_stopping.update(self.run_devices)
+        self.refresh_power_confirmation()
         self.log('已请求停止全部本地活动运行')
 
-    def confirm_battery(self):
-        devices = self.selected()
-        if not devices and self.device_list.current_ip in self.devices:
-            devices = [self.devices[self.device_list.current_ip]]
-        waiting = [(device, self.statuses.get(device.get('run_id'), {})) for device in devices]
-        waiting = [(device, status) for device, status in waiting
-                   if status.get('state') not in ('FINISHED', 'BLOCKED', 'STOPPING')
-                   and 'battery' in status.get('items', {})
-                   and status['items']['battery'].get('result') is None
-                   and status.get('battery', {}).get('state') == 'WAIT_OPERATOR']
-        if not waiting:
-            QMessageBox.information(self, '电源确认', '所选设备没有等待电源确认的电池阶段。若显示“等待充放电电流”，表示已确认，正在检测实际电流，无需重复点击。')
+    def waiting_power_confirmations(self):
+        waiting = {}
+        for run_id, ip in self.run_devices.items():
+            device = self.devices.get(ip, {})
+            status = self.statuses.get(run_id, {})
+            item = status.get('items', {}).get('battery')
+            b = status.get('battery', {})
+            if (self.closing or run_id in self.power_stopping or device.get('run_id') != run_id
+                    or status.get('state') not in ('RUNNING', 'WAIT_OPERATOR')
+                    or item is None or item.get('result') is not None or b.get('state') != 'WAIT_OPERATOR'
+                    or b.get('confirmed') or run_id in self.power_submitted
+                    or b.get('phase') not in ('charge', 'discharge') or not isinstance(b.get('index'), int)):
+                continue
+            waiting[(run_id, b['phase'], b['index'])] = {'sn': device.get('sn'), 'ip': ip}
+        return waiting
+
+    def refresh_power_confirmation(self):
+        waiting = self.waiting_power_confirmations()
+        self.power_deferred.intersection_update(waiting)
+        entries = waiting
+        self.power_dialog.set_entries(entries)
+        if not entries:
+            self.power_dialog.hide()
+        elif any(key not in self.power_deferred for key in entries) and not self.power_dialog.isVisible():
+            self.power_dialog.show()
+            self.power_dialog.raise_()
+
+    def defer_power_confirmation(self):
+        self.power_deferred.update(self.power_dialog.entries)
+
+    def show_power_confirmation(self, ip):
+        for key, device in self.waiting_power_confirmations().items():
+            if device['ip'] == ip:
+                self.power_deferred.discard(key)
+        self.refresh_power_confirmation()
+
+    def confirm_battery(self, run_id, phase, token):
+        key = (run_id, phase, token)
+        waiting = self.waiting_power_confirmations()
+        if key not in waiting or run_id in self.power_submitted:
+            self.refresh_power_confirmation()
             return
-        for device, status in waiting:
-            b = status['battery']
-            operation = '接入适配器' if b['phase'] == 'charge' else '拔除适配器，确认放电负载'
-            if QMessageBox.question(self, '电源确认', '%s (%s)\n请%s，然后确认。\n确认后会检测实际电流，满足条件才开始计时。' % (device['sn'], device['ip'], operation)) == QMessageBox.Yes:
-                self.service.confirm(device['run_id'], b['phase'], b['index'])
-                self.log('%s：已提交电源确认，等待设备检测实际电流' % device['sn'])
+        self.service.confirm(run_id, phase, token)
+        self.power_submitted.add(run_id)
+        self.log('%s：已提交电源确认，等待设备检测实际电流' % waiting[key]['sn'])
+        self.refresh_power_confirmation()
 
     @staticmethod
     def battery_hint(status):
@@ -422,17 +458,18 @@ class MainWindow(QMainWindow):
             return ''
         if b.get('state') == 'WAIT_OPERATOR':
             operation = '接入适配器' if b.get('phase') == 'charge' else '拔除适配器并接好放电负载'
-            return '电池：请%s，再点击“确认电源已就绪”' % operation
+            return '电池：请%s，在电源确认弹窗中确认；点击设备卡片可重新打开弹窗' % operation
         if b.get('state') == 'WAIT_CURRENT':
             phase = '充电' if b.get('phase') == 'charge' else '放电'
+            operation = '接入适配器' if b.get('phase') == 'charge' else '拔除适配器并接好放电负载'
             current = status.get('latest', {}).get('battery', {}).get('current_ma')
             value = '当前 %s mA，' % current if current is not None else ''
             threshold = b.get('start_current_ma')
             target = '' if threshold is None else '目标 %s %s mA，' % (
                 '≥' if b.get('phase') == 'charge' else '≤',
                 threshold if b.get('phase') == 'charge' else -threshold)
-            return '电池：已确认，等待%s电流；%s%s连续达标 %s/%s 次，暂不计时' % (
-                phase, value, target, b.get('start_count', 0), b.get('start_required', '?'))
+            return '电池：本次测试已确认，请%s，等待%s电流；%s%s连续达标 %s/%s 次，暂不计时' % (
+                operation, phase, value, target, b.get('start_count', 0), b.get('start_required', '?'))
         return ''
 
     def show_details(self, ip=None):
@@ -564,6 +601,7 @@ class MainWindow(QMainWindow):
             changed = True
         if changed:
             self.load_history()
+        self.refresh_power_confirmation()
         if self.closing and not self.service.busy() and not self.jobs:
             self.close()
 
@@ -580,6 +618,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self.closing = True
+            self.refresh_power_confirmation()
             self.detached = box.clickedButton() == detach
             self.service.shutdown(detach=self.detached)
         if self.service.busy() or self.jobs:
