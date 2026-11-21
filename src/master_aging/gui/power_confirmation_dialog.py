@@ -14,7 +14,7 @@ class PowerConfirmationDialog(QDialog):
         self.setModal(False)
         self.entries = {}
         layout = QVBoxLayout(self)
-        hint = QLabel('每台设备每次测试仅确认一次。请按当前阶段操作电源并确认；后续阶段按提示切换电源，实际电流连续达标后自动计时。')
+        hint = QLabel('每台设备每次测试仅确认一次。请按当前阶段操作电源并确认，确认后直接按配置时长计时；后续阶段按提示切换电源，无需再次确认。')
         hint.setWordWrap(True)
         layout.addWidget(hint)
         scroll = QScrollArea()

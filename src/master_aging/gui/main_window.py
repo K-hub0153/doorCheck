@@ -447,7 +447,7 @@ class MainWindow(QMainWindow):
             return
         self.service.confirm(run_id, phase, token)
         self.power_submitted.add(run_id)
-        self.log('%s：已提交电源确认，等待设备检测实际电流' % waiting[key]['sn'])
+        self.log('%s：已提交电源确认，设备将直接按配置时长计时' % waiting[key]['sn'])
         self.refresh_power_confirmation()
 
     @staticmethod
@@ -459,17 +459,12 @@ class MainWindow(QMainWindow):
         if b.get('state') == 'WAIT_OPERATOR':
             operation = '接入适配器' if b.get('phase') == 'charge' else '拔除适配器并接好放电负载'
             return '电池：请%s，在电源确认弹窗中确认；点击设备卡片可重新打开弹窗' % operation
-        if b.get('state') == 'WAIT_CURRENT':
+        if b.get('state') == 'RUNNING':
             phase = '充电' if b.get('phase') == 'charge' else '放电'
             operation = '接入适配器' if b.get('phase') == 'charge' else '拔除适配器并接好放电负载'
             current = status.get('latest', {}).get('battery', {}).get('current_ma')
             value = '当前 %s mA，' % current if current is not None else ''
-            threshold = b.get('start_current_ma')
-            target = '' if threshold is None else '目标 %s %s mA，' % (
-                '≥' if b.get('phase') == 'charge' else '≤',
-                threshold if b.get('phase') == 'charge' else -threshold)
-            return '电池：本次测试已确认，请%s，等待%s电流；%s%s连续达标 %s/%s 次，暂不计时' % (
-                operation, phase, value, target, b.get('start_count', 0), b.get('start_required', '?'))
+            return '电池：%s阶段计时中；请%s；%s本次测试无需再次确认' % (phase, operation, value)
         return ''
 
     def show_details(self, ip=None):

@@ -78,11 +78,9 @@ def validate_plan(plan):
             raise ValueError('电池充电分钟和放电分钟不能同时为 0，至少保留一个阶段')
         number(battery.get('duration_min'), 1, 2 * 43200 * 1000, '电池分钟数', True)
         number(battery.get('cycles'), 1, 1000, '电池循环数', True)
-        number(battery.get('start_current_ma'), 1, 100000, '电池启动电流 mA')
-        number(battery.get('stop_current_ma'), 0, battery['start_current_ma'] - 1, '电池停止电流 mA')
-        for key in ('start_confirm_samples', 'stop_confirm_samples', 'max_read_failures'):
+        number(battery.get('stop_current_ma'), 0, 100000, '电池停止电流 mA')
+        for key in ('stop_confirm_samples', 'max_read_failures'):
             number(battery.get(key), 1, 60, key, True)
-        number(battery.get('start_timeout_min'), 1, 120, '电流启动等待分钟数')
         if battery.get('completion_mode') not in ('fixed_duration', 'stop_node'):
             raise ValueError('未知电池完成模式')
         for key, label in (('battery_charge_temperature_range_c', '电池充电温度范围 ℃'),

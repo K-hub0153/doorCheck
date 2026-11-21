@@ -38,11 +38,8 @@ items:
     completion_mode: fixed_duration
     configure_shutdown: false
     current_direction_confirmed: false
-    start_current_ma: 100
     stop_current_ma: 50
-    start_confirm_samples: 3
     stop_confirm_samples: 6
-    start_timeout_min: 10
     max_read_failures: 3
   usb: {enabled: false, duration_min: 120, min_speed_mbps: 5000, fixture_confirmed: false}
   hdmi: {enabled: false, duration_min: 120, display_confirmed: false}

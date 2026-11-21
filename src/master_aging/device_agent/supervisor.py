@@ -138,9 +138,7 @@ class Supervisor:
                                if battery[phase + '_duration_min'] > 0]
         self.battery = {'index': 0, 'phase': self.battery_phases[0] if self.battery_phases else 'charge',
                         'state': 'WAIT_OPERATOR', 'confirmed': False,
-                        'start_count': 0, 'stop_count': 0, 'failures': 0, 'segments': [],
-                        'start_required': battery['start_confirm_samples'],
-                        'start_current_ma': battery['start_current_ma'],
+                        'stop_count': 0, 'failures': 0, 'segments': [],
                         'charge_mah': 0.0, 'discharge_mah': 0.0, 'charge_wh': 0.0, 'discharge_wh': 0.0}
         self.previous_battery = None
         self.timed_out = set()
@@ -351,13 +349,20 @@ class Supervisor:
             self.processes[name] = runners.Process(
                 runners.fio_args(path, size, self.directory / (name + '.json')), self.directory, name)
 
+    def start_battery_phase(self, sample, now):
+        self.battery.update(state='RUNNING', started=now, phase_effective_s=0, stop_count=0)
+        self.previous_battery = (now, sample['current_ma'], sample['voltage_mv'])
+        operation = '接入适配器' if self.battery['phase'] == 'charge' else '拔除适配器并接好放电负载'
+        self.emit('event', {'item': 'battery', 'phase': self.battery['phase'], 'state': 'RUNNING',
+                            'reason': '按配置时长开始计时，请' + operation + '；无需等待电流达标或再次确认'})
+
     def battery_tick(self, sample, now):
         item = self.status['items']['battery']
         b, cfg, protection = self.battery, self.plan['items']['battery'], self.plan.get('protection', {})
         if not sample['valid']:
             b['failures'] += 1
             self.previous_battery = None
-            b['start_count'] = b['stop_count'] = 0
+            b['stop_count'] = 0
             if b['failures'] >= cfg['max_read_failures']:
                 self.safety_reason = '电池连续读取失败'
             return
@@ -384,23 +389,12 @@ class Supervisor:
                 value = json.loads(confirmation.read_text())
                 confirmation.unlink()
                 if value.get('token') == b['index'] and value.get('phase') == b['phase']:
-                    b['state'], b['wait_started'] = 'WAIT_CURRENT', now
                     b['confirmed'] = True
-                    self.emit('operator', value)
+                    self.emit('operator', dict(value, reason='本次测试电源已确认，直接按配置时长计时'))
+                    self.start_battery_phase(sample, now)
             return
         sign = 1 if b['phase'] == 'charge' else -1
         directed = current * sign
-        if b['state'] == 'WAIT_CURRENT':
-            b['start_count'] = b['start_count'] + 1 if directed >= cfg['start_current_ma'] else 0
-            if now - b['wait_started'] > cfg['start_timeout_min'] * 60:
-                self.finish_item('battery', 'INCOMPLETE', '适配器/负载条件不足，启动等待超时')
-                return
-            if b['start_count'] >= cfg['start_confirm_samples']:
-                b['state'], b['started'] = 'RUNNING', now
-                b['phase_effective_s'] = 0
-                self.previous_battery = (now, current, voltage)
-                self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'RUNNING'})
-            return
         if directed < -cfg['stop_current_ma']:
             self.finish_item('battery', 'INCOMPLETE', '电流方向异常，需核验电源/负载条件')
             return
@@ -438,13 +432,8 @@ class Supervisor:
         if b['index'] >= phase_count:
             self.finish_item('battery', 'PASS', '所有已配置的电池阶段完成')
             return
-        b.update(phase=self.battery_phases[b['index'] % len(self.battery_phases)],
-                 state='WAIT_CURRENT', wait_started=now, start_count=0, stop_count=0)
-        self.previous_battery = None
-        operation = '接入适配器' if b['phase'] == 'charge' else '拔除适配器并接好放电负载'
-        self.emit('event', {'item': 'battery', 'phase': b['phase'], 'state': 'WAIT_CURRENT',
-                            'reason': '本次测试已确认，请' + operation + '，等待实际电流达标，无需再次确认',
-                            'token': b['index']})
+        b['phase'] = self.battery_phases[b['index'] % len(self.battery_phases)]
+        self.start_battery_phase(sample, now)
 
     @staticmethod
     def swap_snapshot(memory, vmstat):
@@ -530,7 +519,7 @@ class Supervisor:
         self.status['state'] = (self.battery['state']
                                 if self.status['items'].get('battery', {}).get('result') is None
                                 and self.plan['items']['battery']['enabled']
-                                and self.battery['state'] in ('WAIT_OPERATOR', 'WAIT_CURRENT') else 'RUNNING')
+                                and self.battery['state'] == 'WAIT_OPERATOR' else 'RUNNING')
         self.emit('metric', data)
 
     def run(self):

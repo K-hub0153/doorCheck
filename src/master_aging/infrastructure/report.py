@@ -59,7 +59,7 @@ def event_summary(record):
     phase = {'charge': '充电', 'discharge': '放电'}.get(data.get('phase'), '')
     item = ITEMS.get(data.get('item'), data.get('item') or '')
     if kind == 'operator':
-        return '电池', phase + '电源已确认', '开始检测实际电流，连续达标后计时'
+        return '电池', phase + '电源已确认', data.get('reason') or '开始检测实际电流，连续达标后计时'
     if kind == 'write_reservation':
         return 'SSD/eMMC', '预留写入预算', '%s · 第 %s 轮 · %s 字节' % (data.get('target', ''), data.get('round', ''), data.get('bytes', ''))
     if kind == 'storage':
@@ -75,7 +75,7 @@ def event_summary(record):
     state = data.get('state')
     if phase:
         if state == 'RUNNING':
-            return item or '电池', phase + '开始计时', '实际电流已连续达标'
+            return item or '电池', phase + '开始计时', data.get('reason') or '实际电流已连续达标'
         if state == 'WAIT_CURRENT':
             return item or '电池', '等待' + phase + '电流', data.get('reason') or '无需再次人工确认，实际电流连续达标后自动计时'
         if state == 'WAIT_OPERATOR' or (not state and data.get('token') is not None):
