@@ -8,6 +8,7 @@ import threading
 from functools import wraps
 from pathlib import Path
 from ..domain.models import ITEMS
+from ..domain.execution_log import format_record
 
 STYLE = '''body{font:15px system-ui,sans-serif;color:#263449;background:#f3f6fa;margin:0}
 main{max-width:1200px;margin:auto;padding:32px}h1{font-size:26px}h2{font-size:20px;margin-top:32px}
@@ -67,6 +68,8 @@ def event_summary(record):
             data.get('target', ''), data.get('round', ''), data.get('written_bytes', ''), data.get('verified_bytes', ''))
     if data.get('error'):
         return item or '整机', '执行异常', data['error']
+    if data.get('stage') == 'preflight':
+        return item, '预检通过' if data.get('result') == 'PASS' else '预检未通过', data.get('reason', '')
     result = data.get('result')
     if result:
         title = '老化结束' if data.get('state') == 'FINISHED' else '项目结束'
@@ -146,6 +149,35 @@ def chart(label, points):
             + polylines + '</svg><small>最小 %.3f · 最大 %.3f · 时间跨度 %.1f 分钟</small></div>' % (ymin, ymax, (xmax - xmin) / 60))
 
 
+def write_execution_log(row, records):
+    directory = Path(row['output_dir'])
+    directory.mkdir(parents=True, exist_ok=True)
+    status = json.loads(row['status'])
+    with (directory / 'execution.log').open('w', encoding='utf-8') as stream:
+        stream.write('主控老化执行日志\nSN：%s  IP：%s\n运行：%s\n状态：%s  结果：%s\n' %
+                     (row['sn'], row['ip'], row['run_id'], row['state'], row['result'] or '未结束'))
+        for key in ('error', 'connection_error', 'safety_stop', 'attachment_error'):
+            if status.get(key):
+                stream.write('%s：%s\n' % (key, status[key]))
+        for key, item in status.get('items', {}).items():
+            stream.write('%s：%s；%s\n' % (ITEMS.get(key, key), item.get('result') or '进行中',
+                                          item.get('stop_reason') or ''))
+            if item.get('argv'):
+                stream.write('执行参数：' + json.dumps(item['argv'], ensure_ascii=False) + '\n')
+        stream.write('以下为设备记录，时间为 UTC，按事件序号排列。连接与部署过程见 controller.log。\n\n')
+        for record in sorted(records, key=lambda r: r['seq']):
+            stream.write(format_record(record))
+    return directory / 'execution.log'
+
+
+@serialized
+def export_execution_log(repository, run_id):
+    row = repository.get(run_id)
+    if not row:
+        raise ValueError('运行不存在')
+    return write_execution_log(row, repository.records(run_id))
+
+
 @serialized
 def export_report(repository, run_id):
     row = repository.get(run_id)
@@ -155,6 +187,7 @@ def export_report(repository, run_id):
     directory.mkdir(parents=True, exist_ok=True)
     status, snapshot = json.loads(row['status']), json.loads(row['snapshot'])
     records = repository.records(run_id)
+    write_execution_log(row, records)
     (directory / 'records.json').write_text(json.dumps(records, ensure_ascii=False), encoding='utf-8')
     with (directory / 'metrics.csv').open('w', encoding='utf-8-sig', newline='') as stream:
         writer = csv.writer(stream)
@@ -202,6 +235,13 @@ def export_report(repository, run_id):
                          ('运行配置快照', snapshot), ('清理结果', {'confirmed': status.get('cleanup_confirmed'), 'errors': status.get('cleanup_errors')})):
         body += '<details class="card"><summary>' + text(title) + '</summary><pre>' + text(json.dumps(value, ensure_ascii=False, indent=2)) + '</pre></details>'
     body += '<p><a href="metrics.csv">原始指标 CSV</a> · <a href="records.json">完整事件与采样 JSON</a> · <a href="summary.json">结论 JSON</a></p>'
+    body += '<h2>执行日志</h2><p><a href="execution.log">查看执行日志（含 4G 原始响应）</a>'
+    if (directory / 'controller.log').is_file():
+        body += ' · <a href="controller.log">连接与部署日志</a>'
+    body += '</p><ul>'
+    for log in sorted((directory / 'device').glob('*.log')):
+        body += '<li><a href="device/' + text(log.name) + '">' + text(log.name) + '</a></li>'
+    body += '</ul>'
     path = directory / 'report.html'
     path.write_text(document('老化报告 ' + row['sn'], body), encoding='utf-8')
     checksums = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.iterdir() if p.is_file() and p.name != 'checksums.json'}

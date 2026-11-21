@@ -90,14 +90,18 @@ class Repository:
         with self.connection() as db:
             return db.execute('SELECT COALESCE(MAX(seq),0) FROM record WHERE run_id=?', (run_id,)).fetchone()[0]
 
-    def records(self, run_id, kind=None):
+    def records(self, run_id, kind=None, after_seq=0, limit=None):
         with self.connection() as db:
-            sql = 'SELECT payload FROM record WHERE run_id=?'
-            args = [run_id]
+            sql = 'SELECT payload FROM record WHERE run_id=? AND seq>?'
+            args = [run_id, after_seq]
             if kind:
                 sql += ' AND kind=?'
                 args.append(kind)
-            rows = db.execute(sql + ' ORDER BY seq', args).fetchall()
+            sql += ' ORDER BY seq'
+            if limit is not None:
+                sql += ' LIMIT ?'
+                args.append(limit)
+            rows = db.execute(sql, args).fetchall()
             return [json.loads(row[0]) for row in rows]
 
     def runs(self, unfinished=False):

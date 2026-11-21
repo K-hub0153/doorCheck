@@ -20,6 +20,7 @@ from ..infrastructure.repository import Repository
 from ..infrastructure.report import export_report
 from .plan_dialog import PlanDialog
 from .power_confirmation_dialog import PowerConfirmationDialog
+from .execution_log_dialog import ExecutionLogDialog
 from .metrics_panel import MetricsPanel
 from .device_list_panel import DeviceListPanel
 from .discovery_dialogs import DeviceSelectionDialog, InterfaceDialog
@@ -44,6 +45,7 @@ class MainWindow(QMainWindow):
         except (ValueError, KeyError, TypeError) as exc:
             plan_error = str(exc)
         self.devices, self.run_devices, self.statuses = {}, {}, {}
+        self.log_dialogs = {}
         self.jobs, self.work_pool = [], ThreadPoolExecutor(max_workers=4, thread_name_prefix='aging-discovery')
         self.probing, self.job_messages = set(), queue.Queue()
         self.scan_progress = queue.Queue(maxsize=1)
@@ -150,7 +152,8 @@ class MainWindow(QMainWindow):
         for row, specs in enumerate([
             [('配置计划', self.configure, None), ('读取设备信息', self.probe_selected, 'secondary'),
              ('开始选中设备', self.start, 'start')],
-            [('停止选中设备', self.stop_selected, 'danger'), ('停止整批', self.stop_all, 'danger')]]):
+            [('停止选中设备', self.stop_selected, 'danger'), ('停止整批', self.stop_all, 'danger'),
+             ('执行日志', self.open_current_log, 'secondary')]]):
             for col, (text, action, role) in enumerate(specs):
                 button = QPushButton(text)
                 if role:
@@ -170,6 +173,7 @@ class MainWindow(QMainWindow):
         history_actions = QHBoxLayout()
         self.button('刷新', self.load_history, history_actions, 'secondary')
         self.button('HTML 报告', self.open_report, history_actions)
+        self.button('执行日志', self.open_history_log, history_actions, 'secondary')
         self.button('批次报告', self.open_batch, history_actions, 'secondary')
         self.button('恢复补采', self.resume, history_actions, 'secondary')
         history_layout.addLayout(history_actions)
@@ -508,6 +512,31 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
         except Exception as exc:
             self.error(exc)
+
+    def open_current_log(self):
+        try:
+            device = self.devices.get(self.device_list.current_ip, {})
+            if not device.get('run_id'):
+                raise ValueError('请先点击一台已开始老化的设备，或在历史记录中选择运行')
+            self.open_log(device['run_id'])
+        except Exception as exc:
+            self.error(exc)
+
+    def open_history_log(self):
+        try:
+            self.open_log(self.history_id())
+        except Exception as exc:
+            self.error(exc)
+
+    def open_log(self, run_id):
+        if run_id not in self.log_dialogs:
+            dialog = ExecutionLogDialog(self.repository, run_id, self)
+            self.log_dialogs[run_id] = dialog
+            dialog.finished.connect(lambda: self.log_dialogs.pop(run_id, None))
+        dialog = self.log_dialogs[run_id]
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def open_batch(self):
         try:

@@ -14,6 +14,7 @@ import threading
 import time
 
 from ..domain.models import conclusion, digest, utc_now
+from ..domain.execution_log import format_record
 from ..domain.policies import validate_plan
 from . import collectors, lte, runners
 
@@ -51,7 +52,7 @@ def ddr_allocation(memory, config):
     return {'bytes': allocation, 'available_bytes': available, 'reserve_bytes': reserve}
 
 
-def preflight(plan, expected):
+def preflight(plan, expected, emit=None):
     validate_plan(plan)
     info = collectors.probe()
     info['tool_versions'] = {}
@@ -114,8 +115,12 @@ def preflight(plan, expected):
             raise ValueError('未发现已连接的 HDMI')
     if items['lte']['enabled']:
         result = lte.sample(items['lte'])
+        if emit:
+            emit('event', {'item': 'lte', 'stage': 'preflight',
+                           'result': 'PASS' if result['ok'] else 'BLOCKED',
+                           'reason': result.get('reason') or '4G 预检通过', 'lte': result})
         if not result['ok']:
-            raise ValueError('4G 预检失败: ' + json.dumps(result, ensure_ascii=False))
+            raise ValueError('4G 预检失败: ' + (result.get('reason') or '无法获取有效信号'))
         info['lte_initial'] = result
     if shutil.disk_usage(ROOT).free < plan['min_free_space_mib'] * 2**20:
         raise ValueError('设备日志目录剩余空间不足')
@@ -164,6 +169,8 @@ class Supervisor:
             stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
             stream.flush()
             os.fsync(stream.fileno())
+        with (self.directory / 'execution.log').open('a', encoding='utf-8') as stream:
+            stream.write(format_record(record))
         return record
 
     def guard(self):
@@ -236,7 +243,9 @@ class Supervisor:
                     result = 'INCOMPLETE'
                 reason += '；压测进程停止未确认: ' + str(exc)
         item.update(result=result, stop_reason=reason, finished_at=utc_now())
-        self.emit('event', {'item': key, 'result': result, 'reason': reason})
+        self.emit('event', {'item': key, 'result': result, 'reason': reason,
+                            'exit_code': item.get('exit_code'), 'effective_s': item.get('effective_s'),
+                            'planned_s': item.get('planned_s')})
 
     def start_items(self):
         self.started = time.monotonic()
@@ -287,6 +296,11 @@ class Supervisor:
                 item['scope'] = '沿用产测 AT 模组识别及 RSRP/RSRQ/SINR 阈值，周期检测信号'
             elif key == 'hdmi':
                 item['scope'] = 'HDMI 连接、EDID 与模式；人工显示确认：' + ('已记录' if config.get('display_confirmed') else '未记录')
+            if item.get('result') is None:
+                self.emit('event', {'item': key, 'state': 'WAIT_OPERATOR' if key == 'battery' else 'RUNNING',
+                                    'reason': '项目已启动，等待首次电源确认' if key == 'battery' else '项目已启动',
+                                    'planned_s': item['planned_s'], 'argv': item.get('argv'),
+                                    'allocation': item.get('allocation')})
         self.status['state'] = 'RUNNING'
         self.emit('event', {'state': 'RUNNING', 'hardware': self.info})
 
@@ -545,7 +559,8 @@ class Supervisor:
 
     def run(self):
         try:
-            self.info = preflight(self.plan, self.request['device'])
+            self.emit('event', {'state': 'PREFLIGHT', 'reason': '开始设备预检'})
+            self.info = preflight(self.plan, self.request['device'], emit=self.emit)
             self.status['hardware'] = self.info
             self.collector = collectors.SystemCollector()
             self.start_items()

@@ -60,12 +60,12 @@ def sample(settings):
         from src.master_control.core.lte_signal import DEFAULT_AT_PORT, load_modules, identify_module, decode, judge
     override = settings.get('at_port') or None
     modules = load_modules(at_port=override)
-    raw = {'ati': '', 'attempts': []}
+    raw = {'ati_port': override or DEFAULT_AT_PORT, 'ati': '', 'attempts': []}
     result = {'ok': False, 'raw': raw, 'signal': {},
               'scope': '沿用产测 AT 模组识别及 RSRP/RSRQ/SINR 阈值，周期检测信号'}
     try:
         raw['ati'] = read_at(override or DEFAULT_AT_PORT, 'ATI')
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, termios.error) as exc:
         raw['ati_error'] = str(exc)
     spec, model = identify_module(raw['ati'], modules)
 
@@ -75,7 +75,7 @@ def sample(settings):
         raw['attempts'].append(attempt)
         try:
             attempt['signal'] = read_at(candidate.at_port, candidate.at_command)
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, termios.error) as exc:
             attempt['error'] = str(exc)
         return decode(candidate, attempt.get('signal', ''))
 
