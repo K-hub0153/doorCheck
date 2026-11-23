@@ -50,9 +50,12 @@ class DeviceCard(QFrame):
         self.hardware.setText(device.get('hardware_text') or device.get('chip') or device.get('model') or '机型待读取')
         self.storage.setText(device.get('storage_text') or device.get('disk_model') or '内存 / 存储待读取')
 
-    def update_status(self, status, live=''):
+    def update_status(self, status, live='', confirmation_pending=False):
         state, result = status['state'], status.get('result')
-        self.status.setText(STATES.get(state, state) + (' · ' + result if result else ''))
+        label = STATES.get(state, state)
+        if confirmation_pending and state in ('RUNNING', 'WAIT_OPERATOR') and not result:
+            label = '电源确认已提交，等待设备响应'
+        self.status.setText(label + (' · ' + result if result else ''))
         self.status.setStyleSheet('color:%s;font-weight:bold' % status_color(result or state))
         self.status.setToolTip(status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or '')
         self.live.setText(live)

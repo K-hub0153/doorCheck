@@ -451,16 +451,19 @@ class MainWindow(QMainWindow):
             return
         self.service.confirm(run_id, phase, token)
         self.power_submitted.add(run_id)
-        self.log('%s：已提交电源确认，设备将直接按配置时长计时' % waiting[key]['sn'])
+        self.update_device_card(run_id)
+        self.log('%s：已提交电源确认，等待设备响应' % waiting[key]['sn'])
         self.refresh_power_confirmation()
 
     @staticmethod
-    def battery_hint(status):
+    def battery_hint(status, confirmation_pending=False):
         b = status.get('battery', {})
         item = status.get('items', {}).get('battery')
         if item is None or item.get('result') is not None or status.get('state') in ('FINISHED', 'BLOCKED', 'STOPPING'):
             return ''
         if b.get('state') == 'WAIT_OPERATOR':
+            if confirmation_pending:
+                return '电池：电源确认已提交，等待设备响应'
             operation = '接入适配器' if b.get('phase') == 'charge' else '拔除适配器并接好放电负载'
             return '电池：请%s，在电源确认弹窗中确认；点击设备卡片可重新打开弹窗' % operation
         if b.get('state') == 'RUNNING':
@@ -470,6 +473,44 @@ class MainWindow(QMainWindow):
             value = '当前 %s mA，' % current if current is not None else ''
             return '电池：%s阶段计时中；请%s；%s本次测试无需再次确认' % (phase, operation, value)
         return ''
+
+    def update_device_card(self, run_id):
+        ip = self.run_devices.get(run_id)
+        if ip not in self.device_list.cards:
+            return
+        status = self.statuses.get(run_id, {})
+        if not status:
+            return
+        reason = status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
+        latest = status.get('latest', {})
+        temps = list(latest.get('temperature_c', {}).values())
+        remaining = ', '.join('%s %.0fm' % (ITEMS.get(key, key), max(0, item.get('planned_s', 0) - item.get('effective_s', 0)) / 60)
+                              for key, item in status.get('items', {}).items() if item.get('result') is None)
+        temperature = ('%.1f℃' % max(temps)) if temps else '温度未采到'
+        busy = latest.get('cpu', {}).get('busy_pct')
+        busy_text = ('%.1f%%' % busy) if busy is not None else '未采到'
+        live = reason if status['state'] in ('DEPLOYING', 'READY') else 'CPU %s · %s\n%s' % (busy_text, temperature, remaining)
+        battery = status.get('battery', {})
+        pending = (run_id in self.power_submitted and battery.get('state') == 'WAIT_OPERATOR'
+                   and not battery.get('confirmed') and status.get('items', {}).get('battery', {}).get('result') is None)
+        hint = self.battery_hint(status, pending)
+        if hint:
+            live += '\n' + hint
+        storage = status.get('items', {}).get('storage', {})
+        progress = storage.get('storage_progress', {})
+        for value in progress.values():
+            suffix = ''
+            if value['pending']:
+                suffix = '，当前轮已中断' if storage.get('result') is not None else '，当前轮读写校验中'
+            if storage.get('result'):
+                suffix += '，' + storage['result']
+                if value.get('cleanup'):
+                    suffix += '，进程' + ('已回收' if value['cleanup'].get('confirmed') else '回收未确认')
+                if value.get('file_cleanup'):
+                    suffix += '，临时文件' + ('已清理' if value['file_cleanup'].get('removed') else '未清理')
+            live += '\nSSD/eMMC %s：已完成 %s/%s 轮%s' % (value['directory'], value['completed_rounds'],
+                      value['planned_rounds'], suffix)
+        self.device_list.cards[ip].update_status(status, live, confirmation_pending=pending)
 
     def show_details(self, ip=None):
         ip = ip or self.device_list.current_ip
@@ -606,20 +647,11 @@ class MainWindow(QMainWindow):
                 previous_reason = previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or previous.get('environment_message') or ''
                 if (status['state'], reason) != (previous.get('state'), previous_reason):
                     self.log('%s：%s %s' % (self.devices[ip]['sn'], STATES.get(status['state'], status['state']), reason))
+                if status.get('battery', {}).get('confirmed') and not previous.get('battery', {}).get('confirmed'):
+                    self.log('%s：设备已收到电源确认，电池老化开始计时' % self.devices[ip]['sn'])
                 if status.get('hardware') and status['hardware'] != previous.get('hardware'):
                     self.apply_device_info(dict(status['hardware'], ip=ip))
-                latest = status.get('latest', {})
-                temps = list(latest.get('temperature_c', {}).values())
-                remaining = ', '.join('%s %.0fm' % (ITEMS.get(key, key), max(0, item.get('planned_s', 0) - item.get('effective_s', 0)) / 60)
-                                       for key, item in status.get('items', {}).items() if item.get('result') is None)
-                temperature = ('%.1f℃' % max(temps)) if temps else '温度未采到'
-                busy = latest.get('cpu', {}).get('busy_pct')
-                busy_text = ('%.1f%%' % busy) if busy is not None else '未采到'
-                live = reason if status['state'] in ('DEPLOYING', 'READY') else 'CPU %s · %s\n%s' % (busy_text, temperature, remaining)
-                hint = self.battery_hint(status)
-                if hint:
-                    live += '\n' + hint
-                self.device_list.cards[ip].update_status(status, live)
+                self.update_device_card(run_id)
                 if self.device_list.current_ip == ip:
                     self.show_details(ip)
             changed = True

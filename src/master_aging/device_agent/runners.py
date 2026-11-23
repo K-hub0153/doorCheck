@@ -152,6 +152,27 @@ def fio_args(path, size, output):
             '--fallocate=none', '--end_fsync=1', '--output-format=json', '--output=' + str(output)]
 
 
+def fio_evidence(path, expected):
+    """保留到时/停止后的部分结果；有字节数不代表本轮校验完成。"""
+    evidence = {'expected_bytes': expected, 'complete': False}
+    try:
+        data = json.loads(Path(path).read_text())
+        jobs = data['jobs']
+        if len(jobs) != 1:
+            raise ValueError('fio job 数量不符合预期')
+        job = jobs[0]
+        written = job['write']['io_bytes']
+        verified = job['read']['io_bytes']
+        error = job['error']
+        if any(type(value) is not int or value < 0 for value in (written, verified, error)):
+            raise ValueError('fio 字节数或错误码无效')
+        evidence.update(written_bytes=written, verified_bytes=verified, fio_error=error)
+        evidence['complete'] = error == 0 and written == expected and verified >= expected
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        evidence['evidence_error'] = str(exc)
+    return evidence
+
+
 def fio_result(path, expected):
     data = json.loads(Path(path).read_text())
     jobs = data['jobs']

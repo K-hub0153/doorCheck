@@ -204,7 +204,7 @@ class RunService:
                     if control['stop'].is_set() and not stop_sent:
                         transport.action('stop', run_id)
                         stop_sent = True
-                    while not control['commands'].empty():
+                    while not control['stop'].is_set() and not control['commands'].empty():
                         confirmation = control['commands'].get_nowait()
                         try:
                             transport.action('confirm', run_id, **confirmation)
@@ -236,7 +236,6 @@ class RunService:
                             or status.get('items', {}).get('battery', {}).get('result') is not None
                             or status['state'] in ('FINISHED', 'BLOCKED')):
                         confirmation_poll_until = 0
-                    self._ingest(transport, run_id, directory)
                     last_status = status
                     if status.get('agent_alive') is False:
                         last_status.update(state='FINISHED', result='INCOMPLETE', error='设备重启或 supervisor 已退出，禁止重复启动')
@@ -246,10 +245,15 @@ class RunService:
                         last_status['cleanup_confirmed'] = False
                         if conclusion(last_status.get('items', {})) == 'FAIL':
                             last_status['result'] = 'FAIL'
-                    self._store(run_id, last_status, directory)
-                    failures = 0
                     if last_status['state'] in ('FINISHED', 'BLOCKED'):
                         self._ingest(transport, run_id, directory)
+                        self._store(run_id, last_status, directory)
+                    else:
+                        # 运行状态先交给界面，日志补采较慢时不阻塞确认结果显示。
+                        self._store(run_id, last_status, directory)
+                        self._ingest(transport, run_id, directory)
+                    failures = 0
+                    if last_status['state'] in ('FINISHED', 'BLOCKED'):
                         try:
                             transport.collect(run_id, directory / 'device')
                         except Exception as exc:

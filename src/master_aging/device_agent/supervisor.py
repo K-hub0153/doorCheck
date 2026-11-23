@@ -1,5 +1,7 @@
 """Linux 设备端执行器：单调计时、本地保护、独占锁、追加日志与可恢复读取。"""
 import argparse
+import errno
+from functools import wraps
 import fcntl
 import hashlib
 import json
@@ -19,6 +21,14 @@ from ..domain.policies import validate_plan
 from . import collectors, lte, runners
 
 ROOT = Path('/var/tmp/master-aging')
+
+
+def state_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.state_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 def atomic_json(path, value):
@@ -138,6 +148,11 @@ class Supervisor:
         self.info = {}
         self.processes = {}
         self.storage = {}
+        self.storage_lock = threading.RLock()
+        self.stop_lock = threading.RLock()
+        self.item_locks = {key: threading.RLock() for key in self.plan['items']}
+        self.stop_requested = threading.Event()
+        self.state_lock = threading.RLock()
         self.guard_stop = threading.Event()
         self.safety_reason = None
         self.last_sample = time.monotonic()
@@ -156,14 +171,19 @@ class Supervisor:
                         'stop_count': 0, 'failures': 0, 'segments': [],
                         'charge_mah': 0.0, 'discharge_mah': 0.0, 'charge_wh': 0.0, 'discharge_wh': 0.0}
         self.previous_battery = None
+        self.battery_timing_anchor = None
         self.timed_out = set()
 
+    @state_locked
     def save(self):
         self.status['updated_at'] = utc_now()
         self.status['seq'] = self.seq
         self.status['battery'] = self.battery
-        atomic_json(self.directory / 'status.json', self.status)
+        # 先序列化快照，避免持久化期间采集线程更新其他项目的字段。
+        snapshot = json.loads(json.dumps(self.status, ensure_ascii=False, allow_nan=False))
+        atomic_json(self.directory / 'status.json', snapshot)
 
+    @state_locked
     def emit(self, kind, data):
         self.seq += 1
         record = {'seq': self.seq, 'kind': kind, 'utc': utc_now(), 'monotonic': time.monotonic(),
@@ -178,6 +198,8 @@ class Supervisor:
 
     def guard(self):
         while not self.guard_stop.wait(1):
+            if self.stop_requested.is_set():
+                return
             try:
                 temperature_limit = self.plan.get('protection', {}).get('cpu_stop_temperature_c')
                 if temperature_limit is not None:
@@ -227,13 +249,57 @@ class Supervisor:
         self.processes.pop(name)
         return code
 
+    def storage_stop_evidence(self):
+        size = self.plan['items']['storage']['chunk_mib'] * 2**20
+        errors = []
+        for task in self.storage.values():
+            if task['pending']:
+                task['last_fio'] = runners.fio_evidence(task['result_path'], size)
+                if task['last_fio'].get('fio_error') in (errno.EIO, errno.EILSEQ):
+                    errors.append('fio 报告 I/O 或数据校验错误（errno=%s）' % task['last_fio']['fio_error'])
+        self.cleanup_storage_files()
+        self.status['items']['storage']['storage_progress'] = self.storage_progress()
+        return errors
+
+    def cleanup_storage_files(self):
+        """仅在进程组已确认停止、证据已读取后删除本次运行的测试文件。"""
+        for name, task in self.storage.items():
+            if not task.get('file'):
+                continue
+            cleanup = self.status.get('process_cleanup', {}).get(name, {})
+            path = task.get('file')
+            evidence = task.setdefault('file_cleanup', {})
+            if not cleanup.get('confirmed'):
+                evidence.update(removed=False, reason='进程回收尚未确认，保留测试文件')
+                continue
+            expected = Path(task['target']['directory']) / ('.master-aging-' + self.request['run_id'] + '.bin')
+            if path != expected:
+                evidence.update(removed=False, reason='文件路径与本次运行不匹配，保留文件')
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                evidence.clear()
+                evidence.update(removed=True, path=str(path), checked_at=utc_now())
+            except OSError as exc:
+                evidence.update(removed=False, path=str(path), error=str(exc))
+
     def finish_item(self, key, result, reason):
+        if key == 'storage':
+            with self.storage_lock:
+                return self._finish_item(key, result, reason)
+        if key == 'battery':
+            with self.state_lock:
+                return self._finish_item(key, result, reason)
+        with self.item_locks[key]:
+            return self._finish_item(key, result, reason)
+
+    def _finish_item(self, key, result, reason):
         item = self.status['items'][key]
         if item.get('result') is not None:
             return
         names = [key] if key in self.processes else []
         if key == 'storage':
-            names += [name for name in self.processes if name.startswith('storage_')]
+            names += [name for name in list(self.processes) if name.startswith('storage_')]
         for name in names:
             try:
                 code = self.stop_process(name)
@@ -245,6 +311,28 @@ class Supervisor:
                 if result == 'PASS':
                     result = 'INCOMPLETE'
                 reason += '；压测进程停止未确认: ' + str(exc)
+        if key == 'storage':
+            size = self.plan['items']['storage']['chunk_mib'] * 2**20
+            errors = self.storage_stop_evidence()
+            if errors:
+                result = 'FAIL'
+                reason += '；' + '；'.join(errors)
+            details = []
+            for value in item['storage_progress'].values():
+                detail = '%s 已完成 %s/%s 轮' % (value['directory'], value['completed_rounds'], value['planned_rounds'])
+                if value['pending']:
+                    evidence = value['last_fio']
+                    if 'written_bytes' in evidence:
+                        detail += '，中断轮写入 %.1f MiB、读取校验 %.1f MiB（本轮目标 %.1f MiB）' % (
+                            evidence['written_bytes'] / 2**20, evidence['verified_bytes'] / 2**20, size / 2**20)
+                    else:
+                        detail += '，中断轮未取得可解析的 fio 结果'
+                    cleanup = value.get('cleanup', {})
+                    detail += '，进程回收%s，退出码 %s' % ('已确认' if cleanup.get('confirmed') else '未确认', cleanup.get('exit_code'))
+                    file_cleanup = value.get('file_cleanup', {})
+                    detail += '，临时文件%s' % ('已清理' if file_cleanup.get('removed') else '未清理')
+                details.append(detail)
+            reason += '；' + '；'.join(details)
         item.update(result=result, stop_reason=reason, finished_at=utc_now())
         self.emit('event', {'item': key, 'result': result, 'reason': reason,
                             'exit_code': item.get('exit_code'), 'effective_s': item.get('effective_s'),
@@ -258,6 +346,9 @@ class Supervisor:
             item = {'result': None, 'effective_s': 0, 'planned_s': config['duration_min'] * 60,
                     'started_at': utc_now(), 'started_monotonic': self.started}
             self.status['items'][key] = item
+            if (self.directory / 'stop.json').exists():
+                self.finish_item(key, 'ABORTED', '操作者停止，未启动负载')
+                continue
             if key == 'hdmi' and self.info['chip'] == 'hisi':
                 self.finish_item(key, 'NOT_APPLICABLE', '四代主控无 HDMI')
             elif key in ('cpu', 'ddr'):
@@ -304,8 +395,8 @@ class Supervisor:
                                     'reason': '项目已启动，等待首次电源确认' if key == 'battery' else '项目已启动',
                                     'planned_s': item['planned_s'], 'argv': item.get('argv'),
                                     'allocation': item.get('allocation')})
-        self.status['state'] = 'RUNNING'
-        self.emit('event', {'state': 'RUNNING', 'hardware': self.info})
+        self.status['state'] = 'WAIT_OPERATOR' if 'battery' in self.status['items'] else 'RUNNING'
+        self.emit('event', {'state': self.status['state'], 'hardware': self.info})
 
     def reserve(self, name, size, overhead=False):
         ledger = self.status['write_ledger'][name]
@@ -329,7 +420,40 @@ class Supervisor:
         self.save()
         return True
 
+    def storage_progress(self):
+        return {name: {'directory': task['target']['directory'], 'completed_rounds': task['completed'],
+                       'planned_rounds': self.plan['items']['storage']['rounds'], 'pending': task['pending'],
+                       'last_fio': task.get('last_fio', {}),
+                       'result_file': task['result_path'].name if task.get('result_path') else None,
+                       'file_cleanup': task.get('file_cleanup', {}),
+                       'cleanup': self.status.get('process_cleanup', {}).get(name, {})}
+                for name, task in self.storage.items()}
+
     def storage_tick(self, now):
+        with self.storage_lock:
+            item = self.status['items'].get('storage')
+            if not item or item['result'] is not None:
+                return
+            previous = item.get('storage_progress')
+            try:
+                self._storage_tick(now)
+            finally:
+                item['storage_progress'] = self.storage_progress()
+                if item['storage_progress'] != previous or item['result'] is not None:
+                    self.save()
+
+    def storage_loop(self):
+        while not self.guard_stop.is_set():
+            try:
+                self.storage_tick(time.monotonic())
+            except Exception as exc:
+                self.finish_item('storage', 'INCOMPLETE', '存储调度异常: ' + str(exc))
+                self.save()
+                return
+            if self.status['items']['storage']['result'] is not None or self.guard_stop.wait(0.2):
+                return
+
+    def _storage_tick(self, now):
         item = self.status['items'].get('storage')
         if not item or item['result'] is not None:
             return
@@ -341,11 +465,12 @@ class Supervisor:
                 process = self.processes[name]
                 if process.poll() is not None:
                     code = self.stop_process(name)
+                    task['last_fio'] = runners.fio_evidence(task['result_path'], size)
                     if code:
                         self.finish_item('storage', 'FAIL', 'fio 非零退出；保留未决预留量')
                         return
                     try:
-                        result = runners.fio_result(self.directory / (name + '.json'), size)
+                        result = runners.fio_result(task['result_path'], size)
                     except Exception as exc:
                         self.finish_item('storage', 'FAIL', 'fio 校验结果异常: ' + str(exc))
                         return
@@ -363,7 +488,13 @@ class Supervisor:
                         task['file'].unlink()
             if task['pending'] or task['completed'] >= config['rounds']:
                 continue
-            due = self.started + task['completed'] * item['planned_s'] / config['rounds']
+            # 到时先结算已退出的 fio，再停止未完成轮次；禁止到期后启动新轮。
+            now = time.monotonic()
+            if now - item['started_monotonic'] >= item['planned_s']:
+                continue
+            if self.guard_stop.is_set() or self.safety_reason or (self.directory / 'stop.json').exists():
+                continue
+            due = item['started_monotonic'] + task['completed'] * item['planned_s'] / config['rounds']
             if now < due:
                 continue
             if not self.reserve(name, size):
@@ -371,27 +502,102 @@ class Supervisor:
                 return
             # 每轮预留必须先落盘。重连仅补采，禁止启动同 run_id 或重发写入批次。
             self.emit('write_reservation', dict(target=name, bytes=size, round=task['completed'] + 1))
+            # 账本与事件落盘也可能耗时，启动前再次检查，不能越过截止时间补跑。
+            if time.monotonic() - item['started_monotonic'] >= item['planned_s']:
+                item['effective_s'] = item['planned_s']
+                self.finish_item('storage', 'INCOMPLETE', '写入预留落盘后已到时，未启动新轮；保留未决预留量')
+                return
+            if self.guard_stop.is_set() or self.safety_reason or (self.directory / 'stop.json').exists():
+                return
             path = Path(task['target']['directory']) / ('.master-aging-' + self.request['run_id'] + '.bin')
             if path.exists():
                 raise RuntimeError('发现未决存储文件，禁止覆盖')
             task['file'] = path
             task['pending'] = True
+            task['last_fio'] = {}
+            task.pop('file_cleanup', None)
+            task['result_path'] = self.directory / ('%s.round-%s.json' % (name, task['completed'] + 1))
+            self.status.get('process_cleanup', {}).pop(name, None)
             self.processes[name] = runners.Process(
-                runners.fio_args(path, size, self.directory / (name + '.json')), self.directory, name)
+                runners.fio_args(path, size, task['result_path']), self.directory, name)
+        elapsed = time.monotonic() - item['started_monotonic']
+        item['effective_s'] = min(elapsed, item['planned_s'])
+        if elapsed >= item['planned_s']:
+            unfinished = any(t['pending'] or t['completed'] < config['rounds'] for t in self.storage.values())
+            self.finish_item('storage', 'INCOMPLETE' if unfinished else 'PASS',
+                             '到时仍有未完成的写入校验轮次' if unfinished else '有效时长达标，所有写入与读取校验轮次完成')
 
+    @state_locked
     def start_battery_phase(self, sample, now):
         self.battery.update(state='RUNNING', started=now, phase_effective_s=0, stop_count=0)
-        self.previous_battery = (now, sample['current_ma'], sample['voltage_mv'])
+        self.previous_battery = (now, sample['current_ma'], sample['voltage_mv']) if sample else None
+        self.battery_timing_anchor = now if sample is None else None
         operation = '接入适配器' if self.battery['phase'] == 'charge' else '拔除适配器并接好放电负载'
         self.emit('event', {'item': 'battery', 'phase': self.battery['phase'], 'state': 'RUNNING',
                             'reason': '按配置时长开始计时，请' + operation + '；无需等待电流达标或再次确认'})
 
+    @state_locked
+    def accept_power_confirmation(self):
+        item = self.status['items'].get('battery')
+        if (not item or item['result'] is not None or self.battery['state'] != 'WAIT_OPERATOR'
+                or self.safety_reason or self.guard_stop.is_set()
+                or (self.directory / 'stop.json').exists()):
+            return
+        confirmation = self.directory / 'confirm.json'
+        if not confirmation.exists():
+            return
+        value = json.loads(confirmation.read_text())
+        confirmation.unlink()
+        if value.get('token') != self.battery['index'] or value.get('phase') != self.battery['phase']:
+            return
+        self.battery['confirmed'] = True
+        self.emit('operator', dict(value, reason='本次测试电源已确认，直接按配置时长计时'))
+        self.start_battery_phase(None, time.monotonic())
+        self.status['state'] = 'RUNNING'
+        self.save()
+
+    def accept_operator_stop(self):
+        with self.stop_lock:
+            if self.stop_requested.is_set():
+                return True
+            if not (self.directory / 'stop.json').exists():
+                return False
+            self.stop_requested.set()
+            with self.state_lock:
+                self.status['state'] = 'STOPPING'
+                self.save()
+            # 先通知全部本次负载停止，再逐组等待回收，避免串行等待仍在压测。
+            for process in list(self.processes.values()):
+                try:
+                    process.request_stop()
+                except Exception as exc:
+                    self.emit('event', {'reason': '负载停止通知异常，继续执行进程组回收', 'error': str(exc)})
+            for key in self.status['items']:
+                self.finish_item(key, 'ABORTED', '操作者停止')
+            self.save()
+            return True
+
+    def control_loop(self):
+        while not self.guard_stop.is_set():
+            try:
+                if self.accept_operator_stop():
+                    return
+                if self.plan['items']['battery']['enabled']:
+                    self.accept_power_confirmation()
+            except Exception as exc:
+                self.safety_reason = '控制命令处理失败: ' + str(exc)
+                return
+            if self.guard_stop.wait(0.1):
+                return
+
+    @state_locked
     def battery_tick(self, sample, now):
         item = self.status['items']['battery']
         b, cfg, protection = self.battery, self.plan['items']['battery'], self.plan.get('protection', {})
         if not sample['valid']:
             b['failures'] += 1
             self.previous_battery = None
+            self.battery_timing_anchor = None
             b['stop_count'] = 0
             if b['failures'] >= cfg['max_read_failures']:
                 self.safety_reason = '电池连续读取失败'
@@ -414,14 +620,6 @@ class Supervisor:
             return
         if b['state'] == 'WAIT_OPERATOR':
             self.previous_battery = None
-            confirmation = self.directory / 'confirm.json'
-            if confirmation.exists():
-                value = json.loads(confirmation.read_text())
-                confirmation.unlink()
-                if value.get('token') == b['index'] and value.get('phase') == b['phase']:
-                    b['confirmed'] = True
-                    self.emit('operator', dict(value, reason='本次测试电源已确认，直接按配置时长计时'))
-                    self.start_battery_phase(sample, now)
             return
         sign = 1 if b['phase'] == 'charge' else -1
         directed = current * sign
@@ -433,6 +631,12 @@ class Supervisor:
         if len(self.battery_phases) == 1:
             duration *= cfg['cycles']
         elapsed = b.get('phase_effective_s', 0)
+        if self.battery_timing_anchor is not None:
+            gap = now - self.battery_timing_anchor
+            if 0 <= gap <= self.plan['max_sample_gap_s']:
+                elapsed += gap
+            # 首次确认后不使用确认前的电流补造积分；失败或超长缺口不计有效时长。
+            self.battery_timing_anchor = None
         if self.previous_battery:
             previous_time, previous_current, previous_voltage = self.previous_battery
             gap = now - previous_time
@@ -474,38 +678,41 @@ class Supervisor:
     def sample(self):
         now = time.monotonic()
         data = self.collector.sample()
+        if self.stop_requested.is_set():
+            return
         if data.get('kernel_errors'):
             self.safety_reason = '检测到新的内核/OOM/I/O 错误，详见采样证据'
         if data.get('kernel_log_gap'):
             raise RuntimeError('内核环形日志缺段，证据不足')
         if self.plan['items']['battery']['enabled']:
             data['battery'] = collectors.battery_sample(self.info['battery_bus'])
-            was_waiting = self.battery['state'] == 'WAIT_OPERATOR'
+            if self.stop_requested.is_set():
+                return
             self.battery_tick(data['battery'], time.monotonic())
-            if was_waiting and self.battery['state'] == 'RUNNING':
-                # 确认后的真实状态先发布，不等待同轮 4G 等较慢采集完成。
-                self.status['state'] = 'RUNNING'
-                self.status['latest'] = data
-                self.save()
         if self.safety_reason:
             self.emit('metric', data)
             self.status['latest'] = data
             return
         for key, item in self.status['items'].items():
+            if self.stop_requested.is_set():
+                return
             if item['result'] is not None:
                 continue
             cfg = self.plan['items'][key]
             elapsed = now - item['started_monotonic']
-            if key != 'battery':
+            if key not in ('battery', 'storage'):
                 item['effective_s'] = min(elapsed, item['planned_s'])
             if key in ('cpu', 'ddr'):
-                code = self.processes[key].poll()
+                process = self.processes.get(key)
+                if process is None:
+                    continue
+                code = process.poll()
                 swapping = False
                 if key == 'ddr':
                     latest_swap = self.swap_snapshot(data['memory'], data.get('vmstat', ''))
                     item['swap_latest'] = latest_swap
                     try:
-                        group = self.processes[key].memory_snapshot()
+                        group = process.memory_snapshot()
                     except (OSError, ValueError) as exc:
                         self.finish_item(key, 'INCOMPLETE', 'DDR 进程内存采样失败: ' + str(exc))
                         continue
@@ -552,19 +759,19 @@ class Supervisor:
                 self.emit('metric', data)
                 self.status['latest'] = data
                 return
-            if key != 'battery' and item['result'] is None and elapsed >= item['planned_s']:
-                if key == 'storage' and any(t['pending'] or t['completed'] < cfg['rounds'] for t in self.storage.values()):
-                    self.finish_item(key, 'INCOMPLETE', '到时仍有未完成的写入校验轮次')
-                else:
-                    self.finish_item(key, 'PASS', '有效时长达标，校验/监测无错误')
+            if key not in ('battery', 'storage') and item['result'] is None and elapsed >= item['planned_s']:
+                self.finish_item(key, 'PASS', '有效时长达标，校验/监测无错误')
         self.last_sample = time.monotonic()
         self.status['latest'] = data
         self.status['wall_s'] = self.last_sample - self.started
-        self.status['state'] = (self.battery['state']
-                                if self.status['items'].get('battery', {}).get('result') is None
-                                and self.plan['items']['battery']['enabled']
-                                and self.battery['state'] == 'WAIT_OPERATOR' else 'RUNNING')
-        self.emit('metric', data)
+        with self.state_lock:
+            if self.stop_requested.is_set():
+                return
+            self.status['state'] = (self.battery['state']
+                                    if self.status['items'].get('battery', {}).get('result') is None
+                                    and self.plan['items']['battery']['enabled']
+                                    and self.battery['state'] == 'WAIT_OPERATOR' else 'RUNNING')
+            self.emit('metric', data)
 
     def run(self):
         try:
@@ -577,13 +784,14 @@ class Supervisor:
             self.guard_thread = threading.Thread(target=self.guard, daemon=True)
             self.guard_thread.start()
             next_sample = 0
-            sampled_confirmation = None
             self.save()
+            self.control_thread = threading.Thread(target=self.control_loop, daemon=True)
+            self.control_thread.start()
+            if self.plan['items']['storage']['enabled']:
+                self.storage_thread = threading.Thread(target=self.storage_loop, daemon=True)
+                self.storage_thread.start()
             while any(i['result'] is None for i in self.status['items'].values()):
-                if (self.directory / 'stop.json').exists():
-                    self.status['state'] = 'STOPPING'
-                    for key in self.status['items']:
-                        self.finish_item(key, 'ABORTED', '操作者停止')
+                if self.accept_operator_stop():
                     break
                 if self.safety_reason:
                     self.status['state'] = 'SAFETY_STOP'
@@ -592,18 +800,7 @@ class Supervisor:
                     self.status['safety_stop'] = self.safety_reason
                     break
                 now = time.monotonic()
-                self.storage_tick(now)
-                confirmation_version = None
-                if (self.plan['items']['battery']['enabled'] and self.battery['state'] == 'WAIT_OPERATOR'
-                        and self.status['items']['battery']['result'] is None):
-                    try:
-                        confirmation_version = (self.directory / 'confirm.json').stat().st_mtime_ns
-                    except FileNotFoundError:
-                        pass
-                # 人工确认触发即时采样；同一命令只触发一次，读取失败仍按正常间隔重试。
-                if (now >= next_sample or (confirmation_version is not None
-                                          and confirmation_version != sampled_confirmation)):
-                    sampled_confirmation = confirmation_version
+                if now >= next_sample:
                     self.sample()
                     next_sample = now + self.plan['sample_interval_s']
                     self.save()
@@ -618,16 +815,38 @@ class Supervisor:
                     self.finish_item(key, 'INCOMPLETE', '执行异常: ' + str(exc))
         finally:
             self.guard_stop.set()
+            if hasattr(self, 'control_thread'):
+                self.control_thread.join()
+            if hasattr(self, 'storage_thread'):
+                self.storage_thread.join()
             if hasattr(self, 'guard_thread'):
                 self.guard_thread.join(timeout=3)
             cleanup_errors = []
+            storage_retried = any(name.startswith('storage_') for name in self.processes)
             for name in list(self.processes):
                 try:
                     self.stop_process(name)
                 except Exception as exc:
                     cleanup_errors.append(name + ': ' + str(exc))
+            if storage_retried:
+                # 首次回收失败时结果可能尚未落盘，最终重试后重新分析并刷新证据。
+                errors = self.storage_stop_evidence()
+                item = self.status['items']['storage']
+                if errors:
+                    item['result'] = 'FAIL'
+                    item['stop_reason'] += '；最终回收分析：' + '；'.join(errors)
+                confirmed = all(value.get('cleanup', {}).get('confirmed') for value in
+                                item['storage_progress'].values() if value['pending'])
+                item['stop_reason'] += '；最终重试后进程回收' + ('已确认' if confirmed else '未确认')
+                files_removed = all(task.get('file_cleanup', {}).get('removed') for task in self.storage.values()
+                                    if task.get('file'))
+                item['stop_reason'] += '，临时文件清理' + ('已确认' if files_removed else '未确认')
             self.status['cleanup_errors'] = cleanup_errors
             self.status['cleanup_confirmed'] = not cleanup_errors
+            file_errors = {name: task['file_cleanup'] for name, task in self.storage.items()
+                           if task.get('file_cleanup') and not task['file_cleanup'].get('removed')}
+            self.status['file_cleanup_errors'] = file_errors
+            self.status['file_cleanup_confirmed'] = not file_errors
             if self.status['state'] != 'BLOCKED':
                 self.status['state'] = 'FINISHED'
                 if self.safety_reason:
