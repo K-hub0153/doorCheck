@@ -679,16 +679,15 @@ class Supervisor:
         natural = b['stop_count'] >= cfg['stop_confirm_samples'] and (
             (b['phase'] == 'charge' and sample['soc_pct'] >= 99) or
             (b['phase'] == 'discharge' and (min_soc is None or sample['soc_pct'] <= min_soc + 2)))
-        if elapsed < duration and not natural:
-            return
-        if natural and elapsed < duration and cfg['completion_mode'] == 'fixed_duration':
-            self.finish_item('battery', 'INCOMPLETE', '充放电提前停止，未完成固定时长')
+        stop_node = natural and cfg['completion_mode'] == 'stop_node'
+        # 固定时长模式下，满电/低电流仍继续监测；只有停止节点模式允许提前完成。
+        if elapsed < duration and not stop_node:
             return
         if elapsed >= duration and cfg['completion_mode'] == 'stop_node' and not natural:
             self.finish_item('battery', 'INCOMPLETE', '到达最大阶段时间，未确认正常停止节点')
             return
         b['segments'].append({'phase': b['phase'], 'index': b['index'], 'effective_s': min(elapsed, duration),
-                              'end_soc': sample['soc_pct'], 'stop_reason': '停止节点' if natural else '到时'})
+                              'end_soc': sample['soc_pct'], 'stop_reason': '停止节点' if stop_node else '到时'})
         b['index'] += 1
         phase_count = cfg['cycles'] * len(self.battery_phases) if len(self.battery_phases) > 1 else 1
         if b['index'] >= phase_count:
