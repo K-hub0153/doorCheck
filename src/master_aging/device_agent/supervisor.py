@@ -81,7 +81,10 @@ def preflight(plan, expected, emit=None):
         if not info['tools']['fio'] or not collectors.command(['fio', '--version']).startswith('fio-'):
             raise ValueError('设备缺少真正的 fio 工具')
         info['tool_versions']['fio'] = collectors.command(['fio', '--version'])
-        info['journal_storage'] = collectors.storage_target(str(ROOT), info['disks'])
+        try:
+            info['journal_storage'] = collectors.storage_target(str(ROOT), info['disks'], allow_overlay=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ValueError('老化日志目录 %s 无法核验实际落盘位置: %s' % (ROOT, exc)) from exc
         info['storage_targets'] = [collectors.storage_target(d, info['disks']) for d in items['storage']['targets']]
         identities = [v['identity'] for v in info['storage_targets']]
         if len(set(identities)) != len(identities):
@@ -477,7 +480,13 @@ class Supervisor:
             raise RuntimeError('内核环形日志缺段，证据不足')
         if self.plan['items']['battery']['enabled']:
             data['battery'] = collectors.battery_sample(self.info['battery_bus'])
+            was_waiting = self.battery['state'] == 'WAIT_OPERATOR'
             self.battery_tick(data['battery'], time.monotonic())
+            if was_waiting and self.battery['state'] == 'RUNNING':
+                # 确认后的真实状态先发布，不等待同轮 4G 等较慢采集完成。
+                self.status['state'] = 'RUNNING'
+                self.status['latest'] = data
+                self.save()
         if self.safety_reason:
             self.emit('metric', data)
             self.status['latest'] = data
@@ -568,6 +577,7 @@ class Supervisor:
             self.guard_thread = threading.Thread(target=self.guard, daemon=True)
             self.guard_thread.start()
             next_sample = 0
+            sampled_confirmation = None
             self.save()
             while any(i['result'] is None for i in self.status['items'].values()):
                 if (self.directory / 'stop.json').exists():
@@ -583,7 +593,17 @@ class Supervisor:
                     break
                 now = time.monotonic()
                 self.storage_tick(now)
-                if now >= next_sample:
+                confirmation_version = None
+                if (self.plan['items']['battery']['enabled'] and self.battery['state'] == 'WAIT_OPERATOR'
+                        and self.status['items']['battery']['result'] is None):
+                    try:
+                        confirmation_version = (self.directory / 'confirm.json').stat().st_mtime_ns
+                    except FileNotFoundError:
+                        pass
+                # 人工确认触发即时采样；同一命令只触发一次，读取失败仍按正常间隔重试。
+                if (now >= next_sample or (confirmation_version is not None
+                                          and confirmation_version != sampled_confirmation)):
+                    sampled_confirmation = confirmation_version
                     self.sample()
                     next_sample = now + self.plan['sample_interval_s']
                     self.save()

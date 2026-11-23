@@ -5,6 +5,7 @@ import ipaddress
 from pathlib import Path
 import queue
 import threading
+import time
 
 from ..adapters.ssh_transport import SSHTransport
 from ..adapters.environment import DeploymentCancelled
@@ -76,7 +77,8 @@ class RunService:
                 raise ValueError('该运行正在连接或执行')
             if any(s['device']['sn'] == device['sn'] for s in self.active.values()):
                 raise ValueError('同一 SN 已有本地运行，先停止或恢复原运行')
-            state = {'device': device, 'stop': threading.Event(), 'commands': queue.Queue(), 'future_done': threading.Event()}
+            state = {'device': device, 'stop': threading.Event(), 'commands': queue.Queue(),
+                     'wake': threading.Event(), 'future_done': threading.Event()}
             self.active[run_id] = state
             return state
 
@@ -93,11 +95,13 @@ class RunService:
         with self._lock:
             if run_id in self.active:
                 self.active[run_id]['stop'].set()
+                self.active[run_id]['wake'].set()
 
     def confirm(self, run_id, phase, token, operator=''):
         with self._lock:
             if run_id in self.active:
                 self.active[run_id]['commands'].put({'phase': phase, 'token': token, 'operator': operator})
+                self.active[run_id]['wake'].set()
 
     def _store(self, run_id, status, directory):
         self.repository.save_status(run_id, status)
@@ -140,6 +144,7 @@ class RunService:
         acquired = False
         failures = 0
         confirmed_reboot = False
+        confirmation_poll_until = 0
         try:
             while not gate.acquire(timeout=0.2):
                 if self.detaching.is_set() or control['stop'].is_set():
@@ -155,6 +160,8 @@ class RunService:
                 self._store(run_id, last_status, directory)
                 return
             while not self.detaching.is_set():
+                # 先清除唤醒，再处理命令；处理期间到达的新命令不会丢失唤醒。
+                control['wake'].clear()
                 validated_status = None
                 try:
                     if transport is None:
@@ -201,6 +208,7 @@ class RunService:
                         confirmation = control['commands'].get_nowait()
                         try:
                             transport.action('confirm', run_id, **confirmation)
+                            confirmation_poll_until = time.monotonic() + 5
                         except Exception:
                             # 人工每次运行只确认一次，发送失败必须保留命令待重连补发。
                             control['commands'].put(confirmation)
@@ -224,6 +232,10 @@ class RunService:
                     if last_status.get('boot_id') and status.get('boot_id') != last_status['boot_id']:
                         raise ValueError('状态 boot_id 不一致')
                     validated_status = status
+                    if (status.get('battery', {}).get('confirmed')
+                            or status.get('items', {}).get('battery', {}).get('result') is not None
+                            or status['state'] in ('FINISHED', 'BLOCKED')):
+                        confirmation_poll_until = 0
                     self._ingest(transport, run_id, directory)
                     last_status = status
                     if status.get('agent_alive') is False:
@@ -275,7 +287,9 @@ class RunService:
                     if transport:
                         transport.close()
                         transport = None
-                self.detaching.wait(min(10, 2 + failures))
+                # 确认落盘和执行器消费异步发生；短时加快查询，读取异常时避免持续高频轮询。
+                delay = 0.2 if time.monotonic() < confirmation_poll_until and not failures else min(10, 2 + failures)
+                control['wake'].wait(delay)
         except Exception as exc:
             last_status.update(state='RECONNECTING' if launched else 'BLOCKED', result=None if launched else 'BLOCKED', error=str(exc))
             self._store(run_id, last_status, directory)
@@ -298,10 +312,11 @@ class RunService:
     def shutdown(self, detach=False):
         if detach:
             self.detaching.set()
-        else:
-            with self._lock:
-                for control in self.active.values():
+        with self._lock:
+            for control in self.active.values():
+                if not detach:
                     control['stop'].set()
+                control['wake'].set()
         if detach and not self.busy():
             self.pool.shutdown(wait=False)
 

@@ -185,12 +185,28 @@ def hdmi_sample(paths):
     return {'ok': bool(values) and any(v['status'] == 'connected' for v in values.values()), 'connectors': values}
 
 
-def storage_target(directory, disks):
+def storage_target(directory, disks, allow_overlay=False):
     path = Path(directory).resolve(strict=True)
     if not path.is_dir():
         raise ValueError('存储目标目录不存在')
-    # 只接受内置物理盘的直接挂载；overlay/tmpfs/LVM/USB 一律阻止，避免错误落盘。
-    mount = json.loads(command(['findmnt', '-J', '-T', str(path), '-o', 'SOURCE,FSTYPE,TARGET']))['filesystems'][0]
+    mount = json.loads(command(['findmnt', '-J', '-T', str(path), '-o', 'SOURCE,FSTYPE,TARGET,OPTIONS']))['filesystems'][0]
+    if 'ro' in mount.get('options', '').split(','):
+        raise ValueError('目录 %s 位于只读文件系统' % path)
+    if mount['fstype'] == 'overlay':
+        if not allow_overlay:
+            raise ValueError('存储测试目录 %s 位于 overlay 联合文件系统，'
+                             '请改用直接挂载内置盘的可写目录（如 /data）；不会自动改写测试路径' % path)
+        # 日志无需 direct I/O，但仍须确认实际写入层对应唯一内置物理盘。
+        options = mount.get('options', '').split(',')
+        upper_dirs = [option.partition('=')[2] for option in options if option.startswith('upperdir=')]
+        if 'rw' not in options or len(upper_dirs) != 1 or not Path(upper_dirs[0]).is_absolute():
+            raise ValueError('日志目录 %s 的 overlay 缺少可核验的可写 upperdir' % path)
+        # 不继续接受嵌套 overlay、tmpfs 或无法核验的设备映射。
+        backing = storage_target(upper_dirs[0], disks)
+        return dict(backing, directory=str(path), mount=mount,
+                    backing_directory=backing['directory'], backing_mount=backing['mount'],
+                    free_bytes=min(backing['free_bytes'], shutil.disk_usage(path).free))
+    # 压测只接受内置物理盘的直接挂载，避免错误落盘或降低 direct I/O 要求。
     source = mount['source'].split('[')[0]
     if not source.startswith('/dev/') or mount['fstype'] in ('tmpfs', 'overlay', 'squashfs'):
         raise ValueError('目标不是已验证的物理盘文件系统: ' + str(mount))
