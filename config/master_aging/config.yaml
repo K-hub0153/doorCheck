@@ -4,36 +4,44 @@ max_sample_gap_s: 40
 min_free_space_mib: 256
 max_log_mib: 64
 environment:
-  chamber_id: null
-  set_temperature_c: null
-  set_humidity_pct: null
+  chamber_id: '2'
+  set_temperature_c: 45.0
+  set_humidity_pct: 45.0
   measured_source: none
   measured_temperature: null
   measured_humidity: null
 items:
-  cpu: {enabled: false, duration_min: 120, target_busy_pct: 95, grace_s: 60}
-  ddr: {enabled: false, duration_min: 120, max_memory_pct: 50, reserve_mib: 256}
+  cpu:
+    enabled: true
+    duration_min: 1
+    target_busy_pct: 95
+    grace_s: 60
+  ddr:
+    enabled: true
+    duration_min: 1
+    max_memory_pct: 10
+    reserve_mib: 256
   storage:
-    enabled: false
-    duration_min: 120
-    targets: []
-    write_budget_gib: 8
-    chunk_mib: 256
-    rounds: 31
+    enabled: true
+    duration_min: 1
+    targets:
+    - /data
+    write_budget_gib: 8.0
+    chunk_mib: 250
+    rounds: 2
     log_reserve_mib: 64
     metadata_reserve_mib: 64
     cumulative_write_budget_gib: null
     direct: true
   lte:
-    enabled: false
-    duration_min: 120
-    # 留空沿用产测模组表：移远 /dev/ttyUSB2，龙尚 /dev/ttyACM1。
+    enabled: true
+    duration_min: 1
     at_port: ''
   battery:
-    enabled: false
-    duration_min: 240
-    charge_duration_min: 120
-    discharge_duration_min: 120
+    enabled: true
+    duration_min: 1
+    charge_duration_min: 1
+    discharge_duration_min: 0
     cycles: 1
     completion_mode: fixed_duration
     configure_shutdown: false
@@ -41,10 +49,16 @@ items:
     stop_current_ma: 50
     stop_confirm_samples: 6
     max_read_failures: 3
-  usb: {enabled: false, duration_min: 120, min_speed_mbps: 5000, fixture_confirmed: false}
-  hdmi: {enabled: false, duration_min: 120, display_confirmed: false}
+  usb:
+    enabled: true
+    duration_min: 1
+    min_speed_mbps: 5000
+    fixture_confirmed: false
+  hdmi:
+    enabled: true
+    duration_min: 1
+    display_confirmed: false
 protection:
-  # 选填；null 表示不启用对应保护项，填写后按门限执行。
   cpu_stop_temperature_c: null
   battery_charge_temperature_range_c: null
   battery_discharge_temperature_range_c: null
