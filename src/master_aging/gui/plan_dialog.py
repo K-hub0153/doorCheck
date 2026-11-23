@@ -105,7 +105,7 @@ class PlanDialog(QDialog):
         self.completion.addItem('等待充放电停止节点（设定时长为上限）', 'stop_node')
         self.completion.setCurrentIndex(max(0, self.completion.findData(plan['items']['battery']['completion_mode'])))
         battery_form.addRow('完成方式', self.completion)
-        options.addWidget(QLabel('4G 自动识别模组并按产测标准检测信号。'))
+        options.addWidget(QLabel('4G 自动识别模组，周期检测信号。\n要求：RSRP ≥ -90 dBm、RSRQ ≥ -13 dB、SINR ≥ 5 dB。'))
         options.addStretch()
         protection = plan.get('protection', {})
         controls = QFormLayout(safety)

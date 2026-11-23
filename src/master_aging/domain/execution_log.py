@@ -2,11 +2,12 @@
 import json
 
 from .models import ITEMS
+from .diagnostics import monitor_reason
 
 
 def lte_lines(result):
     lines = ['4G %s：%s' % ('通过' if result.get('ok') else '未通过',
-                          result.get('reason') or ('信号符合产测标准' if result.get('ok') else '未获取有效信号，详见原始记录'))]
+                          '信号符合设定阈值' if result.get('ok') else monitor_reason('lte', result))]
     if result.get('module'):
         lines.append('模组：%s；AT 口：%s' % (result['module'], result.get('at_port', '')))
     if result.get('signal'):

@@ -159,19 +159,20 @@ def battery_identity(bus):
 
 
 def usb_sample(min_speed):
-    devices = []
+    devices, observed = [], []
     for path in Path('/sys/bus/usb/devices').glob('*'):
         if path.name.startswith('usb') or ':' in path.name:
             continue
         try:
             speed = float(read(path / 'speed'))
+            observed.append({'path': path.name, 'speed_mbps': speed})
             if speed >= min_speed:
                 devices.append({'path': path.name, 'speed_mbps': speed,
                                 'vendor': read(path / 'idVendor'), 'product': read(path / 'idProduct'),
                                 'serial': read(path / 'serial'), 'devnum': read(path / 'devnum')})
         except ValueError:
             pass
-    return {'ok': bool(devices), 'devices': devices}
+    return {'ok': bool(devices), 'devices': devices, 'observed_devices': observed}
 
 
 def hdmi_sample(paths):

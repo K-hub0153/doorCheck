@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -275,15 +276,38 @@ def fio_evidence(path, expected):
     return evidence
 
 
+def process_diagnostics(directory, name):
+    """有界读取本次负载日志，保留工具输出的错误，避免猜测退出根因。"""
+    messages = []
+    for suffix in ('stderr', 'stdout'):
+        path = Path(directory) / ('%s.%s.log' % (name, suffix))
+        try:
+            with path.open('rb') as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 8192))
+                lines = stream.read().decode('utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        errors = [line for line in lines if re.search(r'error|fail|errno|fatal|cannot|no space', line, re.I)]
+        selected = errors[-3:] if errors else lines[-3:] if suffix == 'stderr' else []
+        if selected:
+            messages.append(path.name + ': ' + '；'.join(selected)[-1200:])
+    return '；'.join(messages)
+
+
 def fio_result(path, expected):
     data = json.loads(Path(path).read_text())
     jobs = data['jobs']
-    if len(jobs) != 1 or any(j.get('error') for j in jobs):
-        raise RuntimeError('fio I/O 或数据校验失败')
+    if len(jobs) != 1:
+        raise RuntimeError('fio job 数量 %s，要求 1' % len(jobs))
     job = jobs[0]
+    if job.get('error'):
+        error = job['error']
+        raise RuntimeError('fio I/O 或数据校验失败: %s（errno=%s）' % (os.strerror(error), error))
     written, verified = job['write']['io_bytes'], job['read']['io_bytes']
     if written != expected or verified < expected:
-        raise RuntimeError('fio 实际写入/校验字节数与计划不符')
+        raise RuntimeError('fio 实际写入 %s 字节、读取校验 %s 字节；要求写入 %s 字节、读取校验 ≥ %s 字节' %
+                           (written, verified, expected, expected))
     return {'written_bytes': written, 'verified_bytes': verified,
             'write_bw_kib_s': job['write'].get('bw'), 'read_bw_kib_s': job['read'].get('bw'),
             'write_latency_ns': job['write'].get('clat_ns'), 'read_latency_ns': job['read'].get('clat_ns')}

@@ -490,6 +490,9 @@ class MainWindow(QMainWindow):
         busy = latest.get('cpu', {}).get('busy_pct')
         busy_text = ('%.1f%%' % busy) if busy is not None else '未采到'
         live = reason if status['state'] in ('DEPLOYING', 'READY') else 'CPU %s · %s\n%s' % (busy_text, temperature, remaining)
+        for key, item in status.get('items', {}).items():
+            if item.get('result') in ('FAIL', 'INCOMPLETE', 'BLOCKED'):
+                live += '\n%s %s：%s' % (ITEMS.get(key, key), item['result'], item.get('stop_reason') or '未提供具体原因')
         battery = status.get('battery', {})
         pending = (run_id in self.power_submitted and battery.get('state') == 'WAIT_OPERATOR'
                    and not battery.get('confirmed') and status.get('items', {}).get('battery', {}).get('result') is None)

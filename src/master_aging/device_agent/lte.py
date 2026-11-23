@@ -1,10 +1,12 @@
-"""沿用主控产测的 AT 模组识别、信号解析与统一阈值。"""
+"""4G 老化监测：AT 模组识别、信号解析和阈值判定。"""
 import fcntl
 import os
 import select
 import termios
 import time
 from pathlib import Path
+
+from ..domain.diagnostics import LTE_SCOPE, monitor_reason
 
 
 def at(fd, text):
@@ -55,14 +57,17 @@ def read_at(port, text):
 def sample(settings):
     # 纯解析模块在部署时随 zipapp 发布，PC 运行时使用同一份源文件。
     try:
-        from lte_decode import DEFAULT_AT_PORT, load_modules, identify_module, decode, judge
+        from lte_decode import (DEFAULT_AT_PORT, LTE_THRESHOLDS,
+                                load_modules, identify_module, decode, judge)
     except ImportError:
-        from src.master_control.core.lte_signal import DEFAULT_AT_PORT, load_modules, identify_module, decode, judge
+        from src.master_control.core.lte_signal import (
+            DEFAULT_AT_PORT, LTE_THRESHOLDS,
+            load_modules, identify_module, decode, judge)
     override = settings.get('at_port') or None
     modules = load_modules(at_port=override)
     raw = {'ati_port': override or DEFAULT_AT_PORT, 'ati': '', 'attempts': []}
-    result = {'ok': False, 'raw': raw, 'signal': {},
-              'scope': '沿用产测 AT 模组识别及 RSRP/RSRQ/SINR 阈值，周期检测信号'}
+    result = {'ok': False, 'raw': raw, 'signal': {}, 'thresholds': dict(LTE_THRESHOLDS),
+              'scope': LTE_SCOPE}
     try:
         raw['ati'] = read_at(override or DEFAULT_AT_PORT, 'ATI')
     except (OSError, RuntimeError, termios.error) as exc:
@@ -83,7 +88,7 @@ def sample(settings):
         decoded = read_signal(spec)
         note = 'ATI 型号识别'
     else:
-        # 与产测一致：ATI 未识别时，按各厂商端口和响应格式依次试读。
+        # ATI 未识别时，按各厂商端口和响应格式依次试读。
         for candidate in modules:
             decoded = read_signal(candidate)
             if decoded.ok:
@@ -97,11 +102,12 @@ def sample(settings):
             return result
         note = 'ATI 未识别，按响应格式判定'
     signal_ok, checks, reason = judge(decoded.metrics)
-    failed = ', '.join(key.upper() for key, passed in checks.items() if not passed)
+    values = {m.key: m.value for m in decoded.metrics}
     result.update(ok=decoded.ok and signal_ok, module=spec.name, model=model,
                   at_port=spec.at_port, identify_note=note, checks=checks,
-                  signal={m.key: m.value for m in decoded.metrics},
-                  reason=raw['attempts'][-1].get('error') or decoded.reason or reason or
-                         ('4G 信号不达标: ' + failed if failed else ''))
+                  signal=values,
+                  reason=raw['attempts'][-1].get('error') or decoded.reason or reason or '')
+    if not result['ok']:
+        result['reason'] = monitor_reason('lte', result)
     raw['signal'] = raw['attempts'][-1].get('signal', '')
     return result

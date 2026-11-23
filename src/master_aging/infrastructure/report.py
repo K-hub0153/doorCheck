@@ -11,6 +11,7 @@ from functools import lru_cache, wraps
 from pathlib import Path
 from ..domain.models import ITEMS
 from ..domain.execution_log import format_record
+from ..domain.diagnostics import GENERIC_MONITOR_REASON, LTE_SCOPE, item_reason, item_scope
 
 STYLE = '''body{font:15px system-ui,sans-serif;color:#263449;background:#f3f6fa;margin:0}
 main{max-width:1200px;margin:auto;padding:32px}h1{font-size:26px}h2{font-size:20px;margin-top:32px}
@@ -43,6 +44,19 @@ def serialized(function):
 
 def text(value):
     return escape(str(value if value is not None else '缺失'))
+
+
+def evidence_text(value):
+    """规范旧记录中的说明字段；下载的原始 JSON 保留原文。"""
+    def present(data):
+        if isinstance(data, dict):
+            return {key: (LTE_SCOPE if key == 'scope' and isinstance(child, str)
+                          and child.startswith('沿用产测') else present(child))
+                    for key, child in data.items()}
+        if isinstance(data, list):
+            return [present(child) for child in data]
+        return data
+    return json.dumps(present(value), ensure_ascii=False, indent=2)
 
 
 def local_time(value):
@@ -89,7 +103,7 @@ def event_summary(record):
     return item or '整机', STATE_LABELS.get(state, state or '运行事件'), data.get('reason') or ('所选项目已启动' if state == 'RUNNING' else '')
 
 
-def event_timeline(records):
+def event_timeline(records, item_reasons=None):
     # 沿用设备序号保证因果顺序，设备时钟校准不应打乱先后关系。
     ordered = sorted(records, key=lambda r: r['seq'])
     origins = {}
@@ -102,6 +116,8 @@ def event_timeline(records):
     body += '<div class="table-scroll"><table class="timeline"><thead><tr><th>时间 / 累计用时</th><th>项目</th><th>事件 / 结果</th><th>说明</th></tr></thead><tbody>'
     for record in events:
         item, title, description = event_summary(record)
+        if description == GENERIC_MONITOR_REASON and item_reasons:
+            description = item_reasons.get(record['data'].get('item'), description)
         start, current = origins[record.get('boot_id')], record.get('monotonic')
         elapsed = '用时缺失'
         if isinstance(start, (int, float)) and isinstance(current, (int, float)):
@@ -112,7 +128,7 @@ def event_timeline(records):
         body += ('<tr><td class="time">' + text(local_time(record.get('utc'))) + '<br><small>' + elapsed
                  + ' · #' + text(record['seq']) + '</small></td><td>' + text(item) + '</td><td class="event">' + text(title) + badge
                  + '</td><td class="description">' + text(description) + '<details><summary>原始事件</summary><pre>'
-                 + text(json.dumps(record['data'], ensure_ascii=False, indent=2)) + '</pre></details></td></tr>')
+                 + text(evidence_text(record['data'])) + '</pre></details></td></tr>')
     return body + '</tbody></table></div>'
 
 
@@ -168,6 +184,7 @@ def write_execution_log(row, records):
     directory = Path(row['output_dir'])
     directory.mkdir(parents=True, exist_ok=True)
     status = json.loads(row['status'])
+    config = json.loads(row.get('snapshot') or '{}').get('items', {})
     with (directory / 'execution.log').open('w', encoding='utf-8') as stream:
         stream.write('主控老化执行日志\nSN：%s  IP：%s\n运行：%s\n状态：%s  结果：%s\n' %
                      (row['sn'], row['ip'], row['run_id'], row['state'], row['result'] or '未结束'))
@@ -176,11 +193,16 @@ def write_execution_log(row, records):
                 stream.write('%s：%s\n' % (key, status[key]))
         for key, item in status.get('items', {}).items():
             stream.write('%s：%s；%s\n' % (ITEMS.get(key, key), item.get('result') or '进行中',
-                                          item.get('stop_reason') or ''))
+                                          item_reason(key, item, records, config.get(key))))
             if item.get('argv'):
                 stream.write('执行参数：' + json.dumps(item['argv'], ensure_ascii=False) + '\n')
         stream.write('以下为设备记录，时间为 UTC，按事件序号排列。连接与部署过程见 controller.log。\n\n')
         for record in sorted(records, key=lambda r: r['seq']):
+            data = record['data']
+            if data.get('reason') == GENERIC_MONITOR_REASON and data.get('item') in status.get('items', {}):
+                key = data['item']
+                data = dict(data, reason=item_reason(key, status['items'][key], records, config.get(key)))
+                record = dict(record, data=data)
             stream.write(format_record(record))
     return directory / 'execution.log'
 
@@ -221,6 +243,8 @@ def export_report(repository, run_id):
                         value = "'" + value
                     writer.writerow([record['seq'], record['utc'], record.get('received_at'), record['boot_id'], record['monotonic'], key, value])
     items = status.get('items', {})
+    reasons = {key: item_reason(key, item, records, snapshot.get('items', {}).get(key))
+               for key, item in items.items()}
     result = row['result'] or 'INCOMPLETE'
     body = '<h1>主控设备老化报告</h1><p>SN：' + text(row['sn']) + ' · <b class="' + text(result) + '">' + text(result) + '</b></p>'
     body += '<div class="card">批次：' + text(row['batch_id']) + '<br>运行：' + text(run_id)
@@ -231,7 +255,7 @@ def export_report(repository, run_id):
     body += '<h2>项目判定</h2><table><tr><th>项目</th><th>计划秒数</th><th>有效秒数</th><th>结果</th><th>停止原因 / 范围</th></tr>'
     for key, item in items.items():
         item_result = item.get('result') or 'INCOMPLETE'
-        body += '<tr><td>' + text(ITEMS.get(key, key)) + '</td><td>' + text(item.get('planned_s')) + '</td><td>' + text(round(item.get('effective_s', 0), 2)) + '</td><td class="' + text(item_result) + '">' + text(item_result) + '</td><td>' + text(item.get('stop_reason')) + '<br>' + text(item.get('scope', '')) + '</td></tr>'
+        body += '<tr><td>' + text(ITEMS.get(key, key)) + '</td><td>' + text(item.get('planned_s')) + '</td><td>' + text(round(item.get('effective_s', 0), 2)) + '</td><td class="' + text(item_result) + '">' + text(item_result) + '</td><td>' + text(reasons[key]) + '<br>' + text(item_scope(key, item)) + '</td></tr>'
     body += '</table><p><small>CPU/DDR/存储等为合成负载。HDMI connected 仅代表连接检测，显示确认由操作者记录。日志或时长不足不能判通过。</small></p>'
     metrics = [r for r in records if r['kind'] == 'metric']
     curves = {k: [] for k in ('CPU 忙碌率 %', '最高 CPU 温度 ℃', '电池 SOC %', '电池净电流 mA', '电池电压 mV', '电池温度 ℃')}
@@ -244,11 +268,11 @@ def export_report(repository, run_id):
         for key, value in zip(curves, values):
             curves[key].append((t, value))
     body += '<h2>采样曲线</h2><div class="grid">' + ''.join(chart(key, points) for key, points in curves.items()) + '</div>'
-    body += event_timeline(records)
+    body += event_timeline(records, reasons)
     for title, value in (('硬件与固件', status.get('hardware')), ('环境记录', snapshot.get('environment')),
                          ('电池阶段与积分', status.get('battery')), ('存储写入账本', status.get('write_ledger')),
                          ('运行配置快照', snapshot), ('清理结果', {'confirmed': status.get('cleanup_confirmed'), 'errors': status.get('cleanup_errors')})):
-        body += '<details class="card"><summary>' + text(title) + '</summary><pre>' + text(json.dumps(value, ensure_ascii=False, indent=2)) + '</pre></details>'
+        body += '<details class="card"><summary>' + text(title) + '</summary><pre>' + text(evidence_text(value)) + '</pre></details>'
     body += '<p><a href="metrics.csv">原始指标 CSV</a> · <a href="records.json">完整事件与采样 JSON</a> · <a href="summary.json">结论 JSON</a></p>'
     body += '<h2>执行日志</h2><p><a href="execution.log">查看执行日志（含 4G 原始响应）</a>'
     if (directory / 'controller.log').is_file():

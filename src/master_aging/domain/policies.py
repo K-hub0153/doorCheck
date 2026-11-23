@@ -64,7 +64,7 @@ def validate_plan(plan):
             raise ValueError('首期存储校验要求已验证的 direct I/O，不自动降级为缓存模式')
     if 'lte' in enabled:
         lte = items['lte']
-        # 留空沿用产测内置模组表；运行时核验串口占用，不要求蜂窝联网配置。
+        # 留空使用内置模组表；运行时核验串口占用，不要求蜂窝联网配置。
         port = lte.get('at_port')
         if port not in (None, '') and (not isinstance(port, str) or not re.fullmatch(r'/dev/tty(?:USB|ACM)\d+', port)):
             raise ValueError('4G AT 口必须为 /dev/ttyUSB数字 或 /dev/ttyACM数字，留空自动识别')

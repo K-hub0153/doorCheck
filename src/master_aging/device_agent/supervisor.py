@@ -17,6 +17,7 @@ import time
 
 from ..domain.models import conclusion, digest, utc_now
 from ..domain.execution_log import format_record
+from ..domain.diagnostics import LTE_SCOPE, monitor_reason
 from ..domain.policies import validate_plan
 from . import collectors, lte, recovery, runners
 
@@ -58,7 +59,8 @@ def ddr_allocation(memory, config):
     allocation = int(min(memory['MemTotal'] * config['max_memory_pct'] // 100,
                          available - reserve))
     if allocation < 16 * 2**20:
-        raise ValueError('DDR 可用内存不足，无法保留系统保护空间')
+        raise ValueError('DDR 可分配内存 %.1f MiB，至少需要 16 MiB；系统可用 %.1f MiB，需保留 %.1f MiB' %
+                         (allocation / 2**20, available / 2**20, reserve / 2**20))
     return {'bytes': allocation, 'available_bytes': available, 'reserve_bytes': reserve}
 
 
@@ -81,7 +83,8 @@ def preflight(plan, expected, emit=None, current_run_id=None):
         if not info['temperatures']:
             raise ValueError('未发现可读 thermal zone，无法启用本地温度保护')
         if max(info['temperatures'].values()) >= temperature_limit:
-            raise ValueError('当前温度已到保护停止点')
+            raise ValueError('当前 CPU 最高温度 %.1f ℃，已达停止门限 %.1f ℃' %
+                             (max(info['temperatures'].values()), temperature_limit))
     items = plan['items']
     for key in ('cpu', 'ddr'):
         if items[key]['enabled'] and not info['tools']['stress-ng']:
@@ -104,8 +107,10 @@ def preflight(plan, expected, emit=None, current_run_id=None):
         if len(set(identities)) != len(identities):
             raise ValueError('同一物理盘不能重复分配多个独立预算')
         required = items['storage']['chunk_mib'] * 2**20 + plan['min_free_space_mib'] * 2**20
-        if any(v['free_bytes'] < required for v in info['storage_targets']):
-            raise ValueError('存储目标剩余空间不足')
+        for target in info['storage_targets']:
+            if target['free_bytes'] < required:
+                raise ValueError('存储目录 %s 剩余 %.1f MiB，至少需要 %.1f MiB（单轮写入加保护预留）' %
+                                 (target['directory'], target['free_bytes'] / 2**20, required / 2**20))
         cfg = items['storage']
         total_plan = (cfg['rounds'] * cfg['chunk_mib'] + cfg['log_reserve_mib'] + cfg['metadata_reserve_mib']) * 2**20
         for target in info['storage_targets']:
@@ -116,7 +121,9 @@ def preflight(plan, expected, emit=None, current_run_id=None):
                     raise ValueError('目标盘历史预留自动恢复未完成，无法确认旧测试目录已清理: ' + str(ledger))
                 limit = cfg.get('cumulative_write_budget_gib')
                 if limit is not None and data['reserved_bytes'] + total_plan > limit * 2**30:
-                    raise ValueError('该盘累计剩余批准预算不足以完成计划')
+                    raise ValueError('%s 累计写入预算不足: 已预留 %.1f MiB，本次需要 %.1f MiB，累计上限 %.1f MiB' %
+                                     (target['directory'], data['reserved_bytes'] / 2**20,
+                                      total_plan / 2**20, limit * 1024))
     if items['battery']['enabled']:
         if not info['tools']['i2cget']:
             raise ValueError('设备缺少 i2cget')
@@ -124,12 +131,16 @@ def preflight(plan, expected, emit=None, current_run_id=None):
         info['battery_initial'] = collectors.battery_sample(info['battery_bus'])
         info['battery_identity'] = collectors.battery_identity(info['battery_bus'])
         if not info['battery_initial']['valid']:
-            raise ValueError('电池必读寄存器读取失败')
-    if items['usb']['enabled'] and not collectors.usb_sample(items['usb']['min_speed_mbps'])['ok']:
-        raise ValueError('未发现达到最低速率的 USB 夹具')
+            detail = '；'.join('%s: %s' % pair for pair in info['battery_initial'].get('errors', {}).items())
+            raise ValueError('电池必读寄存器读取失败: ' + (detail or '温度/电压/电流/SOC 数据缺失'))
+    if items['usb']['enabled']:
+        result = collectors.usb_sample(items['usb']['min_speed_mbps'])
+        if not result['ok']:
+            raise ValueError(monitor_reason('usb', result, items['usb']))
     if items['hdmi']['enabled'] and info['chip'] != 'hisi':
-        if not collectors.hdmi_sample(info['hdmi_paths'])['ok']:
-            raise ValueError('未发现已连接的 HDMI')
+        result = collectors.hdmi_sample(info['hdmi_paths'])
+        if not result['ok']:
+            raise ValueError(monitor_reason('hdmi', result))
     if items['lte']['enabled']:
         result = lte.sample(items['lte'])
         if emit:
@@ -139,8 +150,10 @@ def preflight(plan, expected, emit=None, current_run_id=None):
         if not result['ok']:
             raise ValueError('4G 预检失败: ' + (result.get('reason') or '无法获取有效信号'))
         info['lte_initial'] = result
-    if shutil.disk_usage(ROOT).free < plan['min_free_space_mib'] * 2**20:
-        raise ValueError('设备日志目录剩余空间不足')
+    free = shutil.disk_usage(ROOT).free / 2**20
+    if free < plan['min_free_space_mib']:
+        raise ValueError('设备日志目录 %s 剩余 %.1f MiB，要求至少 %s MiB' %
+                         (ROOT, free, plan['min_free_space_mib']))
     return info
 
 
@@ -211,9 +224,12 @@ class Supervisor:
                     if not temps:
                         raise RuntimeError('CPU 温度传感器失效')
                     if max(temps.values()) >= temperature_limit:
-                        raise RuntimeError('CPU 超温')
-                if time.monotonic() - self.last_sample > self.plan['max_sample_gap_s']:
-                    raise RuntimeError('采样/调度超时，保护停止')
+                        raise RuntimeError('CPU 超温: 最高 %.1f ℃，停止门限 %.1f ℃' %
+                                           (max(temps.values()), temperature_limit))
+                gap = time.monotonic() - self.last_sample
+                if gap > self.plan['max_sample_gap_s']:
+                    raise RuntimeError('采样/调度超时: %.1f 秒未完成采样，最大允许 %.1f 秒' %
+                                       (gap, self.plan['max_sample_gap_s']))
                 for name in ('cpu', 'ddr'):
                     item = self.status['items'].get(name)
                     process = self.processes.get(name)
@@ -223,11 +239,14 @@ class Supervisor:
                             self.timed_out.add(name)
                             process.request_stop()
                 for path in [ROOT] + [Path(t['directory']) for t in self.info.get('storage_targets', [])]:
-                    if shutil.disk_usage(path).free < self.plan['min_free_space_mib'] * 2**20:
-                        raise RuntimeError('剩余空间低于保护线')
+                    free = shutil.disk_usage(path).free / 2**20
+                    if free < self.plan['min_free_space_mib']:
+                        raise RuntimeError('目录 %s 剩余空间 %.1f MiB，低于保护线 %s MiB' %
+                                           (path, free, self.plan['min_free_space_mib']))
                 size = sum(p.stat().st_size for p in self.directory.rglob('*') if p.is_file())
                 if size > self.plan['max_log_mib'] * 2**20:
-                    raise RuntimeError('设备日志达到上限')
+                    raise RuntimeError('设备日志 %.1f MiB，超过上限 %s MiB' %
+                                       (size / 2**20, self.plan['max_log_mib']))
                 continue
             except Exception as exc:
                 self.safety_reason = str(exc)
@@ -260,7 +279,9 @@ class Supervisor:
             if task['pending']:
                 task['last_fio'] = runners.fio_evidence(task['result_path'], size)
                 if task['last_fio'].get('fio_error') in (errno.EIO, errno.EILSEQ):
-                    errors.append('fio 报告 I/O 或数据校验错误（errno=%s）' % task['last_fio']['fio_error'])
+                    error = task['last_fio']['fio_error']
+                    errors.append('%s 第 %s 轮 fio 错误: %s（errno=%s）' % (
+                        task['target']['directory'], task['completed'] + 1, os.strerror(error), error))
         self.cleanup_storage_files()
         self.close_storage_reservations()
         self.status['items']['storage']['storage_progress'] = self.storage_progress()
@@ -332,6 +353,9 @@ class Supervisor:
                     item['exit_code'] = code
                 if result == 'PASS' and code != 0:
                     result, reason = 'INCOMPLETE', '压测退出码不是 0: %s' % code
+                    detail = runners.process_diagnostics(self.directory, name)
+                    if detail:
+                        reason += '；' + detail
             except Exception as exc:
                 if result == 'PASS':
                     result = 'INCOMPLETE'
@@ -352,6 +376,11 @@ class Supervisor:
                             evidence['written_bytes'] / 2**20, evidence['verified_bytes'] / 2**20, size / 2**20)
                     else:
                         detail += '，中断轮未取得可解析的 fio 结果'
+                    if evidence.get('fio_error'):
+                        error = evidence['fio_error']
+                        detail += '，fio 错误 %s（errno=%s）' % (os.strerror(error), error)
+                    if evidence.get('evidence_error'):
+                        detail += '，结果读取异常: ' + evidence['evidence_error']
                     cleanup = value.get('cleanup', {})
                     detail += '，进程回收%s，退出码 %s' % ('已确认' if cleanup.get('confirmed') else '未确认', cleanup.get('exit_code'))
                     file_cleanup = value.get('file_cleanup', {})
@@ -361,9 +390,14 @@ class Supervisor:
                     details.append('未决预留自动归档失败: ' + value['reservation_cleanup_error'])
             reason += '；' + '；'.join(details)
         item.update(result=result, stop_reason=reason, finished_at=utc_now())
-        self.emit('event', {'item': key, 'result': result, 'reason': reason,
-                            'exit_code': item.get('exit_code'), 'effective_s': item.get('effective_s'),
-                            'planned_s': item.get('planned_s')})
+        if result in ('FAIL', 'INCOMPLETE') and item.get('last_sample'):
+            item['failure_sample'] = item['last_sample']
+        event = {'item': key, 'result': result, 'reason': reason,
+                 'exit_code': item.get('exit_code'), 'effective_s': item.get('effective_s'),
+                 'planned_s': item.get('planned_s')}
+        if item.get('last_sample'):
+            event[key] = item['last_sample']
+        self.emit('event', event)
 
     def start_items(self):
         self.started = time.monotonic()
@@ -399,7 +433,7 @@ class Supervisor:
                 item['pid'] = self.processes[key].process.pid
                 item['argv'] = args
             elif key == 'storage':
-                item['scope'] = '固定字节写入与 direct 校验读取；轮次间及结束后只读观察至计划到时'
+                item['scope'] = '按设定容量逐轮写入，直接读取并校验数据；完成后持续监测至计划结束'
                 for idx, target in enumerate(self.info['storage_targets']):
                     name = 'storage_' + str(idx)
                     self.storage[name] = dict(target=target, completed=0, pending=False, due=self.started)
@@ -414,7 +448,7 @@ class Supervisor:
                 self.emit('event', {'item': 'battery', 'phase': self.battery['phase'],
                                     'reason': '请逐设备' + operation + '并确认', 'token': 0})
             elif key == 'lte':
-                item['scope'] = '沿用产测 AT 模组识别及 RSRP/RSRQ/SINR 阈值，周期检测信号'
+                item['scope'] = LTE_SCOPE
             elif key == 'hdmi':
                 item['scope'] = 'HDMI 连接、EDID 与模式；人工显示确认：' + ('已记录' if config.get('display_confirmed') else '未记录')
             if item.get('result') is None:
@@ -433,6 +467,7 @@ class Supervisor:
         global_path = ROOT / 'write-ledger' / (ledger['identity'] + '.json')
         global_path.parent.mkdir(parents=True, exist_ok=True)
         total = json.loads(global_path.read_text()) if global_path.exists() else {'reserved_bytes': 0, 'unresolved_bytes': 0}
+        ledger['cumulative_reserved_bytes'] = total['reserved_bytes']
         cumulative_limit = config.get('cumulative_write_budget_gib')
         if cumulative_limit is not None and total['reserved_bytes'] + size > cumulative_limit * 2**30:
             return False
@@ -495,12 +530,16 @@ class Supervisor:
                     code = self.stop_process(name)
                     task['last_fio'] = runners.fio_evidence(task['result_path'], size)
                     if code:
-                        self.finish_item('storage', 'FAIL', 'fio 非零退出；保留未决预留量')
+                        detail = runners.process_diagnostics(self.directory, name)
+                        self.finish_item('storage', 'FAIL', '%s 第 %s 轮 fio 退出码 %s%s' % (
+                            task['target']['directory'], task['completed'] + 1, code,
+                            '；' + detail if detail else ''))
                         return
                     try:
                         result = runners.fio_result(task['result_path'], size)
                     except Exception as exc:
-                        self.finish_item('storage', 'FAIL', 'fio 校验结果异常: ' + str(exc))
+                        self.finish_item('storage', 'FAIL', '%s 第 %s 轮 fio 校验结果异常: %s' % (
+                            task['target']['directory'], task['completed'] + 1, exc))
                         return
                     ledger['settled_bytes'] += result['written_bytes']
                     ledger['unresolved_bytes'] -= size
@@ -526,7 +565,13 @@ class Supervisor:
             if now < due:
                 continue
             if not self.reserve(name, size):
-                self.finish_item('storage', 'INCOMPLETE', '写入预算不足')
+                self.finish_item('storage', 'INCOMPLETE', '%s 第 %s 轮写入预算不足: 本轮需 %s MiB，'
+                                     '本次已预留 %.1f MiB，上限 %.1f MiB；累计已预留 %s MiB，累计上限 %s GiB' % (
+                                     task['target']['directory'], task['completed'] + 1, config['chunk_mib'],
+                                     ledger['reserved_bytes'] / 2**20, config['write_budget_gib'] * 1024,
+                                     ('%.1f' % (ledger['cumulative_reserved_bytes'] / 2**20)
+                                      if 'cumulative_reserved_bytes' in ledger else '未读取'),
+                                     config.get('cumulative_write_budget_gib', '未设置')))
                 return
             # 每轮预留必须先落盘。重连仅补采，禁止启动同 run_id 或重发写入批次。
             self.emit('write_reservation', dict(target=name, bytes=size, round=task['completed'] + 1))
@@ -622,13 +667,16 @@ class Supervisor:
     def battery_tick(self, sample, now):
         item = self.status['items']['battery']
         b, cfg, protection = self.battery, self.plan['items']['battery'], self.plan.get('protection', {})
+        item['last_sample'] = sample
         if not sample['valid']:
             b['failures'] += 1
             self.previous_battery = None
             self.battery_timing_anchor = None
             b['stop_count'] = 0
             if b['failures'] >= cfg['max_read_failures']:
-                self.safety_reason = '电池连续读取失败'
+                self.safety_reason = '电池连续读取失败 %s 次（上限 %s 次）: %s' % (
+                    b['failures'], cfg['max_read_failures'],
+                    '；'.join('%s: %s' % pair for pair in sample.get('errors', {}).items()) or '必读寄存器数据缺失')
             return
         b['failures'] = 0
         current, voltage, temperature = sample['current_ma'], sample['voltage_mv'], sample['temperature_c']
@@ -637,12 +685,21 @@ class Supervisor:
         maximum = protection.get('battery_max_voltage_mv')
         max_current = protection.get('battery_max_abs_current_ma')
         min_soc = protection.get('discharge_min_soc_pct')
-        if ((limits is not None and not limits[0] <= temperature <= limits[1]) or
-                (minimum is not None and voltage < minimum) or
-                (maximum is not None and voltage > maximum) or
-                (max_current is not None and abs(current) > max_current) or
-                (min_soc is not None and b['phase'] == 'discharge' and sample['soc_pct'] <= min_soc)):
-            self.safety_reason = '电池温度/电压/电流/SOC 达到保护线；请接回适配器'
+        violations = []
+        if limits is not None and not limits[0] <= temperature <= limits[1]:
+            violations.append('温度 %.1f ℃，允许 %.1f～%.1f ℃' % (temperature, *limits))
+        if minimum is not None and voltage < minimum:
+            violations.append('电压 %s mV，低于下限 %s mV' % (voltage, minimum))
+        if maximum is not None and voltage > maximum:
+            violations.append('电压 %s mV，高于上限 %s mV' % (voltage, maximum))
+        if max_current is not None and abs(current) > max_current:
+            violations.append('电流 %s mA，绝对值超过上限 %s mA' % (current, max_current))
+        if min_soc is not None and b['phase'] == 'discharge' and sample['soc_pct'] <= min_soc:
+            violations.append('SOC %s%%，达到放电停止线 %s%%' % (sample['soc_pct'], min_soc))
+        phase_label = '充电' if b['phase'] == 'charge' else '放电'
+        if violations:
+            item['failure_sample'] = sample
+            self.safety_reason = '电池%s保护: %s；请接回适配器' % (phase_label, '；'.join(violations))
             return
         if item['result'] is not None:
             return
@@ -652,7 +709,9 @@ class Supervisor:
         sign = 1 if b['phase'] == 'charge' else -1
         directed = current * sign
         if directed < -cfg['stop_current_ma']:
-            self.finish_item('battery', 'INCOMPLETE', '电流方向异常，需核验电源/负载条件')
+            self.finish_item('battery', 'INCOMPLETE', '电池%s电流方向异常: 实测 %s mA，允许反向幅度 ≤ %s mA；'
+                             '正值表示充电，负值表示放电，请核验电源/负载条件' %
+                             (phase_label, current, cfg['stop_current_ma']))
             return
         duration = cfg[b['phase'] + '_duration_min'] * 60
         # 仅配置单一方向时将所有循环合并，持续充/放电，不要求中途重复切电确认。
@@ -684,7 +743,12 @@ class Supervisor:
         if elapsed < duration and not stop_node:
             return
         if elapsed >= duration and cfg['completion_mode'] == 'stop_node' and not natural:
-            self.finish_item('battery', 'INCOMPLETE', '到达最大阶段时间，未确认正常停止节点')
+            self.finish_item('battery', 'INCOMPLETE', '电池%s已监测 %.1f/%s 秒，未确认停止节点: '
+                             '电流 %s mA、SOC %s%%；要求绝对电流 ≤ %s mA 连续 %s 次（当前 %s 次），%s' % (
+                                 phase_label, elapsed, duration, current, sample['soc_pct'], cfg['stop_current_ma'],
+                                 cfg['stop_confirm_samples'], b['stop_count'],
+                                 '充电 SOC ≥ 99%' if b['phase'] == 'charge' else (
+                                     '放电 SOC ≤ %g%%' % (min_soc + 2) if min_soc is not None else '未设置放电 SOC 条件')))
             return
         b['segments'].append({'phase': b['phase'], 'index': b['index'], 'effective_s': min(elapsed, duration),
                               'end_soc': sample['soc_pct'], 'stop_reason': '停止节点' if stop_node else '到时'})
@@ -708,7 +772,7 @@ class Supervisor:
         if self.stop_requested.is_set():
             return
         if data.get('kernel_errors'):
-            self.safety_reason = '检测到新的内核/OOM/I/O 错误，详见采样证据'
+            self.safety_reason = '检测到新的内核错误: ' + '；'.join(data['kernel_errors'])
         if data.get('kernel_log_gap'):
             raise RuntimeError('内核环形日志缺段，证据不足')
         if self.plan['items']['battery']['enabled']:
@@ -730,6 +794,8 @@ class Supervisor:
             if key not in ('battery', 'storage'):
                 item['effective_s'] = min(elapsed, item['planned_s'])
             if key in ('cpu', 'ddr'):
+                if key == 'cpu':
+                    item['last_sample'] = data.get('cpu', {})
                 process = self.processes.get(key)
                 if process is None:
                     continue
@@ -749,18 +815,25 @@ class Supervisor:
                                (p['ppid'] != item['pid'] or p['name'].startswith('stress-ng-vm'))]
                     group['worker_swap_bytes'] = sum(p['swap_bytes'] for p in workers)
                     item['memory_latest'] = data['ddr_process_memory'] = group
+                    item['last_sample'] = group
                     swapping = group['worker_swap_bytes'] > 0
                 if swapping:
-                    self.finish_item(key, 'INCOMPLETE', 'DDR 压测 worker 出现 swap 换出，需降低内存负载后重试')
+                    self.finish_item(key, 'INCOMPLETE', 'DDR 压测 worker 换出 %.1f KiB（要求 0 KiB），'
+                                     '内存负载 %.1f MiB；需降低内存负载后重试' % (
+                                         group['worker_swap_bytes'] / 1024, self.info['ddr_bytes'] / 2**20))
                 elif elapsed >= item['planned_s']:
                     # 正常到时先等 stress-ng 汇总；非零退出和清理失败仍不能通过。
                     if code is not None or key in self.timed_out or elapsed >= item['planned_s'] + 5:
                         self.finish_item(key, 'PASS', '计划时长已到，已核验压测退出和进程清理')
                     continue
                 elif code is not None:
-                    self.finish_item(key, 'FAIL' if code else 'INCOMPLETE', '压测进程提前退出: %s' % code)
+                    detail = runners.process_diagnostics(self.directory, key)
+                    self.finish_item(key, 'FAIL' if code else 'INCOMPLETE', '%s 压测进程提前退出: 退出码 %s，'
+                                     '已运行 %.1f/%s 秒%s' % (key.upper(), code, elapsed, item['planned_s'],
+                                                                          '；' + detail if detail else ''))
                 elif key == 'cpu' and elapsed > cfg['grace_s'] and data['cpu']['busy_pct'] is not None and data['cpu']['busy_pct'] < cfg['target_busy_pct']:
-                    self.finish_item(key, 'FAIL', 'CPU 有效计算忙碌率未达到目标')
+                    self.finish_item(key, 'FAIL', 'CPU 有效计算忙碌率 %.1f%%，要求 ≥ %.1f%%；已过启动宽限 %s 秒' % (
+                        data['cpu']['busy_pct'], cfg['target_busy_pct'], cfg['grace_s']))
             elif key == 'battery':
                 pass  # 电池采样与保护在上方执行，包括项目完成后的剩余综合负载阶段。
             elif key in ('usb', 'hdmi', 'lte'):
@@ -776,11 +849,19 @@ class Supervisor:
                     elif key == 'hdmi':
                         data[key] = collectors.hdmi_sample(self.info['hdmi_paths'])
                     else:
-                        data[key] = lte.sample(cfg)
+                        try:
+                            data[key] = lte.sample(cfg)
+                        finally:
+                            # AT 读取可能耗时数秒，按实际返回时间记录监测时长。
+                            elapsed = time.monotonic() - item['started_monotonic']
+                            item['effective_s'] = min(elapsed, item['planned_s'])
+                    item['last_sample'] = data[key]
                     if not data[key]['ok']:
-                        self.finish_item(key, 'FAIL', '连续监测发现异常，详见原始样本；归因待复核')
+                        reason = monitor_reason(key, data[key], cfg, item.get('usb_baseline') if key == 'usb' else None)
+                        self.finish_item(key, 'FAIL', reason)
                 except Exception as exc:
                     data[key] = {'ok': False, 'error': str(exc)}
+                    item['last_sample'] = data[key]
                     self.finish_item(key, 'INCOMPLETE', '采样失败: ' + str(exc))
             if self.safety_reason:
                 self.emit('metric', data)
