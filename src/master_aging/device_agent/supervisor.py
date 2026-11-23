@@ -18,7 +18,7 @@ import time
 from ..domain.models import conclusion, digest, utc_now
 from ..domain.execution_log import format_record
 from ..domain.policies import validate_plan
-from . import collectors, lte, runners
+from . import collectors, lte, recovery, runners
 
 ROOT = Path('/var/tmp/master-aging')
 
@@ -62,7 +62,7 @@ def ddr_allocation(memory, config):
     return {'bytes': allocation, 'available_bytes': available, 'reserve_bytes': reserve}
 
 
-def preflight(plan, expected, emit=None):
+def preflight(plan, expected, emit=None, current_run_id=None):
     validate_plan(plan)
     info = collectors.probe()
     info['tool_versions'] = {}
@@ -72,6 +72,10 @@ def preflight(plan, expected, emit=None):
         raise ValueError('真实硬件与 SN 机型无法核验一致；请确认设备树/固件')
     if expected.get('fingerprint') and info['fingerprint'] != expected['fingerprint']:
         raise ValueError('设备指纹发生变化')
+    if current_run_id:
+        info['environment_recovery'] = recovery.prepare(ROOT, current_run_id, plan, info, emit, atomic_json)
+        if any(value['process_cleanup'] for value in info['environment_recovery']):
+            info['memory'] = collectors.memory()
     temperature_limit = plan.get('protection', {}).get('cpu_stop_temperature_c')
     if temperature_limit is not None:
         if not info['temperatures']:
@@ -109,7 +113,7 @@ def preflight(plan, expected, emit=None):
             if ledger.exists():
                 data = json.loads(ledger.read_text())
                 if data.get('unresolved_bytes'):
-                    raise ValueError('目标盘存在未决写入预留，需要人工核对后才能进行新的存储测试')
+                    raise ValueError('目标盘历史预留自动恢复未完成，无法确认旧测试目录已清理: ' + str(ledger))
                 limit = cfg.get('cumulative_write_budget_gib')
                 if limit is not None and data['reserved_bytes'] + total_plan > limit * 2**30:
                     raise ValueError('该盘累计剩余批准预算不足以完成计划')
@@ -258,8 +262,29 @@ class Supervisor:
                 if task['last_fio'].get('fio_error') in (errno.EIO, errno.EILSEQ):
                     errors.append('fio 报告 I/O 或数据校验错误（errno=%s）' % task['last_fio']['fio_error'])
         self.cleanup_storage_files()
+        self.close_storage_reservations()
         self.status['items']['storage']['storage_progress'] = self.storage_progress()
         return errors
+
+    def close_storage_reservations(self):
+        for name, task in self.storage.items():
+            ledger = self.status['write_ledger'][name]
+            if not ledger.get('unresolved_bytes') or name in self.processes:
+                continue
+            if task.get('file') and not task.get('file_cleanup', {}).get('removed'):
+                continue
+            try:
+                resolution = recovery.close_reservation(ROOT, ledger['identity'], self.request['run_id'],
+                    {'fio': task.get('last_fio', {}), 'cleanup': self.status.get('process_cleanup', {}).get(name),
+                     'file_cleanup': task.get('file_cleanup'), 'completed_rounds': task['completed']}, atomic_json)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                task['reservation_cleanup_error'] = str(exc)
+                continue
+            if resolution:
+                ledger['unverified_bytes'] = ledger.get('unverified_bytes', 0) + ledger['unresolved_bytes']
+                ledger['unresolved_bytes'] = 0
+                ledger['resolution'] = resolution
+                task.pop('reservation_cleanup_error', None)
 
     def cleanup_storage_files(self):
         """仅在进程组已确认停止、证据已读取后删除本次运行的测试文件。"""
@@ -332,6 +357,8 @@ class Supervisor:
                     file_cleanup = value.get('file_cleanup', {})
                     detail += '，临时文件%s' % ('已清理' if file_cleanup.get('removed') else '未清理')
                 details.append(detail)
+                if value.get('reservation_cleanup_error'):
+                    details.append('未决预留自动归档失败: ' + value['reservation_cleanup_error'])
             reason += '；' + '；'.join(details)
         item.update(result=result, stop_reason=reason, finished_at=utc_now())
         self.emit('event', {'item': key, 'result': result, 'reason': reason,
@@ -426,6 +453,7 @@ class Supervisor:
                        'last_fio': task.get('last_fio', {}),
                        'result_file': task['result_path'].name if task.get('result_path') else None,
                        'file_cleanup': task.get('file_cleanup', {}),
+                       'reservation_cleanup_error': task.get('reservation_cleanup_error'),
                        'cleanup': self.status.get('process_cleanup', {}).get(name, {})}
                 for name, task in self.storage.items()}
 
@@ -776,7 +804,8 @@ class Supervisor:
     def run(self):
         try:
             self.emit('event', {'state': 'PREFLIGHT', 'reason': '开始设备预检'})
-            self.info = preflight(self.plan, self.request['device'], emit=self.emit)
+            self.info = preflight(self.plan, self.request['device'], emit=self.emit,
+                                  current_run_id=self.request['run_id'])
             self.status['hardware'] = self.info
             self.collector = collectors.SystemCollector()
             self.start_items()
@@ -828,13 +857,13 @@ class Supervisor:
                     self.stop_process(name)
                 except Exception as exc:
                     cleanup_errors.append(name + ': ' + str(exc))
+            storage_errors = self.storage_stop_evidence() if self.storage else []
             if storage_retried:
                 # 首次回收失败时结果可能尚未落盘，最终重试后重新分析并刷新证据。
-                errors = self.storage_stop_evidence()
                 item = self.status['items']['storage']
-                if errors:
+                if storage_errors:
                     item['result'] = 'FAIL'
-                    item['stop_reason'] += '；最终回收分析：' + '；'.join(errors)
+                    item['stop_reason'] += '；最终回收分析：' + '；'.join(storage_errors)
                 confirmed = all(value.get('cleanup', {}).get('confirmed') for value in
                                 item['storage_progress'].values() if value['pending'])
                 item['stop_reason'] += '；最终重试后进程回收' + ('已确认' if confirmed else '未确认')
@@ -847,6 +876,11 @@ class Supervisor:
                            if task.get('file_cleanup') and not task['file_cleanup'].get('removed')}
             self.status['file_cleanup_errors'] = file_errors
             self.status['file_cleanup_confirmed'] = not file_errors
+            reservation_errors = {name: task.get('reservation_cleanup_error') or '进程或临时文件清理未确认'
+                                  for name, task in self.storage.items()
+                                  if self.status['write_ledger'][name].get('unresolved_bytes')}
+            self.status['reservation_cleanup_errors'] = reservation_errors
+            self.status['reservation_cleanup_confirmed'] = not reservation_errors
             if self.status['state'] != 'BLOCKED':
                 self.status['state'] = 'FINISHED'
                 if self.safety_reason:

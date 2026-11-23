@@ -144,6 +144,108 @@ class Process:
             self.err.close()
 
 
+def _recovery_processes():
+    proc = Path('/proc')
+    if not proc.is_dir():
+        raise RuntimeError('无法读取 /proc，不能核验历史负载')
+    members = []
+    for entry in proc.glob('[0-9]*/stat'):
+        try:
+            fields = entry.read_text().rsplit(')', 1)[1].split()
+            if fields[0] in ('Z', 'X'):
+                continue
+            cwd = os.readlink(str(entry.parent / 'cwd'))
+            if cwd.endswith(' (deleted)'):
+                cwd = cwd[:-10]
+            members.append({'pid': int(entry.parent.name), 'pgid': int(fields[2]), 'session': int(fields[3]),
+                            'start': fields[19],
+                            'argv': (entry.parent / 'cmdline').read_bytes().split(b'\x00'),
+                            'cwd': cwd})
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            raise RuntimeError('权限不足，无法核验设备进程残留') from exc
+    return members
+
+
+def recover_run_processes(directories):
+    """按工作目录与负载参数共同识别旧负载，禁止只凭历史 PID 或名称杀进程。"""
+    known = {str(path.resolve()): path.name for path in directories}
+    initial = _recovery_processes()
+    groups = {}
+    for member in initial:
+        run_id = known.get(member['cwd'])
+        if not run_id:
+            continue
+        argv = member['argv']
+        executable = Path(os.fsdecode(argv[0])).name if argv else ''
+        wrapper = PARENT_GUARD.encode() in argv
+        fio = executable == 'fio' and any(
+            arg.startswith(b'--filename=') and arg.endswith(('.master-aging-' + run_id + '.bin').encode())
+            for arg in argv)
+        if not (wrapper or fio or executable == 'stress-ng' or executable.startswith('stress-ng-')):
+            continue
+        pgid = member['pgid']
+        if member['session'] != pgid:
+            # 本工具用 start_new_session=True 创建负载，普通 shell 下的同名工具不属于本次。
+            continue
+        if pgid <= 1 or pgid == os.getpgrp():
+            raise RuntimeError('旧负载进程组身份无效，未发送停止信号')
+        groups.setdefault(pgid, {'run_id': run_id, 'members': []})['members'].append(member)
+    evidence = {}
+
+    def verified_live_groups():
+        snapshot = _recovery_processes()
+        live = {}
+        for pgid, group in groups.items():
+            members = [p for p in snapshot if p['pgid'] == pgid]
+            if not members:
+                continue
+            cookies = {(p['pid'], p['start']) for p in group['members']}
+            if not any((p['pid'], p['start']) in cookies for p in members):
+                raise RuntimeError('旧负载 PID 已变化，未发送停止信号')
+            directory = next(path for path, run_id in known.items() if run_id == group['run_id'])
+            if any(p['cwd'] != directory or p['session'] != pgid for p in members):
+                raise RuntimeError('旧负载进程组成员身份不一致，未发送停止信号')
+            group['members'] = members
+            live[pgid] = members
+        return live
+
+    # 先向全部已核验进程组发送 TERM，再等待、强制清理与核验。
+    for pgid, group in groups.items():
+        if pgid not in verified_live_groups():
+            continue
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    pending = set(groups)
+    while pending:
+        live = set(verified_live_groups())
+        pending.intersection_update(live)
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    for pgid in pending:
+        if pgid not in verified_live_groups():
+            continue
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while pending:
+        pending.intersection_update(verified_live_groups())
+        if pending and time.monotonic() >= deadline:
+            raise RuntimeError('自动回收旧负载失败，仍有运行进程组: %s' % sorted(pending))
+        if pending:
+            time.sleep(0.05)
+    for pgid, group in groups.items():
+        evidence.setdefault(group['run_id'], []).append({'pgid': pgid, 'confirmed': True, 'utc': time.time()})
+    return evidence
+
+
 def fio_args(path, size, output):
     return ['fio', '--name=aging-verify', '--filename=' + str(path), '--rw=write',
             '--size=' + str(size), '--io_size=' + str(size), '--bs=1M', '--numjobs=1',

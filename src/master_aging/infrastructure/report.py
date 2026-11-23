@@ -1,11 +1,13 @@
 """完全离线的 HTML、CSV/JSON；HTML 中的设备字段统一转义。"""
+import base64
 import csv
 from datetime import datetime, timezone
 import hashlib
 from html import escape
 import json
+import sys
 import threading
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 from ..domain.models import ITEMS
 from ..domain.execution_log import format_record
@@ -114,8 +116,21 @@ def event_timeline(records):
     return body + '</tbody></table></div>'
 
 
+@lru_cache(maxsize=1)
+def favicon_url():
+    if getattr(sys, 'frozen', False):
+        path = Path(sys._MEIPASS) / 'vdian.ico'
+    else:
+        path = Path(__file__).resolve().parents[2] / 'ui' / 'icon' / 'vdian.ico'
+    return 'data:image/x-icon;base64,' + base64.b64encode(path.read_bytes()).decode('ascii')
+
+
 def document(title, body):
-    return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>' + text(title) + '</title><style>' + STYLE + '</style><main>' + body + '</main></html>'
+    return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width">'
+            '<link rel="icon" type="image/x-icon" href="' + favicon_url() + '">'
+            '<title>' + text(title) + '</title><style>' + STYLE
+            + '</style></head><body><main>' + body + '</main></body></html>')
 
 
 def chart(label, points):
