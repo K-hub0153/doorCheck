@@ -385,9 +385,16 @@ class MainWindow(QMainWindow):
 
     def switch_mode(self):
         if not self.quality_mode:
-            password, accepted = QInputDialog.getText(self, '', '请输入质检密码', QLineEdit.Password)
-            if not accepted:
+            dialog = QInputDialog(self, Qt.Dialog | Qt.FramelessWindowHint)
+            dialog.setInputMode(QInputDialog.TextInput)
+            dialog.setLabelText('请输入质检密码')
+            dialog.setTextEchoMode(QLineEdit.Password)
+            dialog.setOkButtonText('确定')
+            dialog.setCancelButtonText('取消')
+            dialog.setMinimumWidth(320)
+            if dialog.exec_() != QDialog.Accepted:
                 return
+            password = dialog.textValue()
             if password != 'wd24qc':
                 QMessageBox.warning(self, '切换失败', '质检密码错误')
                 return
