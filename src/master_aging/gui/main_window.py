@@ -153,25 +153,30 @@ class MainWindow(QMainWindow):
         self.plan_label.setObjectName('planSummary')
         self.plan_label.setWordWrap(True)
         content_layout.addWidget(self.plan_label)
-        actions = QGridLayout()
+        actions = self.actions_layout = QGridLayout()
         actions.setSpacing(8)
-        for row, specs in enumerate([
+        for col in range(6):
+            actions.setColumnStretch(col, 1)
+        self.action_rows = []
+        for specs in [
             [('配置计划', self.configure, None), ('读取设备信息', self.probe_selected, 'secondary'),
              ('开始选中设备', self.start, 'start')],
             [('停止选中设备', self.stop_selected, 'danger'), ('停止整批', self.stop_all, 'danger'),
-             ('执行日志', self.open_current_log, 'secondary')]]):
-            for col, (text, action, role) in enumerate(specs):
+             ('执行日志', self.open_current_log, 'secondary')]]:
+            buttons = []
+            for text, action, role in specs:
                 button = QPushButton(text)
                 if role:
                     button.setProperty('role', role)
                 button.clicked.connect(action)
-                actions.addWidget(button, row, col)
+                buttons.append(button)
                 if text == '配置计划':
                     self.configure_button = button
-                    button.hide()
                 if text == '读取设备信息':
                     self.probe_button = button
                     button.setToolTip('读取设备 SN、机型、内存、存储和工具状态；开始老化时会自动读取。勾选可批量读取，未勾选时读取当前查看的设备。')
+            self.action_rows.append(buttons)
+        self.update_action_layout()
         content_layout.addLayout(actions)
         self.tabs = QTabWidget()
         content_layout.addWidget(self.tabs, 1)
@@ -368,16 +373,26 @@ class MainWindow(QMainWindow):
         for device in devices:
             self.probe(device)
 
+    def update_action_layout(self):
+        while self.actions_layout.count():
+            self.actions_layout.takeAt(0)
+        self.configure_button.setVisible(self.quality_mode)
+        for row, buttons in enumerate(self.action_rows):
+            visible = [button for button in buttons if button is not self.configure_button or self.quality_mode]
+            span = 6 // len(visible)
+            for col, button in enumerate(visible):
+                self.actions_layout.addWidget(button, row, col * span, 1, span)
+
     def switch_mode(self):
         if not self.quality_mode:
-            password, accepted = QInputDialog.getText(self, '切换质检模式', '请输入质检密码', QLineEdit.Password)
+            password, accepted = QInputDialog.getText(self, '', '请输入质检密码', QLineEdit.Password)
             if not accepted:
                 return
             if password != 'wd24qc':
                 QMessageBox.warning(self, '切换失败', '质检密码错误')
                 return
         self.quality_mode = not self.quality_mode
-        self.configure_button.setVisible(self.quality_mode)
+        self.update_action_layout()
         mode = '质检模式' if self.quality_mode else '生产模式'
         self.mode_label.setText('当前模式：' + mode)
         self.mode_button.setText('切换生产模式' if self.quality_mode else '切换质检模式')
