@@ -38,7 +38,7 @@ def format_record(record):
             prefix, data.get('cpu', {}).get('busy_pct'), memory.get('MemAvailable', 0) / 2**20,
             max(0, memory.get('SwapTotal', 0) - memory.get('SwapFree', 0)) / 2**20))
         for key, label in (('battery', '电池'), ('ddr_process_memory', 'DDR 进程内存'),
-                           ('usb', 'USB'), ('hdmi', 'HDMI'), ('kernel_errors', '内核异常')):
+                           ('kernel_errors', '内核异常')):
             if data.get(key):
                 lines.append(label + '：' + json.dumps(data[key], ensure_ascii=False))
     else:

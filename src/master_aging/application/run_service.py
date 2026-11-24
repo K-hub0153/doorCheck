@@ -25,6 +25,7 @@ class RunService:
         self.pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix='master-aging')
         self._lock = threading.Lock()
         self.active = {}
+        self.power_confirmed_batches = set()
         self.detaching = threading.Event()
 
     def notify(self, run_id, status):
@@ -66,18 +67,19 @@ class RunService:
             snapshot['config_hash'] = digest(plan)
             (directory / 'config_snapshot.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
             self.repository.create(batch_id, run_id, device, snapshot, directory)
-            state = self._register(run_id, device)
+            state = self._register(run_id, device, batch_id)
             self.pool.submit(self._run, run_id, device, snapshot, directory, state, gate, False)
             ids.append(run_id)
         return ids
 
-    def _register(self, run_id, device):
+    def _register(self, run_id, device, batch_id):
         with self._lock:
             if run_id in self.active:
                 raise ValueError('该运行正在连接或执行')
             if any(s['device']['sn'] == device['sn'] for s in self.active.values()):
                 raise ValueError('同一 SN 已有本地运行，先停止或恢复原运行')
-            state = {'device': device, 'stop': threading.Event(), 'commands': queue.Queue(),
+            state = {'device': device, 'batch_id': batch_id, 'status': {}, 'confirmation_queued': False,
+                     'stop': threading.Event(), 'commands': queue.Queue(),
                      'wake': threading.Event(), 'future_done': threading.Event()}
             self.active[run_id] = state
             return state
@@ -88,7 +90,7 @@ class RunService:
             raise ValueError('运行已结束或不存在')
         device = {'sn': row['sn'], 'ip': str(ipaddress.IPv4Address(ip or row['ip']))}
         plan = json.loads(row['snapshot'])
-        state = self._register(run_id, device)
+        state = self._register(run_id, device, row['batch_id'])
         self.pool.submit(self._run, run_id, device, plan, Path(row['output_dir']), state, threading.Semaphore(1), True)
 
     def stop(self, run_id):
@@ -97,13 +99,42 @@ class RunService:
                 self.active[run_id]['stop'].set()
                 self.active[run_id]['wake'].set()
 
-    def confirm(self, run_id, phase, token, operator=''):
+    def confirm_batch(self, run_id):
+        """人工确认作用于整批；尚在部署的设备待首次等待电源时自动提交。"""
         with self._lock:
-            if run_id in self.active:
-                self.active[run_id]['commands'].put({'phase': phase, 'token': token, 'operator': operator})
-                self.active[run_id]['wake'].set()
+            if run_id not in self.active:
+                return []
+            batch_id = self.active[run_id]['batch_id']
+            self.power_confirmed_batches.add(batch_id)
+            ids = []
+            for member_id, control in self.active.items():
+                if control['batch_id'] == batch_id:
+                    ids.append(member_id)
+                    self._queue_power_confirmation(control)
+            return ids
+
+    def _queue_power_confirmation(self, control):
+        # 调用方持有 _lock；各设备仍使用自己的阶段/序号，保留设备端核验与重试。
+        status = control['status']
+        battery = status.get('battery', {})
+        item = status.get('items', {}).get('battery')
+        if (control['batch_id'] not in self.power_confirmed_batches or control['confirmation_queued']
+                or control['stop'].is_set() or self.detaching.is_set()
+                or status.get('state') not in ('RUNNING', 'WAIT_OPERATOR')
+                or item is None or item.get('result') is not None or battery.get('confirmed')
+                or battery.get('state') != 'WAIT_OPERATOR' or battery.get('phase') not in ('charge', 'discharge')
+                or not isinstance(battery.get('index'), int)):
+            return
+        control['commands'].put({'phase': battery['phase'], 'token': battery['index'], 'operator': ''})
+        control['confirmation_queued'] = True
+        control['wake'].set()
 
     def _store(self, run_id, status, directory):
+        with self._lock:
+            control = self.active.get(run_id)
+            if control:
+                control['status'] = deepcopy(status)
+                self._queue_power_confirmation(control)
         self.repository.save_status(run_id, status)
         (directory / 'summary.json').write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
         with (directory / 'controller.log').open('a', encoding='utf-8') as stream:

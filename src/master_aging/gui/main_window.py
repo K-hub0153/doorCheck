@@ -7,7 +7,7 @@ import queue
 from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtGui import QColor, QDesktopServices
 from PyQt5.QtWidgets import (QAbstractItemView, QDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-                             QInputDialog, QLabel, QMainWindow, QMessageBox,
+                             QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
                              QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QTabWidget,
                              QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 from ..adapters.discovery import Discovery
@@ -37,6 +37,7 @@ class MainWindow(QMainWindow):
         self.repository = Repository()
         self.service = RunService(self.repository)
         self.plan = load_config()
+        self.quality_mode = False
         self.plan_valid = False
         plan_error = None
         try:
@@ -132,7 +133,12 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout(workspace)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(12)
-        right.addWidget(self.header('老化监控'))
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.header('老化监控'), 1)
+        self.mode_label = QLabel('当前模式：生产模式')
+        mode_row.addWidget(self.mode_label)
+        self.mode_button = self.button('切换质检模式', self.switch_mode, mode_row, 'secondary')
+        right.addLayout(mode_row)
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(16, 0, 16, 16)
@@ -160,6 +166,9 @@ class MainWindow(QMainWindow):
                     button.setProperty('role', role)
                 button.clicked.connect(action)
                 actions.addWidget(button, row, col)
+                if text == '配置计划':
+                    self.configure_button = button
+                    button.hide()
                 if text == '读取设备信息':
                     self.probe_button = button
                     button.setToolTip('读取设备 SN、机型、内存、存储和工具状态；开始老化时会自动读取。勾选可批量读取，未勾选时读取当前查看的设备。')
@@ -359,7 +368,36 @@ class MainWindow(QMainWindow):
         for device in devices:
             self.probe(device)
 
+    def switch_mode(self):
+        if not self.quality_mode:
+            password, accepted = QInputDialog.getText(self, '切换质检模式', '请输入质检密码', QLineEdit.Password)
+            if not accepted:
+                return
+            if password != 'wd24qc':
+                QMessageBox.warning(self, '切换失败', '质检密码错误')
+                return
+        self.quality_mode = not self.quality_mode
+        self.configure_button.setVisible(self.quality_mode)
+        mode = '质检模式' if self.quality_mode else '生产模式'
+        self.mode_label.setText('当前模式：' + mode)
+        self.mode_button.setText('切换生产模式' if self.quality_mode else '切换质检模式')
+        if not self.quality_mode:
+            try:
+                self.reload_plan()
+            except Exception as exc:
+                self.error(exc)
+        self.log('已切换为' + mode)
+
+    def reload_plan(self):
+        self.plan_valid = False
+        self.plan_label.setText('配置文件无效，请由质检人员检查计划')
+        self.plan = validate_plan(load_config())
+        self.plan_valid = True
+        self.update_plan_summary()
+
     def configure(self):
+        if not self.quality_mode:
+            return
         dialog = PlanDialog(self.plan, self)
         if dialog.exec_():
             self.plan = dialog.plan
@@ -370,8 +408,9 @@ class MainWindow(QMainWindow):
     def update_plan_summary(self):
         if self.plan_valid:
             selected = ', '.join(ITEMS[k] for k, v in self.plan['items'].items() if v['enabled'])
-            self.plan_label.setText('项目：%s · 并行计划约 %.0f 分钟（另计人工等待）' %
-                                    (selected, planned_seconds(self.plan) / 60))
+            self.plan_label.setText('老化柜：%s · 项目：%s · 并行计划约 %.0f 分钟（另计人工等待）' %
+                                    (self.plan.get('environment', {}).get('cabinet_id') or '未填写',
+                                     selected, planned_seconds(self.plan) / 60))
 
     def start(self):
         try:
@@ -380,6 +419,8 @@ class MainWindow(QMainWindow):
                 raise ValueError('请勾选要运行的设备')
             if any(device['ip'] in self.probing for device in devices):
                 raise ValueError('所选设备正在读取信息，请等待完成后开始老化')
+            if not self.quality_mode:
+                self.reload_plan()
             if not self.plan_valid:
                 self.configure()
                 if not self.plan_valid:
@@ -443,16 +484,19 @@ class MainWindow(QMainWindow):
                 self.power_deferred.discard(key)
         self.refresh_power_confirmation()
 
-    def confirm_battery(self, run_id, phase, token):
-        key = (run_id, phase, token)
+    def confirm_battery(self):
         waiting = self.waiting_power_confirmations()
-        if key not in waiting or run_id in self.power_submitted:
+        if not waiting:
             self.refresh_power_confirmation()
             return
-        self.service.confirm(run_id, phase, token)
-        self.power_submitted.add(run_id)
-        self.update_device_card(run_id)
-        self.log('%s：已提交电源确认，等待设备响应' % waiting[key]['sn'])
+        for run_id in {key[0] for key in waiting}:
+            if run_id in self.power_submitted:
+                continue
+            submitted = self.service.confirm_batch(run_id)
+            self.power_submitted.update(submitted)
+            for submitted_id in submitted:
+                self.update_device_card(submitted_id)
+        self.log('已确认整批电源条件；同批设备准备完成后自动提交确认，等待设备响应')
         self.refresh_power_confirmation()
 
     @staticmethod

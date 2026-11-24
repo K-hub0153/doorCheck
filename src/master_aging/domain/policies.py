@@ -21,7 +21,7 @@ def validate_plan(plan):
         raise ValueError('不支持的计划版本')
     items = plan.get('items', {})
     if set(items) != set(ITEMS) or any(not isinstance(v, dict) for v in items.values()):
-        raise ValueError('计划必须包含全部七个项目的配置')
+        raise ValueError('计划必须包含 CPU、DDR、SSD/eMMC、4G 和电池五个项目的配置')
     if any(not isinstance(v.get('enabled'), bool) for v in items.values()):
         raise ValueError('项目 enabled 必须为布尔值')
     enabled = [k for k, v in items.items() if v.get('enabled')]
@@ -68,8 +68,6 @@ def validate_plan(plan):
         port = lte.get('at_port')
         if port not in (None, '') and (not isinstance(port, str) or not re.fullmatch(r'/dev/tty(?:USB|ACM)\d+', port)):
             raise ValueError('4G AT 口必须为 /dev/ttyUSB数字 或 /dev/ttyACM数字，留空自动识别')
-    if 'usb' in enabled:
-        number(items['usb'].get('min_speed_mbps'), 5000, 40000, 'USB 最低速率 Mbps')
     if 'battery' in enabled:
         battery = items['battery']
         for field in ('charge_duration_min', 'discharge_duration_min'):

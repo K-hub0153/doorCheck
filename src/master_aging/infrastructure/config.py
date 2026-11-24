@@ -18,16 +18,25 @@ def config_path():
     return app_dir() / 'config/master_aging/config.yaml'
 
 
+def normalize_config(plan):
+    """迁移旧配置；历史运行快照保持原样，用于核验和补采。"""
+    result = deepcopy(plan)
+    result.pop('max_parallel_devices', None)
+    for key in ('usb', 'hdmi'):
+        result.get('items', {}).pop(key, None)
+    environment = result.get('environment') or {}
+    result['environment'] = {'cabinet_id': environment.get('cabinet_id', environment.get('chamber_id'))}
+    return result
+
+
 def load_config():
     with config_path().open(encoding='utf-8') as stream:
         result = yaml.safe_load(stream)
-    result.pop('max_parallel_devices', None)
-    return deepcopy(result)
+    return normalize_config(result)
 
 
 def save_config(plan):
-    plan = deepcopy(validate_plan(plan))
-    plan.pop('max_parallel_devices', None)
+    plan = validate_plan(normalize_config(plan))
     path = config_path()
     temporary = None
     try:

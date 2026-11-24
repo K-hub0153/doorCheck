@@ -133,14 +133,6 @@ def preflight(plan, expected, emit=None, current_run_id=None):
         if not info['battery_initial']['valid']:
             detail = '；'.join('%s: %s' % pair for pair in info['battery_initial'].get('errors', {}).items())
             raise ValueError('电池必读寄存器读取失败: ' + (detail or '温度/电压/电流/SOC 数据缺失'))
-    if items['usb']['enabled']:
-        result = collectors.usb_sample(items['usb']['min_speed_mbps'])
-        if not result['ok']:
-            raise ValueError(monitor_reason('usb', result, items['usb']))
-    if items['hdmi']['enabled'] and info['chip'] != 'hisi':
-        result = collectors.hdmi_sample(info['hdmi_paths'])
-        if not result['ok']:
-            raise ValueError(monitor_reason('hdmi', result))
     if items['lte']['enabled']:
         result = lte.sample(items['lte'])
         if emit:
@@ -410,9 +402,7 @@ class Supervisor:
             if (self.directory / 'stop.json').exists():
                 self.finish_item(key, 'ABORTED', '操作者停止，未启动负载')
                 continue
-            if key == 'hdmi' and self.info['chip'] == 'hisi':
-                self.finish_item(key, 'NOT_APPLICABLE', '四代主控无 HDMI')
-            elif key in ('cpu', 'ddr'):
+            if key in ('cpu', 'ddr'):
                 args = ['stress-ng', '--verify', '--metrics-brief']
                 if key == 'cpu':
                     args += ['--cpu', str(self.info['cpu_count']), '--cpu-method', 'all']
@@ -446,11 +436,9 @@ class Supervisor:
                 item['planned_s'] = (config['charge_duration_min'] + config['discharge_duration_min']) * 60 * config['cycles']
                 operation = '接入适配器' if self.battery['phase'] == 'charge' else '拔除适配器，确认放电负载'
                 self.emit('event', {'item': 'battery', 'phase': self.battery['phase'],
-                                    'reason': '请逐设备' + operation + '并确认', 'token': 0})
+                                    'reason': '请为本批全部设备' + operation + '，整批确认一次', 'token': 0})
             elif key == 'lte':
                 item['scope'] = LTE_SCOPE
-            elif key == 'hdmi':
-                item['scope'] = 'HDMI 连接、EDID 与模式；人工显示确认：' + ('已记录' if config.get('display_confirmed') else '未记录')
             if item.get('result') is None:
                 self.emit('event', {'item': key, 'state': 'WAIT_OPERATOR' if key == 'battery' else 'RUNNING',
                                     'reason': '项目已启动，等待首次电源确认' if key == 'battery' else '项目已启动',
@@ -836,28 +824,17 @@ class Supervisor:
                         data['cpu']['busy_pct'], cfg['target_busy_pct'], cfg['grace_s']))
             elif key == 'battery':
                 pass  # 电池采样与保护在上方执行，包括项目完成后的剩余综合负载阶段。
-            elif key in ('usb', 'hdmi', 'lte'):
+            elif key == 'lte':
                 try:
-                    if key == 'usb':
-                        data[key] = collectors.usb_sample(cfg['min_speed_mbps'])
-                        # 夹具身份及 devnum 发生变化保留为重枚举故障。
-                        identities = data[key]['devices']
-                        if 'usb_baseline' not in item:
-                            item['usb_baseline'] = identities
-                        elif item['usb_baseline'] != identities:
-                            data[key]['ok'] = False
-                    elif key == 'hdmi':
-                        data[key] = collectors.hdmi_sample(self.info['hdmi_paths'])
-                    else:
-                        try:
-                            data[key] = lte.sample(cfg)
-                        finally:
-                            # AT 读取可能耗时数秒，按实际返回时间记录监测时长。
-                            elapsed = time.monotonic() - item['started_monotonic']
-                            item['effective_s'] = min(elapsed, item['planned_s'])
+                    try:
+                        data[key] = lte.sample(cfg)
+                    finally:
+                        # AT 读取可能耗时数秒，按实际返回时间记录监测时长。
+                        elapsed = time.monotonic() - item['started_monotonic']
+                        item['effective_s'] = min(elapsed, item['planned_s'])
                     item['last_sample'] = data[key]
                     if not data[key]['ok']:
-                        reason = monitor_reason(key, data[key], cfg, item.get('usb_baseline') if key == 'usb' else None)
+                        reason = monitor_reason(key, data[key])
                         self.finish_item(key, 'FAIL', reason)
                 except Exception as exc:
                     data[key] = {'ok': False, 'error': str(exc)}

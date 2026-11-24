@@ -4,12 +4,7 @@ max_sample_gap_s: 40
 min_free_space_mib: 256
 max_log_mib: 64
 environment:
-  chamber_id: '2'
-  set_temperature_c: 45.0
-  set_humidity_pct: 45.0
-  measured_source: none
-  measured_temperature: null
-  measured_humidity: null
+  cabinet_id: '2'
 items:
   cpu:
     enabled: true
@@ -49,15 +44,6 @@ items:
     stop_current_ma: 50
     stop_confirm_samples: 6
     max_read_failures: 3
-  usb:
-    enabled: true
-    duration_min: 1
-    min_speed_mbps: 5000
-    fixture_confirmed: false
-  hdmi:
-    enabled: true
-    duration_min: 1
-    display_confirmed: false
 protection:
   cpu_stop_temperature_c: null
   battery_charge_temperature_range_c: null

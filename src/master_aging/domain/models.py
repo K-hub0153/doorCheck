@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 ITEMS = {'cpu': 'CPU', 'ddr': 'DDR', 'storage': 'SSD/eMMC', 'lte': '4G',
-         'battery': '电池', 'usb': 'USB', 'hdmi': 'HDMI'}
+         'battery': '电池'}
 FINAL = {'PASS', 'FAIL', 'ABORTED', 'INCOMPLETE', 'NOT_APPLICABLE', 'BLOCKED'}
 
 

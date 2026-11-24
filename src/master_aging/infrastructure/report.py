@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 from html import escape
 import json
+import math
 import sys
 import threading
 from functools import lru_cache, wraps
@@ -23,7 +24,9 @@ a{color:#1a62bf}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(
 .table-scroll{overflow-x:auto}.timeline td{vertical-align:top}.timeline .time{white-space:nowrap;font-variant-numeric:tabular-nums}
 .timeline .event{min-width:130px;font-weight:600}.timeline .description{min-width:260px}
 .timeline details{margin-top:8px}.timeline summary{cursor:pointer;color:#607087;font-size:12px}
-.badge{display:inline-block;border-radius:4px;padding:2px 7px;background:#eef3f9;font-size:12px;margin-left:6px}'''
+.badge{display:inline-block;border-radius:4px;padding:2px 7px;background:#eef3f9;font-size:12px;margin-left:6px}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:8px}.legend span{font-size:12px}
+@media print{body{background:white}main{max-width:none;padding:0}.card{break-inside:avoid}.grid{display:block}svg{height:220px}}'''
 
 RESULT_LABELS = {'PASS': '通过', 'FAIL': '失败', 'INCOMPLETE': '未完成', 'ABORTED': '已停止',
                  'BLOCKED': '预检未通过', 'NOT_APPLICABLE': '不适用'}
@@ -149,10 +152,30 @@ def document(title, body):
             + '</style></head><body><main>' + body + '</main></body></html>')
 
 
-def chart(label, points):
-    valid = [(x, y) for x, y in points if isinstance(y, (int, float))]
-    if len(valid) < 2:
-        return '<div class="card">' + text(label) + '：有效数据不足</div>'
+CURVE_LABELS = ('CPU 忙碌率 %', '最高 CPU 温度 ℃', '电池 SOC %', '电池净电流 mA', '电池电压 mV', '电池温度 ℃')
+CURVE_COLORS = ('#286aca', '#d34b31', '#168458', '#9149b8', '#ae7700', '#02838e', '#c4387b', '#566337')
+
+
+def metric_curves(records):
+    curves = {label: [] for label in CURVE_LABELS}
+    for record in records:
+        if record['kind'] != 'metric':
+            continue
+        data = record['data']
+        battery = data.get('battery', {})
+        temps = [v for v in data.get('temperature_c', {}).values() if finite_number(v)]
+        values = (data.get('cpu', {}).get('busy_pct'), max(temps) if temps else None,
+                  battery.get('soc_pct'), battery.get('current_ma'), battery.get('voltage_mv'), battery.get('temperature_c'))
+        for label, value in zip(CURVE_LABELS, values):
+            curves[label].append((record['monotonic'], value))
+    return curves
+
+
+def finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def reduce_points(valid):
     # 每桶保留极大/极小，保证温度或电流尖峰不会被平均隐藏。
     if len(valid) > 600:
         width = max(1, len(valid) // 300)
@@ -161,23 +184,62 @@ def chart(label, points):
             bucket = valid[start:start + width]
             reduced.extend(sorted({min(bucket, key=lambda p: p[1]), max(bucket, key=lambda p: p[1])}))
         valid = reduced
-    xmin, xmax = valid[0][0], valid[-1][0]
-    ymin, ymax = min(y for _, y in valid), max(y for _, y in valid)
-    # 分段绘制：时间缺口不连线，原始数据始终在 CSV/JSON 中保留。
-    deltas = sorted(b[0] - a[0] for a, b in zip(valid, valid[1:]) if b[0] > a[0])
-    gap_limit = deltas[len(deltas) // 2] * 3 if deltas else 0
-    segments, current, previous = [], [], None
-    for x, y in valid:
-        if previous is not None and x - previous > gap_limit:
-            segments.append(current)
-            current = []
-        current.append('%.2f,%.2f' % (20 + (x - xmin) / max(1, xmax - xmin) * 940,
-                                    150 - (y - ymin) / max(1, ymax - ymin) * 130))
-        previous = x
-    segments.append(current)
-    polylines = ''.join('<polyline fill="none" stroke="#286aca" stroke-width="2" points="' + ' '.join(segment) + '"/>' for segment in segments)
-    return ('<div class="card"><b>' + text(label) + '</b><svg viewBox="0 0 980 180" role="img" aria-label="' + text(label) + '">'
-            + polylines + '</svg><small>最小 %.3f · 最大 %.3f · 时间跨度 %.1f 分钟</small></div>' % (ymin, ymax, (xmax - xmin) / 60))
+    return valid
+
+
+def comparison_chart(label, series):
+    # 先按原始采样缺口分段，再保留桶内极值，避免降采样跨越缺失区间。
+    prepared, legend = [], []
+    for index, (name, points, gap_limit) in enumerate(series):
+        color = CURVE_COLORS[index] if index < len(CURVE_COLORS) else 'hsl(%.1f,65%%,40%%)' % (index * 137.508 % 360)
+        segments, segment, valid, previous = [], [], [], None
+        for x, y in points:
+            if not finite_number(x) or not finite_number(y):
+                if segment:
+                    segments.append(segment)
+                    segment = []
+                previous = None
+                continue
+            if previous is not None and (x <= previous or x - previous > gap_limit):
+                segments.append(segment)
+                segment = []
+            segment.append((x, y))
+            valid.append((x, y))
+            previous = x
+        if segment:
+            segments.append(segment)
+        if valid:
+            prepared.append((color, [reduce_points(part) for part in segments]))
+            suffix = ' · 最小 %.3f / 最大 %.3f / 最新 %.3f' % (min(y for _, y in valid), max(y for _, y in valid), valid[-1][1])
+        else:
+            suffix = ' · 无有效采样'
+        legend.append('<span style="color:' + color + '">● ' + text(name + suffix) + '</span>')
+    body = '<div class="card"><b>' + text(label) + '</b>'
+    if prepared:
+        values = [point for _, segments in prepared for part in segments for point in part]
+        xmin, xmax = min(x for x, _ in values), max(x for x, _ in values)
+        ymin, ymax = min(y for _, y in values), max(y for _, y in values)
+        body += '<svg viewBox="0 0 980 210" role="img" aria-label="' + text(label) + '">'
+        body += '<path d="M85 20 V170 H960" fill="none" stroke="#b0bdcd"/>'
+        for color, segments in prepared:
+            for part in segments:
+                coordinates = [(85 + (x - xmin) / max(1, xmax - xmin) * 875,
+                                170 - (y - ymin) / max(1, ymax - ymin) * 150) for x, y in part]
+                if len(coordinates) == 1:
+                    body += '<circle cx="%.2f" cy="%.2f" r="3" fill="%s"/>' % (*coordinates[0], color)
+                else:
+                    body += '<polyline fill="none" stroke="' + color + '" stroke-width="2" points="' + ' '.join('%.2f,%.2f' % p for p in coordinates) + '"/>'
+        body += ('<g fill="#607087" font-size="13"><text x="3" y="25">%.2f</text><text x="3" y="174">%.2f</text>'
+                 '<text x="85" y="195">%.1f 分钟</text><text x="960" y="195" text-anchor="end">%.1f 分钟</text></g></svg>' %
+                 (ymax, ymin, xmin / 60, xmax / 60))
+    else:
+        body += '<p>有效数据不足</p>'
+    return body + '<div class="legend">' + ''.join(legend) + '</div></div>'
+
+
+def chart(label, points, gap_limit=40):
+    origin = points[0][0] if points else 0
+    return comparison_chart(label, [(label, [(x - origin, y) for x, y in points], gap_limit)])
 
 
 def write_execution_log(row, records):
@@ -256,18 +318,9 @@ def export_report(repository, run_id):
     for key, item in items.items():
         item_result = item.get('result') or 'INCOMPLETE'
         body += '<tr><td>' + text(ITEMS.get(key, key)) + '</td><td>' + text(item.get('planned_s')) + '</td><td>' + text(round(item.get('effective_s', 0), 2)) + '</td><td class="' + text(item_result) + '">' + text(item_result) + '</td><td>' + text(reasons[key]) + '<br>' + text(item_scope(key, item)) + '</td></tr>'
-    body += '</table><p><small>CPU/DDR/存储等为合成负载。HDMI connected 仅代表连接检测，显示确认由操作者记录。日志或时长不足不能判通过。</small></p>'
-    metrics = [r for r in records if r['kind'] == 'metric']
-    curves = {k: [] for k in ('CPU 忙碌率 %', '最高 CPU 温度 ℃', '电池 SOC %', '电池净电流 mA', '电池电压 mV', '电池温度 ℃')}
-    for record in metrics:
-        t, data = record['monotonic'], record['data']
-        b = data.get('battery', {})
-        temps = list(data.get('temperature_c', {}).values())
-        values = [data.get('cpu', {}).get('busy_pct'), max(temps) if temps else None,
-                  b.get('soc_pct'), b.get('current_ma'), b.get('voltage_mv'), b.get('temperature_c')]
-        for key, value in zip(curves, values):
-            curves[key].append((t, value))
-    body += '<h2>采样曲线</h2><div class="grid">' + ''.join(chart(key, points) for key, points in curves.items()) + '</div>'
+    body += '</table><p><small>CPU/DDR/存储等为合成负载。日志或时长不足不能判通过。</small></p>'
+    curves = metric_curves(records)
+    body += '<h2>采样曲线</h2><div class="grid">' + ''.join(chart(key, points, snapshot.get('max_sample_gap_s', 40)) for key, points in curves.items()) + '</div>'
     body += event_timeline(records, reasons)
     for title, value in (('硬件与固件', status.get('hardware')), ('环境记录', snapshot.get('environment')),
                          ('电池阶段与积分', status.get('battery')), ('存储写入账本', status.get('write_ledger')),
@@ -294,15 +347,24 @@ def export_batch(repository, batch_id):
     if not rows:
         return
     directory = Path(rows[0]['output_dir']).parents[1]
-    body = '<h1>主控老化批次报告</h1><p>' + text(batch_id) + '</p><table><tr><th>SN</th><th>IP</th><th>状态</th><th>结论</th><th>报告</th></tr>'
+    body = '<h1>主控老化批次报告</h1><p>批次：' + text(batch_id) + '</p><table><tr><th>SN</th><th>IP</th><th>老化柜编号</th><th>状态</th><th>结论</th><th>报告</th></tr>'
     totals = {}
+    batch_curves = {label: [] for label in CURVE_LABELS}
     for row in rows:
+        snapshot = json.loads(row['snapshot'])
+        environment = snapshot.get('environment', {})
+        records = repository.records(row['run_id'], kind='metric')
+        origin = records[0]['monotonic'] if records else 0
+        for label, points in metric_curves(records).items():
+            batch_curves[label].append((row['sn'], [(x - origin, y) for x, y in points], snapshot.get('max_sample_gap_s', 40)))
         result = row['result'] or 'INCOMPLETE'
         totals[result] = totals.get(result, 0) + 1
         path = Path(row['output_dir']) / 'report.html'
         relative = path.relative_to(directory).as_posix()
-        body += '<tr><td>' + text(row['sn']) + '</td><td>' + text(row['ip']) + '</td><td>' + text(row['state']) + '</td><td class="' + text(result) + '">' + text(result) + '</td><td><a href="' + text(relative) + '">逐设备报告</a></td></tr>'
+        body += '<tr><td>' + text(row['sn']) + '</td><td>' + text(row['ip']) + '</td><td>' + text(environment.get('cabinet_id', environment.get('chamber_id'))) + '</td><td>' + text(row['state']) + '</td><td class="' + text(result) + '">' + text(result) + '</td><td><a href="' + text(relative) + '">逐设备报告</a></td></tr>'
     body += '</table><p>' + text(json.dumps(totals, ensure_ascii=False)) + '</p>'
+    body += '<h2>本批采样曲线汇总</h2><p>横轴为各设备自首次采样起经过的分钟数，颜色区分设备。同一指标共用坐标轴；缺失采样不连线。可直接打印或保存为 PDF 用于汇报。</p>'
+    body += ''.join(comparison_chart(label, series) for label, series in batch_curves.items())
     path = directory / 'batch_report.html'
     path.write_text(document('批次报告', body), encoding='utf-8')
     return path

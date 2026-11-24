@@ -25,9 +25,9 @@ class PlanDialog(QDialog):
         layout.addWidget(QLabel('项目并行运行；电池充放电串行。准备、人工等待与数据缺口不计有效时长。'))
         tabs = self.tabs = QTabWidget()
         layout.addWidget(tabs)
-        general = self.tab(tabs, '项目与环境')
+        general = self.tab(tabs, '项目与老化柜')
         settings = self.tab(tabs, '项目设置')
-        safety = self.tab(tabs, '保护与夹具（选填）')
+        safety = self.tab(tabs, '保护（选填）')
         form = QFormLayout(general)
         self.table = QTableWidget(len(ITEMS), 3)
         self.table.setHorizontalHeaderLabels(['启用', '项目', '有效时长（分钟）'])
@@ -51,7 +51,7 @@ class PlanDialog(QDialog):
             self.table.setCellWidget(row, 2, duration)
             self.checks[key], self.durations[key] = check, duration
         form.addRow(self.table)
-        select = QCheckBox('全选项目（无 HDMI 的四代主控自动标记不适用）')
+        select = QCheckBox('全选项目')
         select.toggled.connect(lambda value: [c.setChecked(value) for c in self.checks.values()])
         form.addRow(select)
         self.charge = self.integer(plan['items']['battery']['charge_duration_min'], 0, 43200)
@@ -67,13 +67,8 @@ class PlanDialog(QDialog):
         form.addRow('电池串行阶段', battery_row)
         form.addRow(QLabel('充电分钟为 0 时只放电，放电分钟为 0 时只充电；两者不能同时为 0。'))
         env = plan.get('environment', {})
-        self.chamber = QLineEdit(str(env.get('chamber_id') or ''))
-        self.temperature = QLineEdit('' if env.get('set_temperature_c') is None else str(env['set_temperature_c']))
-        self.humidity = QLineEdit('' if env.get('set_humidity_pct') is None else str(env['set_humidity_pct']))
-        form.addRow('温箱编号', self.chamber)
-        form.addRow('温箱设定温度 ℃（可空）', self.temperature)
-        form.addRow('温箱设定湿度 %（可空）', self.humidity)
-        form.addRow(QLabel('温箱设定值仅作为条件记录；实际温湿度无传感器时留空。'))
+        self.cabinet = QLineEdit(str(env.get('cabinet_id') or ''))
+        form.addRow('老化柜编号', self.cabinet)
         options = QVBoxLayout(settings)
         execution = QFormLayout()
         self.interval = self.integer(plan['sample_interval_s'], 1, 60)
@@ -148,14 +143,9 @@ class PlanDialog(QDialog):
             self.protection_enabled[key] = toggle
             controls.addRow(toggle, row)
             self.ranges[key] = (lower, upper, label)
-        self.fixture = QCheckBox('已插入 USB 3.x 测试夹具，并确认线材/接口条件')
-        self.fixture.setChecked(plan['items']['usb'].get('fixture_confirmed', False))
-        self.display = QCheckBox('已人工确认 HDMI 显示测试图案（四代主控无此接口）')
-        self.display.setChecked(plan['items']['hdmi'].get('display_confirmed', False))
         self.direction = QCheckBox('已验证电池净电流：充电为正，放电为负')
         self.direction.setChecked(plan['items']['battery'].get('current_direction_confirmed', False))
-        for widget in (self.fixture, self.display, self.direction):
-            controls.addRow(widget)
+        controls.addRow(self.direction)
         controls.addRow(QLabel('电池阶段切换时，按主界面提示接入或断开电源适配器。'))
         controls.addRow(QLabel('已启用的电池保护触发后，请按提示接回适配器。'))
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -205,8 +195,6 @@ class PlanDialog(QDialog):
             plan['max_sample_gap_s'] = max(plan['max_sample_gap_s'], self.interval.value() * 2)
             plan['items']['cpu']['target_busy_pct'] = self.cpu_target.value()
             plan['items']['ddr']['max_memory_pct'] = self.ddr_ratio.value()
-            plan['items']['usb']['fixture_confirmed'] = self.fixture.isChecked()
-            plan['items']['hdmi']['display_confirmed'] = self.display.isChecked()
             storage = plan['items']['storage']
             storage['targets'] = [target.strip() for target in self.storage_targets.text().split(',') if target.strip()]
             storage['write_budget_gib'] = self.storage_budget.value()
@@ -223,12 +211,7 @@ class PlanDialog(QDialog):
                     except ValueError:
                         raise ValueError(label + '需填写最低和最高温度')
             plan.pop('station_isolation_confirmed', None)
-            env = plan.setdefault('environment', {})
-            env.update(chamber_id=self.chamber.text().strip() or None,
-                set_temperature_c=float(self.temperature.text()) if self.temperature.text().strip() else None,
-                set_humidity_pct=float(self.humidity.text()) if self.humidity.text().strip() else None)
-            if env['set_humidity_pct'] is not None and not 0 <= env['set_humidity_pct'] <= 100:
-                raise ValueError('湿度需为 0～100%')
+            plan['environment'] = {'cabinet_id': self.cabinet.text().strip() or None}
             validate_plan(plan)
             save_config(plan)
             self.plan = plan
