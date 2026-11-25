@@ -165,7 +165,8 @@ class MainWindow(QMainWindow):
              ('执行日志', self.open_current_log, 'secondary')]]:
             buttons = []
             for text, action, role in specs:
-                button = QPushButton(text)
+                # 隐藏按钮也需归属内容区，避免首次显示时短暂成为独立窗口。
+                button = QPushButton(text, content)
                 if role:
                     button.setProperty('role', role)
                 button.clicked.connect(action)
