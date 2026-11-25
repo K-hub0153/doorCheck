@@ -226,6 +226,23 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([350, 990])
         self.statusBar().showMessage('就绪')
+        self.toast_label = QLabel(root)
+        self.toast_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.toast_label.setStyleSheet(
+            'background: #323232; color: white; padding: 10px 20px; border-radius: 6px;')
+        self.toast_label.hide()
+        self.toast_timer = QTimer(self)
+        self.toast_timer.setSingleShot(True)
+        self.toast_timer.timeout.connect(self.toast_label.hide)
+
+    def show_toast(self, message):
+        self.toast_label.setText(message)
+        self.toast_label.adjustSize()
+        self.toast_label.move(
+            max(0, (self.centralWidget().width() - self.toast_label.width()) // 2), 24)
+        self.toast_label.raise_()
+        self.toast_label.show()
+        self.toast_timer.start(3000)
 
     def log(self, message):
         self.messages.appendPlainText(message)
@@ -397,7 +414,7 @@ class MainWindow(QMainWindow):
                 return
             password = dialog.textValue()
             if password != 'wd24qc':
-                QMessageBox.warning(self, '切换失败', '质检密码错误')
+                self.show_toast('质检密码错误')
                 return
         self.quality_mode = not self.quality_mode
         self.update_action_layout()
