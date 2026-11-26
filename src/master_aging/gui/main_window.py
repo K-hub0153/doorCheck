@@ -15,9 +15,9 @@ from ..adapters.ssh_transport import SSHTransport
 from ..application.run_service import RunService
 from ..domain.models import ITEMS
 from ..domain.policies import planned_seconds, validate_plan
-from ..infrastructure.config import load_config, runtime_dir
+from ..infrastructure.config import load_config
 from ..infrastructure.repository import Repository
-from ..infrastructure.report import export_report
+from ..infrastructure.report_server import ReportServer
 from .plan_dialog import PlanDialog
 from .power_confirmation_dialog import PowerConfirmationDialog
 from .execution_log_dialog import ExecutionLogDialog
@@ -36,6 +36,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self.repository = Repository()
         self.service = RunService(self.repository)
+        self.report_server = ReportServer(self.repository)
         self.plan = load_config()
         self.quality_mode = False
         self.plan_valid = False
@@ -64,12 +65,9 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(400)
         self.load_history()
-        unfinished = self.repository.runs(unfinished=True)
-        self.log('本地目录：' + str(runtime_dir()))
+        self.log('数据存储：MySQL ' + self.repository.description)
         if plan_error:
             self.log('已读取的计划需要重新配置：' + plan_error)
-        if unfinished:
-            self.log('发现 %s 条未结束运行，可在历史记录中选择“恢复补采”；恢复不会重复启动负载。' % len(unfinished))
 
     def button(self, text, action, layout, role=None):
         button = QPushButton(text)
@@ -187,7 +185,7 @@ class MainWindow(QMainWindow):
         history_layout = QVBoxLayout(history)
         history_actions = QHBoxLayout()
         self.button('刷新', self.load_history, history_actions, 'secondary')
-        self.button('HTML 报告', self.open_report, history_actions)
+        self.button('查看报告', self.open_report, history_actions)
         self.button('执行日志', self.open_history_log, history_actions, 'secondary')
         self.button('批次报告', self.open_batch, history_actions, 'secondary')
         self.button('恢复补采', self.resume, history_actions, 'secondary')
@@ -216,10 +214,9 @@ class MainWindow(QMainWindow):
         self.messages.setMaximumBlockCount(1000)
         self.tabs.addTab(self.messages, '操作日志')
         footer = QHBoxLayout()
-        hint = QLabel('结果保存在本机 · HTML 报告 / SQLite')
+        hint = QLabel('历史、日志与附件统一保存至 MySQL · 报告按需查看')
         hint.setObjectName('muted')
         footer.addWidget(hint, 1)
-        self.button('打开结果目录', lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(runtime_dir()))), footer, 'secondary')
         content_layout.addLayout(footer)
         splitter.addWidget(workspace)
         splitter.setStretchFactor(0, 0)
@@ -486,7 +483,7 @@ class MainWindow(QMainWindow):
         self.service.shutdown()
         self.power_stopping.update(self.run_devices)
         self.refresh_power_confirmation()
-        self.log('已请求停止全部本地活动运行')
+        self.log('已请求停止本工具控制的全部活动运行')
 
     def waiting_power_confirmations(self):
         waiting = {}
@@ -565,7 +562,7 @@ class MainWindow(QMainWindow):
         status = self.statuses.get(run_id, {})
         if not status:
             return
-        reason = status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
+        reason = status.get('storage_error') or status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
         latest = status.get('latest', {})
         temps = list(latest.get('temperature_c', {}).values())
         remaining = ', '.join('%s %.0fm' % (ITEMS.get(key, key), max(0, item.get('planned_s', 0) - item.get('effective_s', 0)) / 60)
@@ -577,6 +574,8 @@ class MainWindow(QMainWindow):
         for key, item in status.get('items', {}).items():
             if item.get('result') in ('FAIL', 'INCOMPLETE', 'BLOCKED'):
                 live += '\n%s %s：%s' % (ITEMS.get(key, key), item['result'], item.get('stop_reason') or '未提供具体原因')
+        if status.get('storage_error'):
+            live += '\n' + status['storage_error']
         battery = status.get('battery', {})
         pending = (run_id in self.power_submitted and battery.get('state') == 'WAIT_OPERATOR'
                    and not battery.get('confirmed') and status.get('items', {}).get('battery', {}).get('result') is None)
@@ -613,7 +612,20 @@ class MainWindow(QMainWindow):
             self.detail.setPlainText(json.dumps(status, ensure_ascii=False, indent=2))
 
     def load_history(self):
-        rows = self.repository.runs()
+        if getattr(self, 'history_loading', False):
+            return
+        self.history_loading = True
+        def complete(rows):
+            self.history_loading = False
+            self._show_history(rows)
+        def failed(exc):
+            self.history_loading = False
+            self.statistics.setText('读取历史失败：' + str(exc))
+        self.job(self.repository.runs, complete, failed)
+
+    def _show_history(self, rows):
+        selected = self.history.item(self.history.currentRow(), 5)
+        selected_id = selected.text() if selected else None
         counts = {}
         for row in rows:
             key = row['result'] or '未结束'
@@ -627,6 +639,8 @@ class MainWindow(QMainWindow):
                 if col in (3, 4):
                     item.setForeground(QColor(status_color(value)))
                 self.history.setItem(index, col, item)
+            if row['run_id'] == selected_id:
+                self.history.selectRow(index)
 
     def history_id(self):
         row = self.history.currentRow()
@@ -636,8 +650,7 @@ class MainWindow(QMainWindow):
 
     def open_report(self):
         try:
-            path = export_report(self.repository, self.history_id())
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            QDesktopServices.openUrl(QUrl(self.report_server.url('run', self.history_id())))
         except Exception as exc:
             self.error(exc)
 
@@ -658,7 +671,7 @@ class MainWindow(QMainWindow):
 
     def open_log(self, run_id):
         if run_id not in self.log_dialogs:
-            dialog = ExecutionLogDialog(self.repository, run_id, self)
+            dialog = ExecutionLogDialog(self.repository, run_id, self.report_server, self)
             self.log_dialogs[run_id] = dialog
             dialog.finished.connect(lambda: self.log_dialogs.pop(run_id, None))
         dialog = self.log_dialogs[run_id]
@@ -668,10 +681,12 @@ class MainWindow(QMainWindow):
 
     def open_batch(self):
         try:
-            from ..infrastructure.report import export_batch
-            row = self.repository.get(self.history_id())
-            path = export_batch(self.repository, row['batch_id'])
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            run_id = self.history_id()
+            def opened(row):
+                if not row:
+                    raise ValueError('运行不存在，请刷新历史记录')
+                QDesktopServices.openUrl(QUrl(self.report_server.url('batch', row['batch_id'])))
+            self.job(lambda: self.repository.get(run_id), opened)
         except Exception as exc:
             self.error(exc)
 
@@ -679,8 +694,8 @@ class MainWindow(QMainWindow):
         try:
             run_id = self.history_id()
             row = self.repository.get(run_id)
-            if row['state'] in ('FINISHED', 'BLOCKED'):
-                raise ValueError('这条运行已结束，无需恢复补采')
+            if row['sync_complete']:
+                raise ValueError('这条运行已结束且数据已同步，无需恢复补采')
             address, accepted = QInputDialog.getText(self, '恢复设备连接', '当前设备 IPv4（IP 变化时可修改，重连后核验真实身份）', text=row['ip'])
             if not accepted:
                 return
@@ -730,8 +745,8 @@ class MainWindow(QMainWindow):
             self.metrics.update_status(run_id, status)
             ip = self.run_devices.get(run_id)
             if ip in self.devices:
-                reason = status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
-                previous_reason = previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or previous.get('environment_message') or ''
+                reason = status.get('storage_error') or status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
+                previous_reason = previous.get('storage_error') or previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or previous.get('environment_message') or ''
                 if (status['state'], reason) != (previous.get('state'), previous_reason):
                     self.log('%s：%s %s' % (self.devices[ip]['sn'], STATES.get(status['state'], status['state']), reason))
                 if status.get('battery', {}).get('confirmed') and not previous.get('battery', {}).get('confirmed'):
@@ -770,6 +785,9 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.timer.stop()
+        for dialog in list(self.log_dialogs.values()):
+            dialog.close()
+        self.report_server.close()
         self.service.shutdown(detach=True)
         self.work_pool.shutdown(wait=False)
         event.accept()

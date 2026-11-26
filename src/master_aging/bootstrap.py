@@ -3,10 +3,14 @@ import sys
 
 
 def main():
-    from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtWidgets import QApplication, QMessageBox
     from .gui.main_window import MainWindow
     app = QApplication.instance() or QApplication(sys.argv)
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except Exception as exc:
+        QMessageBox.critical(None, '主控老化工具启动失败', str(exc))
+        return 1
     window.show()
     return app.exec_()
 

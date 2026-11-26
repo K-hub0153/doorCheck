@@ -1,0 +1,9 @@
+# 连接配置独立于老化计划，不会写入设备请求、报告或运行快照。
+host: 10.37.96.165
+port: 3394
+user: ishop_oqa
+password: GupZkAYSGgSCMARq
+database: ishop_oqa
+connect_timeout: 5
+read_timeout: 15
+write_timeout: 15

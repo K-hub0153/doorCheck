@@ -2,24 +2,22 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
 import ipaddress
-from pathlib import Path
 import queue
 import threading
 import time
 
 from ..adapters.ssh_transport import SSHTransport
 from ..adapters.environment import DeploymentCancelled
-from ..domain.models import conclusion, digest, new_id, safe_sn, utc_now
+from ..domain.models import conclusion, digest, new_id, utc_now
 from ..domain.policies import validate_plan
-from ..infrastructure.report import export_report, export_batch
-from ..infrastructure.config import runtime_dir
+from ..infrastructure.repository import StorageUnavailable, RunOwned
 
 
 class RunService:
     """每个设备一条串行控制通道；跨设备并行，事件通过线程安全队列交给 GUI。"""
-    def __init__(self, repository, root=None, transport_factory=SSHTransport):
+    def __init__(self, repository, transport_factory=SSHTransport):
         self.repository = repository
-        self.root = Path(root) if root else runtime_dir()
+        self.controller_id = new_id()
         self.transport_factory = transport_factory
         self.events = queue.Queue(maxsize=2048)
         self.pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix='master-aging')
@@ -57,28 +55,28 @@ class RunService:
         previous_pool.shutdown(wait=False)
         batch_id = new_id()
         gate = threading.Semaphore(len(devices))
-        ids = []
+        entries = []
         for device in devices:
-            run_id = new_id()
-            directory = self.root / batch_id / safe_sn(device['sn']) / run_id
-            directory.mkdir(parents=True)
             snapshot = deepcopy(plan)
             snapshot['software_version'] = '1.0.0'
             snapshot['config_hash'] = digest(plan)
-            (directory / 'config_snapshot.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
-            self.repository.create(batch_id, run_id, device, snapshot, directory)
-            state = self._register(run_id, device, batch_id)
-            self.pool.submit(self._run, run_id, device, snapshot, directory, state, gate, False)
-            ids.append(run_id)
-        return ids
+            entries.append((new_id(), device, snapshot))
+        # 数据库中整批提交成功后才允许部署设备。
+        self.repository.create_batch(batch_id, entries)
+        for run_id, device, snapshot in entries:
+            state = self._register(run_id, device, batch_id,
+                                   {'state': 'PREFLIGHT', 'items': {}, 'result': None})
+            self.pool.submit(self._run, run_id, device, snapshot, state, gate, False)
+        return [entry[0] for entry in entries]
 
-    def _register(self, run_id, device, batch_id):
+    def _register(self, run_id, device, batch_id, initial_status=None):
         with self._lock:
             if run_id in self.active:
                 raise ValueError('该运行正在连接或执行')
             if any(s['device']['sn'] == device['sn'] for s in self.active.values()):
                 raise ValueError('同一 SN 已有本地运行，先停止或恢复原运行')
             state = {'device': device, 'batch_id': batch_id, 'status': {}, 'confirmation_queued': False,
+                     'initial_status': deepcopy(initial_status or {}),
                      'stop': threading.Event(), 'commands': queue.Queue(),
                      'wake': threading.Event(), 'future_done': threading.Event()}
             self.active[run_id] = state
@@ -86,12 +84,12 @@ class RunService:
 
     def resume(self, run_id, ip=None):
         row = self.repository.get(run_id)
-        if not row or row['state'] in ('FINISHED', 'BLOCKED'):
+        if not row or row['sync_complete']:
             raise ValueError('运行已结束或不存在')
         device = {'sn': row['sn'], 'ip': str(ipaddress.IPv4Address(ip or row['ip']))}
         plan = json.loads(row['snapshot'])
-        state = self._register(run_id, device, row['batch_id'])
-        self.pool.submit(self._run, run_id, device, plan, Path(row['output_dir']), state, threading.Semaphore(1), True)
+        state = self._register(run_id, device, row['batch_id'], json.loads(row['status']))
+        self.pool.submit(self._run, run_id, device, plan, state, threading.Semaphore(1), True)
 
     def stop(self, run_id):
         with self._lock:
@@ -129,27 +127,19 @@ class RunService:
         control['confirmation_queued'] = True
         control['wake'].set()
 
-    def _store(self, run_id, status, directory):
+    def _store(self, run_id, status):
         with self._lock:
             control = self.active.get(run_id)
             if control:
                 control['status'] = deepcopy(status)
                 self._queue_power_confirmation(control)
         self.repository.save_status(run_id, status)
-        (directory / 'summary.json').write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
-        with (directory / 'controller.log').open('a', encoding='utf-8') as stream:
-            stream.write('%s %s result=%s seq=%s %s\n' % (utc_now(), status['state'], status.get('result'),
-                status.get('seq'), status.get('error') or status.get('connection_error') or status.get('environment_message') or ''))
+        if not status.get('launch_requested') and not status.get('run_id') and status['state'] in ('BLOCKED', 'FINISHED'):
+            self.repository.mark_synced(run_id)
         self.notify(run_id, status)
 
-    def _ingest(self, transport, run_id, directory):
-        offset_file = directory / 'record_offset.json'
-        try:
-            offset = json.loads(offset_file.read_text()) if offset_file.exists() else 0
-            if not isinstance(offset, int) or offset < 0:
-                offset = 0
-        except (OSError, ValueError):
-            offset = 0
+    def _ingest(self, transport, run_id):
+        offset = self.repository.get(run_id)['record_offset']
         while True:
             records, offset, more = transport.records(run_id, offset)
             if records:
@@ -161,21 +151,20 @@ class RunService:
                         if record['seq'] != last + 1:
                             raise ValueError('设备日志序号缺段')
                         last = record['seq']
-                self.repository.ingest(run_id, records)
-                # DB 提交先于游标。PC 在任意位置退出都可重读，主键负责幂等。
-                offset_file.write_text(json.dumps(offset))
+                self.repository.ingest(run_id, records, offset)
             if not more:
                 break
 
-    def _run(self, run_id, device, plan, directory, control, gate, recovering):
+    def _run(self, run_id, device, plan, control, gate, recovering):
         transport = None
-        launched = recovering
         stop_sent = False
-        last_status = json.loads(self.repository.get(run_id)['status'])
+        last_status = dict(control.get('initial_status') or {'state': 'PREFLIGHT', 'items': {}, 'result': None})
+        launched = recovering and bool(last_status.get('launch_requested') or last_status.get('run_id'))
         acquired = False
         failures = 0
         confirmed_reboot = False
         confirmation_poll_until = 0
+        claimed = False
         try:
             while not gate.acquire(timeout=0.2):
                 if self.detaching.is_set() or control['stop'].is_set():
@@ -184,23 +173,29 @@ class RunService:
                 acquired = True
             if not acquired or (control['stop'].is_set() and not launched):
                 last_status.update(state='FINISHED', result='ABORTED', error='运行前取消')
-                self._store(run_id, last_status, directory)
+                self._store(run_id, last_status)
                 return
             if self.detaching.is_set() and not launched:
                 last_status.update(state='FINISHED', result='ABORTED', error='退出前尚未启动设备任务')
-                self._store(run_id, last_status, directory)
+                self._store(run_id, last_status)
                 return
             while not self.detaching.is_set():
                 # 先清除唤醒，再处理命令；处理期间到达的新命令不会丢失唤醒。
                 control['wake'].clear()
                 validated_status = None
                 try:
+                    # 已持有控制权时，人工停止优先，不因数据库短暂断线延迟发往设备。
+                    if claimed and launched and transport and control['stop'].is_set() and not stop_sent:
+                        transport.action('stop', run_id)
+                        stop_sent = True
+                    self.repository.claim(run_id, self.controller_id)
+                    claimed = True
                     if transport is None:
                         transport = self.transport_factory(device)
                         def progress(message):
                             if not launched:
                                 last_status.update(state='DEPLOYING', environment_message=message)
-                                self._store(run_id, last_status, directory)
+                                self._store(run_id, last_status)
                         transport.progress = progress
                         transport.cancelled = lambda: not launched and (control['stop'].is_set() or self.detaching.is_set())
                         progress('正在连接设备并检查运行环境')
@@ -223,13 +218,12 @@ class RunService:
                             if control['stop'].is_set() or self.detaching.is_set():
                                 raise DeploymentCancelled('环境准备期间已取消，未启动老化负载')
                             request = {'run_id': run_id, 'device': dict(device, fingerprint=info['fingerprint']), 'plan': plan}
-                            (directory / 'manifest.json').write_text(json.dumps({'run_id': run_id, 'device': info,
-                                'created_at': utc_now(), 'config_hash': digest(plan), 'agent_sha256': transport.agent.rsplit('-', 1)[-1][:-4]},
-                                ensure_ascii=False, indent=2), encoding='utf-8')
+                            self.repository.save_manifest(run_id, {'run_id': run_id, 'device': info,
+                                'created_at': utc_now(), 'config_hash': digest(plan), 'agent_sha256': transport.agent.rsplit('-', 1)[-1][:-4]})
                             # 在提交启动之前持久化意图。命令响应丢失后只查询原 run_id。
                             last_status.update(state='READY', hardware=info, launch_requested=True,
                                                environment_message='环境准备完成，正在启动老化预检')
-                            self._store(run_id, last_status, directory)
+                            self._store(run_id, last_status)
                             launched = True
                             transport.launch(request)
                     if control['stop'].is_set() and not stop_sent:
@@ -255,11 +249,12 @@ class RunService:
                         if confirmed_reboot:
                             last_status.update(state='FINISHED', result='FAIL' if conclusion(last_status.get('items', {})) == 'FAIL' else 'INCOMPLETE',
                                                cleanup_confirmed=False, error='已确认设备重启，原运行目录丢失，不能恢复连续时长')
-                            self._store(run_id, last_status, directory)
+                            self._store(run_id, last_status)
+                            self.repository.mark_synced(run_id)
                             return
                         raise ValueError('设备上未找到原运行，保留启动不确定性，不重复发起负载')
                     if status.get('config_hash') and status['config_hash'] != digest(plan):
-                        raise ValueError('设备配置快照摘要与本地不一致')
+                        raise ValueError('设备配置快照摘要与数据库不一致')
                     if last_status.get('boot_id') and status.get('boot_id') != last_status['boot_id']:
                         raise ValueError('状态 boot_id 不一致')
                     validated_status = status
@@ -277,68 +272,88 @@ class RunService:
                         if conclusion(last_status.get('items', {})) == 'FAIL':
                             last_status['result'] = 'FAIL'
                     if last_status['state'] in ('FINISHED', 'BLOCKED'):
-                        self._ingest(transport, run_id, directory)
-                        self._store(run_id, last_status, directory)
+                        self._ingest(transport, run_id)
+                        self._store(run_id, last_status)
                     else:
                         # 运行状态先交给界面，日志补采较慢时不阻塞确认结果显示。
-                        self._store(run_id, last_status, directory)
-                        self._ingest(transport, run_id, directory)
+                        self._store(run_id, last_status)
+                        self._ingest(transport, run_id)
                     failures = 0
                     if last_status['state'] in ('FINISHED', 'BLOCKED'):
                         try:
-                            transport.collect(run_id, directory / 'device')
+                            transport.collect(run_id, self.repository)
+                            last_status.pop('attachment_error', None)
+                            self._store(run_id, last_status)
+                        except StorageUnavailable:
+                            raise
                         except Exception as exc:
                             last_status['attachment_error'] = str(exc)
-                            self._store(run_id, last_status, directory)
+                            self._store(run_id, last_status)
                         if self.repository.last_seq(run_id) != status.get('seq', 0):
                             last_status.update(result='FAIL' if last_status.get('result') == 'FAIL' else 'INCOMPLETE',
                                                error='最终日志缺段，不能确认数据完整')
-                            self._store(run_id, last_status, directory)
+                            self._store(run_id, last_status)
+                        if not last_status.get('attachment_error') and self.repository.last_seq(run_id) == status.get('seq', 0):
+                            self.repository.mark_synced(run_id)
                         return
+                except RunOwned:
+                    raise
+                except StorageUnavailable as exc:
+                    # 不推进游标、不回退本地文件，保持设备采样，重连后幂等补采。
+                    failures += 1
+                    self.notify(run_id, dict(last_status, storage_error=str(exc)))
+                    if not launched and transport:
+                        transport.close()
+                        transport = None
                 except DeploymentCancelled as exc:
                     last_status.update(state='FINISHED', result='ABORTED', error=str(exc), cleanup_confirmed=True)
-                    self._store(run_id, last_status, directory)
+                    self._store(run_id, last_status)
                     return
                 except ValueError as exc:
                     if validated_status and validated_status['state'] in ('FINISHED', 'BLOCKED'):
                         last_status = validated_status
                         last_status.update(result='FAIL' if last_status.get('result') == 'FAIL' else 'INCOMPLETE', error=str(exc))
-                        self._store(run_id, last_status, directory)
+                        self._store(run_id, last_status)
                         return
                     # 证据不一致时不能宣称远端已停止；保留可恢复的运行和明确结论。
                     last_status.update(state='RECONNECTING' if launched else 'BLOCKED',
                                        result='INCOMPLETE' if launched else 'BLOCKED',
                                        cleanup_confirmed=False, error=str(exc))
-                    self._store(run_id, last_status, directory)
+                    self._store(run_id, last_status)
                     return
                 except Exception as exc:
                     failures += 1
                     if not launched:
                         last_status.update(state='BLOCKED', result='BLOCKED', error='连接/部署失败: ' + str(exc))
-                        self._store(run_id, last_status, directory)
+                        self._store(run_id, last_status)
                         return
                     last_status.update(state='RECONNECTING', connection_error=str(exc), stop_pending=control['stop'].is_set())
-                    self._store(run_id, last_status, directory)
+                    self._store(run_id, last_status)
                     if transport:
                         transport.close()
                         transport = None
                 # 确认落盘和执行器消费异步发生；短时加快查询，读取异常时避免持续高频轮询。
                 delay = 0.2 if time.monotonic() < confirmation_poll_until and not failures else min(10, 2 + failures)
                 control['wake'].wait(delay)
+        except RunOwned as exc:
+            last_status['storage_error'] = str(exc)
+            self.notify(run_id, last_status)
         except Exception as exc:
             last_status.update(state='RECONNECTING' if launched else 'BLOCKED', result=None if launched else 'BLOCKED', error=str(exc))
-            self._store(run_id, last_status, directory)
+            try:
+                self._store(run_id, last_status)
+            except StorageUnavailable as storage_error:
+                self.notify(run_id, dict(last_status, storage_error=str(storage_error)))
         finally:
             if transport:
                 transport.close()
             if acquired:
                 gate.release()
-            try:
-                export_report(self.repository, run_id)
-                export_batch(self.repository, self.repository.get(run_id)['batch_id'])
-            except Exception as exc:
-                last_status['report_error'] = str(exc)
-                self._store(run_id, last_status, directory)
+            if claimed:
+                try:
+                    self.repository.release(run_id, self.controller_id)
+                except StorageUnavailable:
+                    pass  # 连接中断时租约自然过期。
             with self._lock:
                 self.active.pop(run_id, None)
             control['future_done'].set()

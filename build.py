@@ -35,6 +35,7 @@ class BuildScript:
             "PIL",
             "qrcode",
             "paramiko",
+            "pymysql",
             "psutil",
             "openpyxl",
         ]
@@ -61,6 +62,7 @@ class BuildScript:
             "PIL",
             "qrcode",
             "paramiko",
+            "pymysql",
             "psutil",
             "openpyxl",
         ]

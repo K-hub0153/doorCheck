@@ -176,15 +176,17 @@ class SSHTransport:
             records = [json.loads(line) for line in chunk[:end].decode('utf-8').splitlines()]
             return records, offset + end, len(chunk) == 512 * 1024
 
-    def collect(self, run_id, directory):
+    def collect(self, run_id, repository):
         remote = REMOTE_ROOT + '/' + run_id
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
         with self.client.open_sftp() as sftp:
             sftp.get_channel().settimeout(15)
             for attr in sftp.listdir_attr(remote):
                 import stat
                 if not stat.S_ISREG(attr.st_mode) or '/' in attr.filename:
                     continue
-                if attr.st_size <= 128 * 2**20:
-                    sftp.get(remote + '/' + attr.filename, str(directory / attr.filename))
+                if attr.filename in ('records.jsonl', 'execution.log'):
+                    continue  # 完整事件和可读执行记录由 record 表重建。
+                if attr.st_size > 128 * 2**20:
+                    raise ValueError('设备附件超过 128 MiB：' + attr.filename)
+                with sftp.open(remote + '/' + attr.filename, 'rb') as stream:
+                    repository.save_artifact(run_id, attr.filename, stream)

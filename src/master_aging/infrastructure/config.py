@@ -52,10 +52,16 @@ def save_config(plan):
             temporary.unlink()
 
 
-def runtime_dir():
-    path = app_dir() / 'logs/master_aging'
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+def database_settings():
+    """数据库凭据不得混入老化计划，允许部署环境覆盖连接配置。"""
+    with (app_dir() / 'config/master_aging/database.yaml').open(encoding='utf-8') as stream:
+        settings = yaml.safe_load(stream) or {}
+    for key in ('host', 'port', 'user', 'password', 'database'):
+        value = os.environ.get('MASTER_AGING_DB_' + key.upper())
+        if value is not None:
+            settings[key] = value
+    settings['port'] = int(settings.get('port', 3306))
+    return settings
 
 
 def ssh_settings():

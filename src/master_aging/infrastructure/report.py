@@ -1,8 +1,8 @@
-"""完全离线的 HTML、CSV/JSON；HTML 中的设备字段统一转义。"""
+"""报告模板按需从 MySQL 取数渲染，所有输出保留在内存中。"""
 import base64
 import csv
+import io
 from datetime import datetime, timezone
-import hashlib
 from html import escape
 import json
 import math
@@ -10,6 +10,7 @@ import sys
 import threading
 from functools import lru_cache, wraps
 from pathlib import Path
+from urllib.parse import quote
 from ..domain.models import ITEMS
 from ..domain.execution_log import format_record
 from ..domain.diagnostics import GENERIC_MONITOR_REASON, LTE_SCOPE, item_reason, item_scope
@@ -50,7 +51,7 @@ def text(value):
 
 
 def evidence_text(value):
-    """规范旧记录中的说明字段；下载的原始 JSON 保留原文。"""
+    """规范旧记录中的说明字段；提供的原始 JSON 保留原文。"""
     def present(data):
         if isinstance(data, dict):
             return {key: (LTE_SCOPE if key == 'scope' and isinstance(child, str)
@@ -113,7 +114,7 @@ def event_timeline(records, item_reasons=None):
     for record in ordered:
         origins.setdefault(record.get('boot_id'), record.get('monotonic'))
     events = [record for record in ordered if record['kind'] != 'metric']
-    body = '<h2>事件时间线</h2><p><small>时间按导出电脑的本地时区显示，并标注 UTC 偏移；累计用时从同次设备启动的首条记录起算，不等于项目有效时长。事件按设备序号排列。</small></p>'
+    body = '<h2>事件时间线</h2><p><small>时间按查看电脑的本地时区显示，并标注 UTC 偏移；累计用时从同次设备启动的首条记录起算，不等于项目有效时长。事件按设备序号排列。</small></p>'
     if not events:
         return body + '<div class="card">暂无事件记录</div>'
     body += '<div class="table-scroll"><table class="timeline"><thead><tr><th>时间 / 累计用时</th><th>项目</th><th>事件 / 结果</th><th>说明</th></tr></thead><tbody>'
@@ -141,7 +142,7 @@ def favicon_url():
         path = Path(sys._MEIPASS) / 'vdian.ico'
     else:
         path = Path(__file__).resolve().parents[2] / 'ui' / 'icon' / 'vdian.ico'
-    return 'data:image/x-icon;base64,' + base64.b64encode(path.read_bytes()).decode('ascii')
+    return ('data:image/x-icon;base64,' + base64.b64encode(path.read_bytes()).decode('ascii')) if path.is_file() else ''
 
 
 def document(title, body):
@@ -242,75 +243,73 @@ def chart(label, points, gap_limit=40):
     return comparison_chart(label, [(label, [(x - origin, y) for x, y in points], gap_limit)])
 
 
-def write_execution_log(row, records):
-    directory = Path(row['output_dir'])
-    directory.mkdir(parents=True, exist_ok=True)
+def render_execution_log(row, records):
     status = json.loads(row['status'])
     config = json.loads(row.get('snapshot') or '{}').get('items', {})
-    with (directory / 'execution.log').open('w', encoding='utf-8') as stream:
-        stream.write('主控老化执行日志\nSN：%s  IP：%s\n运行：%s\n状态：%s  结果：%s\n' %
-                     (row['sn'], row['ip'], row['run_id'], row['state'], row['result'] or '未结束'))
-        for key in ('error', 'connection_error', 'safety_stop', 'attachment_error'):
-            if status.get(key):
-                stream.write('%s：%s\n' % (key, status[key]))
-        for key, item in status.get('items', {}).items():
-            stream.write('%s：%s；%s\n' % (ITEMS.get(key, key), item.get('result') or '进行中',
-                                          item_reason(key, item, records, config.get(key))))
-            if item.get('argv'):
-                stream.write('执行参数：' + json.dumps(item['argv'], ensure_ascii=False) + '\n')
-        stream.write('以下为设备记录，时间为 UTC，按事件序号排列。连接与部署过程见 controller.log。\n\n')
-        for record in sorted(records, key=lambda r: r['seq']):
-            data = record['data']
-            if data.get('reason') == GENERIC_MONITOR_REASON and data.get('item') in status.get('items', {}):
-                key = data['item']
-                data = dict(data, reason=item_reason(key, status['items'][key], records, config.get(key)))
-                record = dict(record, data=data)
-            stream.write(format_record(record))
-    return directory / 'execution.log'
+    stream = io.StringIO()
+    stream.write('主控老化执行日志\nSN：%s  IP：%s\n运行：%s\n状态：%s  结果：%s\n' %
+                 (row['sn'], row['ip'], row['run_id'], row['state'], row['result'] or '未结束'))
+    for key in ('error', 'connection_error', 'safety_stop', 'attachment_error'):
+        if status.get(key):
+            stream.write('%s：%s\n' % (key, status[key]))
+    for key, item in status.get('items', {}).items():
+        stream.write('%s：%s；%s\n' % (ITEMS.get(key, key), item.get('result') or '进行中',
+                                      item_reason(key, item, records, config.get(key))))
+        if item.get('argv'):
+            stream.write('执行参数：' + json.dumps(item['argv'], ensure_ascii=False) + '\n')
+    stream.write('以下为设备记录，时间为 UTC，按事件序号排列。连接与部署过程见 controller.log。\n\n')
+    for record in sorted(records, key=lambda r: r['seq']):
+        data = record['data']
+        if data.get('reason') == GENERIC_MONITOR_REASON and data.get('item') in status.get('items', {}):
+            key = data['item']
+            data = dict(data, reason=item_reason(key, status['items'][key], records, config.get(key)))
+            record = dict(record, data=data)
+        stream.write(format_record(record))
+    return stream.getvalue()
 
 
 @serialized
-def export_execution_log(repository, run_id):
+def execution_log(repository, run_id):
     row = repository.get(run_id)
     if not row:
         raise ValueError('运行不存在')
-    return write_execution_log(row, repository.records(run_id))
+    return render_execution_log(row, repository.records(run_id))
+
+
+def render_metrics(records):
+    stream = io.StringIO(newline='')
+    writer = csv.writer(stream)
+    writer.writerow(['seq', 'utc', 'received_at', 'boot_id', 'monotonic_s', 'metric', 'value'])
+    def flatten(value, prefix=''):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield from flatten(child, prefix + '.' + key if prefix else key)
+        else:
+            yield prefix, json.dumps(value, ensure_ascii=False) if isinstance(value, list) else value
+    for record in records:
+        if record['kind'] == 'metric':
+            for key, value in flatten(record['data']):
+                # 防止设备字符串在电子表格内被当作公式执行。
+                if isinstance(value, str) and value.startswith(('=', '+', '-', '@')):
+                    value = "'" + value
+                writer.writerow([record['seq'], record['utc'], record.get('received_at'), record['boot_id'], record['monotonic'], key, value])
+    return '\ufeff' + stream.getvalue()
 
 
 @serialized
-def export_report(repository, run_id):
+def render_report(repository, run_id):
     row = repository.get(run_id)
     if not row:
         raise ValueError('运行不存在')
-    directory = Path(row['output_dir'])
-    directory.mkdir(parents=True, exist_ok=True)
     status, snapshot = json.loads(row['status']), json.loads(row['snapshot'])
     records = repository.records(run_id)
-    write_execution_log(row, records)
-    (directory / 'records.json').write_text(json.dumps(records, ensure_ascii=False), encoding='utf-8')
-    with (directory / 'metrics.csv').open('w', encoding='utf-8-sig', newline='') as stream:
-        writer = csv.writer(stream)
-        writer.writerow(['seq', 'utc', 'received_at', 'boot_id', 'monotonic_s', 'metric', 'value'])
-        def flatten(value, prefix=''):
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    yield from flatten(child, prefix + '.' + key if prefix else key)
-            else:
-                yield prefix, json.dumps(value, ensure_ascii=False) if isinstance(value, list) else value
-        for record in records:
-            if record['kind'] == 'metric':
-                for key, value in flatten(record['data']):
-                    # 防止设备字符串在电子表格内被当作公式执行。
-                    if isinstance(value, str) and value.startswith(('=', '+', '-', '@')):
-                        value = "'" + value
-                    writer.writerow([record['seq'], record['utc'], record.get('received_at'), record['boot_id'], record['monotonic'], key, value])
     items = status.get('items', {})
     reasons = {key: item_reason(key, item, records, snapshot.get('items', {}).get(key))
                for key, item in items.items()}
     result = row['result'] or 'INCOMPLETE'
     body = '<h1>主控设备老化报告</h1><p>SN：' + text(row['sn']) + ' · <b class="' + text(result) + '">' + text(result) + '</b></p>'
     body += '<div class="card">批次：' + text(row['batch_id']) + '<br>运行：' + text(run_id)
-    body += '<br>创建：' + text(local_time(row['created_at'])) + '<br>结束：' + text(local_time(status.get('finished_at'))) + '<br>状态：' + text(row['state']) + '<br>墙钟运行秒数：' + text(status.get('wall_s')) + '<br>数据上报：仅本地保存</div>'
+    body += '<br>创建：' + text(local_time(row['created_at'])) + '<br>结束：' + text(local_time(status.get('finished_at'))) + '<br>状态：' + text(row['state']) + '<br>墙钟运行秒数：' + text(status.get('wall_s')) + '<br>数据存储：MySQL 集中存储</div>'
     for key in ('error', 'connection_error', 'safety_stop', 'attachment_error', 'report_error'):
         if status.get(key):
             body += '<p><b>' + text(key) + '：</b>' + text(status[key]) + '</p>'
@@ -328,25 +327,19 @@ def export_report(repository, run_id):
         body += '<details class="card"><summary>' + text(title) + '</summary><pre>' + text(evidence_text(value)) + '</pre></details>'
     body += '<p><a href="metrics.csv">原始指标 CSV</a> · <a href="records.json">完整事件与采样 JSON</a> · <a href="summary.json">结论 JSON</a></p>'
     body += '<h2>执行日志</h2><p><a href="execution.log">查看执行日志（含 4G 原始响应）</a>'
-    if (directory / 'controller.log').is_file():
-        body += ' · <a href="controller.log">连接与部署日志</a>'
-    body += '</p><ul>'
-    for log in sorted((directory / 'device').glob('*.log')):
-        body += '<li><a href="device/' + text(log.name) + '">' + text(log.name) + '</a></li>'
+    body += ' · <a href="controller.log">连接与部署日志</a></p><ul>'
+    for artifact in repository.artifacts(run_id):
+        name = artifact['name']
+        body += '<li><a href="device/' + quote(name, safe='') + '">' + text(name) + '</a> · ' + text(artifact['size']) + ' 字节</li>'
     body += '</ul>'
-    path = directory / 'report.html'
-    path.write_text(document('老化报告 ' + row['sn'], body), encoding='utf-8')
-    checksums = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.iterdir() if p.is_file() and p.name != 'checksums.json'}
-    (directory / 'checksums.json').write_text(json.dumps(checksums, indent=2), encoding='utf-8')
-    return path
+    return document('老化报告 ' + row['sn'], body)
 
 
 @serialized
-def export_batch(repository, batch_id):
-    rows = [r for r in repository.runs() if r['batch_id'] == batch_id]
+def render_batch(repository, batch_id):
+    rows = repository.runs(batch_id=batch_id)
     if not rows:
-        return
-    directory = Path(rows[0]['output_dir']).parents[1]
+        raise ValueError('批次不存在')
     body = '<h1>主控老化批次报告</h1><p>批次：' + text(batch_id) + '</p><table><tr><th>SN</th><th>IP</th><th>老化柜编号</th><th>状态</th><th>结论</th><th>报告</th></tr>'
     totals = {}
     batch_curves = {label: [] for label in CURVE_LABELS}
@@ -359,12 +352,9 @@ def export_batch(repository, batch_id):
             batch_curves[label].append((row['sn'], [(x - origin, y) for x, y in points], snapshot.get('max_sample_gap_s', 40)))
         result = row['result'] or 'INCOMPLETE'
         totals[result] = totals.get(result, 0) + 1
-        path = Path(row['output_dir']) / 'report.html'
-        relative = path.relative_to(directory).as_posix()
+        relative = '../../run/' + row['run_id'] + '/report.html'
         body += '<tr><td>' + text(row['sn']) + '</td><td>' + text(row['ip']) + '</td><td>' + text(environment.get('cabinet_id', environment.get('chamber_id'))) + '</td><td>' + text(row['state']) + '</td><td class="' + text(result) + '">' + text(result) + '</td><td><a href="' + text(relative) + '">逐设备报告</a></td></tr>'
     body += '</table><p>' + text(json.dumps(totals, ensure_ascii=False)) + '</p>'
     body += '<h2>本批采样曲线汇总</h2><p>横轴为各设备自首次采样起经过的分钟数，颜色区分设备。同一指标共用坐标轴；缺失采样不连线。可直接打印或保存为 PDF 用于汇报。</p>'
     body += ''.join(comparison_chart(label, series) for label, series in batch_curves.items())
-    path = directory / 'batch_report.html'
-    path.write_text(document('批次报告', body), encoding='utf-8')
-    return path
+    return document('批次报告', body)
