@@ -413,7 +413,8 @@ class Supervisor:
                     self.info['ddr_bytes'] = min(self.info['ddr_bytes'], budget['bytes'])
                     budget['bytes'] = self.info['ddr_bytes']
                     self.info['ddr_allocation'] = item['allocation'] = budget
-                    args += ['--vm', '1', '--vm-bytes', str(self.info['ddr_bytes']), '--vm-method', 'all', '--vm-keep']
+                    args += ['--vm', '1', '--vm-bytes', str(self.info['ddr_bytes']), '--vm-method', 'all',
+                             '--vm-keep', '--vm-locked', '--vm-populate', '--vm-madvise', 'normal']
                     item['scope'] = 'DDR 正确性压力；带宽基线需另行使用已验证的 STREAM 工具测量'
                     # 在启动负载前记录基线，不能把系统原有 swap 占用当作本轮换出。
                     item['swap_baseline'] = self.swap_snapshot(memory, collectors.read('/proc/vmstat'))
@@ -793,7 +794,7 @@ class Supervisor:
                     latest_swap = self.swap_snapshot(data['memory'], data.get('vmstat', ''))
                     item['swap_latest'] = latest_swap
                     try:
-                        group = process.memory_snapshot()
+                        group = process.memory_snapshot(self.info['ddr_bytes'])
                     except (OSError, ValueError) as exc:
                         self.finish_item(key, 'INCOMPLETE', 'DDR 进程内存采样失败: ' + str(exc))
                         continue
@@ -804,15 +805,34 @@ class Supervisor:
                     group['worker_swap_bytes'] = sum(p['swap_bytes'] for p in workers)
                     item['memory_latest'] = data['ddr_process_memory'] = group
                     item['last_sample'] = group
-                    swapping = group['worker_swap_bytes'] > 0
+                    swapping = group['vm_swap_bytes'] > 0
+                    # 进程总 VmSwap 仅作诊断；只根据已定位的匿名测试区判断换出。
+                    item['memory_policy'] = 'locked_vm_region'
+                    startup_grace = max(15, self.plan['sample_interval_s'] * 2)
+                    page_size = os.sysconf('SC_PAGE_SIZE')
+                    expected = self.info['ddr_bytes'] // page_size * page_size
+                    if (group['vm_regions'] and group['vm_locked_bytes'] >= expected
+                            and group['vm_rss_bytes'] >= expected and not swapping):
+                        item['memory_verified_samples'] = item.get('memory_verified_samples', 0) + 1
+                        item['memory_last_verified'] = group
+                    if not swapping and code is None and elapsed >= startup_grace:
+                        if (not group['vm_regions'] or group['vm_locked_bytes'] < expected
+                                or group['vm_rss_bytes'] < expected):
+                            self.finish_item(key, 'INCOMPLETE',
+                                'DDR 测试内存锁定未确认：已锁定 %.1f MiB，要求 %.1f MiB；'
+                                '请检查锁页权限或可锁定内存限额' % (group['vm_locked_bytes'] / 2**20, expected / 2**20))
+                            continue
                 if swapping:
-                    self.finish_item(key, 'INCOMPLETE', 'DDR 压测 worker 换出 %.1f KiB（要求 0 KiB），'
+                    self.finish_item(key, 'INCOMPLETE', 'DDR 测试内存区换出 %.1f KiB（要求 0 KiB），'
                                      '内存负载 %.1f MiB；需降低内存负载后重试' % (
-                                         group['worker_swap_bytes'] / 1024, self.info['ddr_bytes'] / 2**20))
+                                         group['vm_swap_bytes'] / 1024, self.info['ddr_bytes'] / 2**20))
                 elif elapsed >= item['planned_s']:
                     # 正常到时先等 stress-ng 汇总；非零退出和清理失败仍不能通过。
                     if code is not None or key in self.timed_out or elapsed >= item['planned_s'] + 5:
-                        self.finish_item(key, 'PASS', '计划时长已到，已核验压测退出和进程清理')
+                        if key == 'ddr' and not item.get('memory_verified_samples'):
+                            self.finish_item(key, 'INCOMPLETE', 'DDR 未取得测试内存驻留与锁定证据，无法判为通过')
+                        else:
+                            self.finish_item(key, 'PASS', '计划时长已到，已核验压测退出和进程清理')
                     continue
                 elif code is not None:
                     detail = runners.process_diagnostics(self.directory, key)

@@ -8,7 +8,8 @@ import zipfile
 import errno
 
 import paramiko
-from .environment import EnvironmentDeployer, workload_tools
+from .environment import DeploymentCancelled, EnvironmentDeployer, workload_tools
+from .offline_runtime import archive_path
 from ..infrastructure.config import ssh_settings
 
 REMOTE_ROOT = '/var/tmp/master-aging'
@@ -46,6 +47,7 @@ class SSHTransport:
         self.deployment = []
         self.client = None
         self.agent = None
+        self.runtime = None
 
     def report(self, message):
         self.progress(message)
@@ -72,7 +74,10 @@ class SSHTransport:
             self.client = None
 
     def command(self, args, timeout=25):
-        stdin, stdout, stderr = self.client.exec_command(' '.join(shlex.quote(str(a)) for a in args), timeout=timeout)
+        command = ' '.join(shlex.quote(str(a)) for a in args)
+        if self.runtime:
+            command = 'export PATH=%s/bin:$PATH; %s' % (shlex.quote(self.runtime), command)
+        stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
         channel = stdout.channel
         data, errors = bytearray(), bytearray()
         deadline = time.monotonic() + timeout
@@ -99,7 +104,62 @@ class SSHTransport:
             channel.close()
 
     def environment(self):
-        return EnvironmentDeployer(self.command, self.report, self.cancelled)
+        return EnvironmentDeployer(self.command, self.report, self.cancelled, self.install_runtime)
+
+    def install_runtime(self, bundle):
+        """SFTP 上传内嵌运行包；设备摘要校验、原子解包后才启用。"""
+        path = archive_path(bundle)
+        signature = bundle['sha256']
+        remote = REMOTE_ROOT + '/runtime-' + signature
+        marker = remote + '/.complete'
+        if self.runtime == remote:
+            return
+        self.command(['mkdir', '-p', REMOTE_ROOT])
+        try:
+            complete = self.command(['cat', marker]).strip() == signature
+        except RuntimeError:
+            complete = False
+        if not complete:
+            import uuid
+            temporary = remote + '.' + uuid.uuid4().hex
+            archive = temporary + '.tar.gz'
+            self.report('上传离线运行环境（%.1f MiB），设备无需下载' % (path.stat().st_size / 2**20))
+            with self.client.open_sftp() as sftp:
+                sftp.get_channel().settimeout(30)
+                try:
+                    with path.open('rb') as stream, sftp.open(archive, 'wb') as output:
+                        output.set_pipelined(True)
+                        while True:
+                            if self.cancelled():
+                                raise DeploymentCancelled('离线环境上传已取消，未启动老化负载')
+                            chunk = stream.read(256 * 1024)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                except Exception:
+                    try:
+                        sftp.remove(archive)
+                    except OSError:
+                        pass
+                    raise
+            # 不执行安装脚本、不替换系统库；仅写入本工具专属目录。
+            script = '''set -eu
+archive=$1; staging=$2; target=$3; expected=$4
+trap 'rm -f -- "$archive"; rm -rf -- "$staging"' EXIT
+actual=$(sha256sum "$archive"); actual=${actual%% *}
+[ "$actual" = "$expected" ] || { echo '离线包摘要校验失败' >&2; exit 1; }
+mkdir "$staging"
+tar -xzf "$archive" -C "$staging"
+printf '%s' "$expected" > "$staging/.complete"
+if [ -d "$target" ]; then
+  [ "$(cat "$target/.complete" 2>/dev/null)" = "$expected" ] || exit 1
+else
+  mv -T "$staging" "$target"
+fi
+'''
+            self.command(['sh', '-c', script, 'aging-runtime', archive, temporary, remote, signature], timeout=120)
+        self.runtime = remote
+        self.report('内嵌离线运行环境已就绪：' + bundle['id'])
 
     def prepare(self, plan):
         self.report('检查所选老化项目的运行环境')
@@ -139,13 +199,12 @@ class SSHTransport:
 
     def probe(self, bootstrap=True):
         self.connect()
-        # Python 缺失时也能先通过 shell 核验 SN，再使用现有软件源补齐。
+        # 先核验身份，再启用内嵌依赖；恢复时也复用同一版本运行环境。
         sn = self.command(['cat', '/etc/serial-id']).strip()
         if not sn or (self.device.get('sn') and sn != self.device['sn']):
             raise ValueError('设备 SN 与所选身份不一致，未部署环境')
-        if bootstrap:
-            self.report('检查设备 Python 运行环境')
-            self.deployment.append(self.environment().ensure(['python3']))
+        self.report('启用设备离线 Python 运行环境')
+        self.deployment.append(self.environment().ensure(['python3']))
         self.deploy()
         return self.action('probe')
 

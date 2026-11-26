@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "bundles": [
+    {
+      "schema_version": 1,
+      "id": "ubuntu-22.04-arm64",
+      "system": "Linux",
+      "os_id": "ubuntu",
+      "version_id": "22.04",
+      "arch": "aarch64",
+      "glibc_min": "2.35",
+      "tools": [
+        "stress-ng",
+        "fio",
+        "findmnt",
+        "i2cget",
+        "python3"
+      ],
+      "archive": "ubuntu-22.04-arm64.tar.gz",
+      "sha256": "3e067c36e28931a4daa067627d14c5bf37e0cd7c811e4b2a347a35c5b21a4b22",
+      "size": 25347537
+    }
+  ]
+}

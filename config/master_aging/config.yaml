@@ -1,41 +1,49 @@
+# 三天生产老化：4320 分钟 = 72 小时；准备和人工接电确认另计。
+# 参考板 wdse-126d61a1aac82c4d：RK3576 / Ubuntu 22.04 ARM64 / 4 GB。
 schema_version: 1
-sample_interval_s: 10
-max_sample_gap_s: 40
-min_free_space_mib: 256
-max_log_mib: 64
+sample_interval_s: 30
+max_sample_gap_s: 120
+min_free_space_mib: 2048
+max_log_mib: 1024
 environment:
   cabinet_id: '2'
 items:
   cpu:
     enabled: true
-    duration_min: 1
+    duration_min: 4320
+    # 压测始终全核运行；此值是采样忙碌率的通过下限，不是负载占空比。
     target_busy_pct: 95
-    grace_s: 60
+    grace_s: 120
   ddr:
     enabled: true
-    duration_min: 1
-    max_memory_pct: 10
-    reserve_mib: 256
+    duration_min: 4320
+    # 参考板目标约 779 MiB；启动分配时按可用内存缩减，并预留至少 768 MiB。
+    # 超出普通锁页限额时需要 CAP_IPC_LOCK；以实际驻留/锁页证据判定通过。
+    max_memory_pct: 20
+    reserve_mib: 768
   storage:
     enabled: true
-    duration_min: 1
+    duration_min: 4320
     targets:
     - /data
-    write_budget_gib: 8.0
-    chunk_mib: 250
-    rounds: 2
-    log_reserve_mib: 64
-    metadata_reserve_mib: 64
+    # 72 轮均匀分布于 72 小时，首轮立即执行，之后每小时一轮。
+    # 每盘测试写入 18 GiB 并读回校验；加日志/元数据预留共 19.125 GiB。
+    write_budget_gib: 24.0
+    chunk_mib: 256
+    rounds: 72
+    log_reserve_mib: 1024
+    metadata_reserve_mib: 128
     cumulative_write_budget_gib: null
     direct: true
   lte:
     enabled: true
-    duration_min: 1
+    duration_min: 4320
     at_port: ''
   battery:
     enabled: true
-    duration_min: 1
-    charge_duration_min: 1
+    # 接适配器持续监测；充满后继续监测至时长达标，不做放电循环。
+    duration_min: 4320
+    charge_duration_min: 4320
     discharge_duration_min: 0
     cycles: 1
     completion_mode: fixed_duration
@@ -45,7 +53,9 @@ items:
     stop_confirm_samples: 6
     max_read_failures: 3
 protection:
-  cpu_stop_temperature_c: null
+  # 暂定工程停止保护线，不代表产品额定温度或验收规格。
+  cpu_stop_temperature_c: 85
+  # 电池具体型号/规格未确认，不预设电压、电流及温度门限。
   battery_charge_temperature_range_c: null
   battery_discharge_temperature_range_c: null
   battery_min_voltage_mv: null

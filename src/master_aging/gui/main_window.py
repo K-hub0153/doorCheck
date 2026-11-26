@@ -284,7 +284,7 @@ class MainWindow(QMainWindow):
                 subnet = dialog.subnet()
             self.scanning = True
             self.scan_button.setEnabled(False)
-            self.scan_label.setText('正在扫描：' + (subnet or '自动识别局域网'))
+            self.scan_label.setText('正在扫描（自动补查未响应地址）：' + (subnet or '自动识别局域网'))
             self.progress.setRange(0, 0)
             self.progress.show()
             self.log('开始子网扫描：' + (subnet or '自动识别局域网'))
@@ -292,7 +292,11 @@ class MainWindow(QMainWindow):
                 try:
                     self.scan_progress.put_nowait((scanned, total))
                 except queue.Full:
-                    pass
+                    try:
+                        self.scan_progress.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.scan_progress.put_nowait((scanned, total))
             def complete(devices):
                 self.finish_scan()
                 self.scan_label.setText('扫描完成 · 发现 %s 台设备' % len(devices))

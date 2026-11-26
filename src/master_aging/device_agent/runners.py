@@ -42,6 +42,32 @@ sys.exit(result if result >= 0 else 128 - result)
 '''
 
 
+def vm_regions(smaps, allocation):
+    """定位 stress-ng 的匿名测试映射，排除堆栈、工具控制页与文件映射。"""
+    regions, current = [], None
+    for line in smaps.splitlines():
+        if re.match(r'^[0-9a-f]+-[0-9a-f]+ ', line):
+            if current:
+                regions.append(current)
+            parts = line.split(None, 5)
+            start, end = (int(value, 16) for value in parts[0].split('-'))
+            current = {'address': parts[0], 'mapped_bytes': end - start, 'permissions': parts[1],
+                       'anonymous': parts[4] == '0' and (len(parts) == 5 or parts[5].startswith('[anon:')),
+                       'rss_bytes': 0, 'swap_bytes': 0, 'locked_bytes': 0}
+        elif current and ':' in line:
+            name, value = line.split(':', 1)
+            key = {'Rss': 'rss_bytes', 'Swap': 'swap_bytes', 'Locked': 'locked_bytes'}.get(name)
+            if key:
+                current[key] = int(value.split()[0]) * 1024
+    if current:
+        regions.append(current)
+    # 内核可能将相邻匿名区合并；锁定量另行核验，不能仅凭进程总 RSS 推断。
+    page_size = os.sysconf('SC_PAGE_SIZE')
+    expected = allocation // page_size * page_size
+    return [region for region in regions if region['anonymous'] and region['permissions'].startswith('rw-p')
+            and region['mapped_bytes'] >= expected]
+
+
 class Process:
     """只持有本次创建的进程组；停止时回收后才允许最终结论。"""
     def __init__(self, args, directory, name):
@@ -62,7 +88,7 @@ class Process:
     def poll(self):
         return self.process.poll()
 
-    def memory_snapshot(self):
+    def memory_snapshot(self, vm_bytes=None):
         """读取本进程组的内存证据，区分控制进程与实际执行校验的 worker。"""
         proc = Path('/proc')
         if not proc.is_dir():
@@ -81,15 +107,24 @@ class Process:
                     if current[0] in ('Z', 'X'):
                         continue
                     raise ValueError('进程 %s 缺少 VmSwap/VmRSS' % path.parent.name)
-                members.append({'pid': int(path.parent.name), 'ppid': int(fields[1]),
+                member = {'pid': int(path.parent.name), 'ppid': int(fields[1]),
                                 'name': status.get('Name', '').strip(),
                                 'rss_bytes': int(status['VmRSS'].split()[0]) * 1024,
-                                'swap_bytes': int(status['VmSwap'].split()[0]) * 1024})
+                                'swap_bytes': int(status['VmSwap'].split()[0]) * 1024}
+                if (vm_bytes is not None and member['pid'] != self.process.pid
+                        and (member['ppid'] != self.process.pid or member['name'].startswith('stress-ng-vm'))):
+                    member['vm_regions'] = vm_regions((path.parent / 'smaps').read_text(), vm_bytes)
+                members.append(member)
             except (FileNotFoundError, ProcessLookupError):
                 continue  # 采样时自然退出的进程。
+        regions = [region for member in members for region in member.get('vm_regions', [])]
         return {'pgid': self.process.pid, 'processes': members,
                 'rss_bytes': sum(p['rss_bytes'] for p in members),
-                'swap_bytes': sum(p['swap_bytes'] for p in members)}
+                'swap_bytes': sum(p['swap_bytes'] for p in members),
+                'vm_regions': regions,
+                'vm_swap_bytes': sum(region['swap_bytes'] for region in regions),
+                'vm_locked_bytes': sum(region['locked_bytes'] for region in regions),
+                'vm_rss_bytes': sum(region['rss_bytes'] for region in regions)}
 
     def request_stop(self):
         # 先由 wrapper 通知负载主进程正常收尾，避免直接终止 stress-ng worker。

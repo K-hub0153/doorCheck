@@ -256,6 +256,10 @@ class BuildScript:
             else:
                 cmd.extend(["--add-data", f"{icon_path}:."])
 
+        # Validate embedded device dependencies before constructing the executable.
+        from src.master_aging.adapters.offline_runtime import validate_resources
+        validate_resources()
+
         # 打包 assets 目录到程序内部
         assets_path = self.project_root / "assets"
         if assets_path.exists():
