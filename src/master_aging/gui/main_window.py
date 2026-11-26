@@ -366,7 +366,7 @@ class MainWindow(QMainWindow):
         self.job(read, completed, failed)
 
     def apply_device_info(self, info):
-        self.found(info)
+        self.found(dict(info, identity_source='serial_id', discovery_note='身份已读取'))
         entry = self.devices[info['ip']]
         entry['hardware_text'] = info['chip'] + ' / ' + info['kernel']
         size = info.get('memory', {}).get('MemTotal', 0) / 2**30

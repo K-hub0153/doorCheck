@@ -30,7 +30,7 @@ class DeviceSelectionDialog(QDialog):
     def __init__(self, devices, parent=None):
         super().__init__(parent)
         self.setWindowTitle('选择设备')
-        self.resize(760, 440)
+        self.resize(980, 440)
         self.devices, self.checks = devices, []
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
@@ -38,8 +38,8 @@ class DeviceSelectionDialog(QDialog):
         select_all = QCheckBox('全选')
         header.addWidget(select_all)
         layout.addLayout(header)
-        table = QTableWidget(len(devices), 4)
-        table.setHorizontalHeaderLabels(['选择', 'SN', 'IP', '机型'])
+        table = QTableWidget(len(devices), 6)
+        table.setHorizontalHeaderLabels(['选择', 'SN / 主机名', 'IP', '机型', '开放端口', '识别状态'])
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
         table.verticalHeader().hide()
@@ -51,6 +51,8 @@ class DeviceSelectionDialog(QDialog):
             table.setCellWidget(row, 0, check)
             for col, key in enumerate(('sn', 'ip', 'model'), 1):
                 table.setItem(row, col, QTableWidgetItem(str(device.get(key, ''))))
+            table.setItem(row, 4, QTableWidgetItem(', '.join(str(port) for port in device.get('open_ports', []))))
+            table.setItem(row, 5, QTableWidgetItem(device.get('discovery_note', '')))
         select_all.toggled.connect(lambda checked: [c.setChecked(checked) for c in self.checks])
         layout.addWidget(table)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)

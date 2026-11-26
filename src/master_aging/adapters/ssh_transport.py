@@ -201,7 +201,9 @@ fi
         self.connect()
         # 先核验身份，再启用内嵌依赖；恢复时也复用同一版本运行环境。
         sn = self.command(['cat', '/etc/serial-id']).strip()
-        if not sn or (self.device.get('sn') and sn != self.device['sn']):
+        expected_sn = (self.device.get('sn')
+                       if self.device.get('identity_source') not in ('hostname', 'unverified') else None)
+        if not sn or (expected_sn and sn != expected_sn):
             raise ValueError('设备 SN 与所选身份不一致，未部署环境')
         self.report('启用设备离线 Python 运行环境')
         self.deployment.append(self.environment().ensure(['python3']))

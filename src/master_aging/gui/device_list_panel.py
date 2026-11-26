@@ -47,8 +47,11 @@ class DeviceCard(QFrame):
 
     def update_device(self, device):
         self.sn.setText(device.get('sn') or '身份待读取')
+        self.sn.setToolTip(device.get('discovery_note', ''))
         self.hardware.setText(device.get('hardware_text') or device.get('chip') or device.get('model') or '机型待读取')
         self.storage.setText(device.get('storage_text') or device.get('disk_model') or '内存 / 存储待读取')
+        if not device.get('run_id'):
+            self.status.setText(device.get('discovery_note') or '待配置')
 
     def update_status(self, status, live='', confirmation_pending=False):
         state, result = status['state'], status.get('result')

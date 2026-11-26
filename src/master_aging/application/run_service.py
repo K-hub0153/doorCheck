@@ -36,6 +36,11 @@ class RunService:
     def start(self, devices, plan):
         plan = deepcopy(validate_plan(plan))
         plan.pop('max_parallel_devices', None)
+        unverified = [device['ip'] for device in devices
+                      if device.get('identity_source') in ('hostname', 'unverified')]
+        if unverified:
+            raise ValueError('以下设备尚未确认 SN，请先读取设备信息，确认 SSH 可连接及 /etc/serial-id 有效：'
+                             + ', '.join(unverified))
         if not devices or len({d['sn'] for d in devices}) != len(devices):
             raise ValueError('请选择设备，且同批 SN 不得重复')
         if len({d['ip'] for d in devices}) != len(devices):
