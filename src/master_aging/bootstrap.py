@@ -9,6 +9,11 @@ def main():
     try:
         window = MainWindow()
     except Exception as exc:
+        from .infrastructure.local_logs import application_logger
+        try:
+            application_logger().exception('主控老化工具启动失败')
+        except OSError:
+            pass  # 日志目录不可写时仍须显示原始启动错误。
         QMessageBox.critical(None, '主控老化工具启动失败', str(exc))
         return 1
     window.show()

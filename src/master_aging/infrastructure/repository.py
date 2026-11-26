@@ -1,4 +1,4 @@
-"""MySQL 是老化结果的唯一持久化来源；不回退到本地文件。"""
+"""MySQL 保存老化结论、关键事件与精简指标；详细日志由 PC 单独落盘。"""
 from contextlib import contextmanager
 import hashlib
 import base64
@@ -7,6 +7,7 @@ import json
 import pymysql
 
 from .config import database_settings
+from .log_summary import CLOUD_INTERVAL_S, cloud_record, cloud_status, important_metric, compact
 from ..domain.models import utc_now
 
 
@@ -101,7 +102,8 @@ class Repository:
                     (run_id, batch_id, device['sn'], device['ip'], now, 'PREFLIGHT', None, encode(plan), encode(status)))
                 db.execute('UPDATE master_aging_device SET run_id=%s WHERE sn=%s', (run_id, device['sn']))
 
-    def save_status(self, run_id, status):
+    def save_status(self, run_id, status, log_transition=True):
+        status = cloud_status(status)
         with self.connection() as db:
             db.execute('UPDATE master_aging_run SET state=%s,result=%s,run_status=%s WHERE run_id=%s',
                        (status['state'], status.get('result'), encode(status), run_id))
@@ -114,8 +116,9 @@ class Repository:
                     ON DUPLICATE KEY UPDATE payload=VALUES(payload)''', (run_id, target, encode(ledger)))
             message = '%s result=%s seq=%s %s' % (status['state'], status.get('result'), status.get('seq'),
                 status.get('error') or status.get('connection_error') or status.get('environment_message') or '')
-            db.execute('INSERT INTO master_aging_ctrl_log (run_id,created_at,message) VALUES (%s,%s,%s)',
-                       (run_id, utc_now(), message))
+            if log_transition:
+                db.execute('INSERT INTO master_aging_ctrl_log (run_id,created_at,message) VALUES (%s,%s,%s)',
+                           (run_id, utc_now(), message))
 
     def update_ip(self, run_id, ip):
         with self.connection() as db:
@@ -123,7 +126,7 @@ class Repository:
 
     def save_manifest(self, run_id, manifest):
         with self.connection() as db:
-            db.execute('UPDATE master_aging_run SET manifest=%s WHERE run_id=%s', (encode(manifest), run_id))
+            db.execute('UPDATE master_aging_run SET manifest=%s WHERE run_id=%s', (encode(compact(manifest)), run_id))
 
     def mark_synced(self, run_id):
         with self.connection() as db:
@@ -150,20 +153,40 @@ class Repository:
         with self.connection() as db:
             # 串行化同一运行的补采，记录和字节游标在一个事务中提交。
             db.execute('SELECT record_offset FROM master_aging_run WHERE run_id=%s FOR UPDATE', (run_id,))
-            if db.fetchone() is None:
+            row = db.fetchone()
+            if row is None:
                 raise ValueError('运行不存在')
+            if offset is not None and offset <= row['record_offset']:
+                return  # 本机详细日志从头补采时，已提交的云端部分无需再次写入。
+            db.execute("SELECT payload FROM master_aging_record WHERE run_id=%s AND kind='metric' ORDER BY seq DESC LIMIT 1", (run_id,))
+            previous = db.fetchone()
+            previous = json.loads(previous['payload']) if previous else None
+            existing_records = {}
+            if records:
+                db.execute('SELECT seq,payload FROM master_aging_record WHERE run_id=%s AND seq BETWEEN %s AND %s',
+                           (run_id, records[0]['seq'], records[-1]['seq']))
+                existing_records = {entry['seq']: entry['payload'] for entry in db.fetchall()}
+            inserts = []
             for record in records:
-                db.execute('SELECT payload FROM master_aging_record WHERE run_id=%s AND seq=%s', (run_id, record['seq']))
-                existing = db.fetchone()
+                summary = cloud_record(record)
+                existing = existing_records.get(record['seq'])
                 if existing:
-                    saved = json.loads(existing['payload'])
+                    saved = json.loads(existing)
                     saved.pop('received_at', None)
-                    if saved != record:
+                    if cloud_record(saved) != summary:
                         raise ValueError('相同运行/序号的设备记录内容发生变化')
                     continue
-                payload = dict(record, received_at=utc_now())
-                db.execute('INSERT INTO master_aging_record (run_id,seq,kind,payload) VALUES (%s,%s,%s,%s)',
-                           (run_id, record['seq'], record['kind'], encode(payload)))
+                if record['kind'] == 'metric':
+                    if (previous and previous.get('boot_id') == record.get('boot_id')
+                            and (record['seq'] < previous['seq']
+                                 or (0 <= record['monotonic'] - previous['monotonic'] < CLOUD_INTERVAL_S
+                                     and not important_metric(record)))):
+                        continue
+                    previous = record
+                payload = dict(summary, received_at=utc_now())
+                inserts.append((run_id, record['seq'], record['kind'], encode(payload)))
+            if inserts:
+                db.executemany('INSERT INTO master_aging_record (run_id,seq,kind,payload) VALUES (%s,%s,%s,%s)', inserts)
             if offset is not None:
                 db.execute('UPDATE master_aging_run SET record_offset=GREATEST(record_offset,%s) WHERE run_id=%s', (offset, run_id))
 

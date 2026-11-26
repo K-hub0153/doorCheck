@@ -60,7 +60,7 @@ class DeviceCard(QFrame):
             label = '电源确认已提交，等待设备响应'
         self.status.setText(label + (' · ' + result if result else ''))
         self.status.setStyleSheet('color:%s;font-weight:bold' % status_color(result or state))
-        self.status.setToolTip(status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or '')
+        self.status.setToolTip(status.get('local_log_error') or status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or '')
         self.live.setText(live)
 
     def set_active(self, active):

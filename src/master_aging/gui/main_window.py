@@ -21,6 +21,7 @@ from ..infrastructure.report_server import ReportServer
 from .plan_dialog import PlanDialog
 from .power_confirmation_dialog import PowerConfirmationDialog
 from .execution_log_dialog import ExecutionLogDialog
+from ..infrastructure.local_logs import application_logger, log_root
 from .metrics_panel import MetricsPanel
 from .device_list_panel import DeviceListPanel
 from .discovery_dialogs import DeviceSelectionDialog, InterfaceDialog
@@ -34,6 +35,7 @@ class MainWindow(QMainWindow):
         self.resize(1380, 900)
         self.setMinimumSize(1080, 720)
         self.setStyleSheet(STYLE)
+        self.logger = application_logger()
         self.repository = Repository()
         self.service = RunService(self.repository)
         self.report_server = ReportServer(self.repository)
@@ -66,6 +68,7 @@ class MainWindow(QMainWindow):
         self.timer.start(400)
         self.load_history()
         self.log('数据存储：MySQL ' + self.repository.description)
+        self.log('详细日志目录：' + str(log_root()))
         if plan_error:
             self.log('已读取的计划需要重新配置：' + plan_error)
 
@@ -242,6 +245,7 @@ class MainWindow(QMainWindow):
         self.toast_timer.start(3000)
 
     def log(self, message):
+        self.logger.info(message)
         self.messages.appendPlainText(message)
         self.statusBar().showMessage(message, 10000)
 
@@ -749,8 +753,8 @@ class MainWindow(QMainWindow):
             self.metrics.update_status(run_id, status)
             ip = self.run_devices.get(run_id)
             if ip in self.devices:
-                reason = status.get('storage_error') or status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
-                previous_reason = previous.get('storage_error') or previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or previous.get('environment_message') or ''
+                reason = status.get('local_log_error') or status.get('storage_error') or status.get('error') or status.get('connection_error') or status.get('safety_stop') or status.get('environment_message') or ''
+                previous_reason = previous.get('local_log_error') or previous.get('storage_error') or previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or previous.get('environment_message') or ''
                 if (status['state'], reason) != (previous.get('state'), previous_reason):
                     self.log('%s：%s %s' % (self.devices[ip]['sn'], STATES.get(status['state'], status['state']), reason))
                 if status.get('battery', {}).get('confirmed') and not previous.get('battery', {}).get('confirmed'):

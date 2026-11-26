@@ -257,7 +257,7 @@ def render_execution_log(row, records):
                                       item_reason(key, item, records, config.get(key))))
         if item.get('argv'):
             stream.write('执行参数：' + json.dumps(item['argv'], ensure_ascii=False) + '\n')
-    stream.write('以下为设备记录，时间为 UTC，按事件序号排列。连接与部署过程见 controller.log。\n\n')
+    stream.write('以下为云端事件及精简指标摘要，时间为 UTC，序号可能不连续。详细采样和工具输出保存在执行任务电脑的 logs/master_aging 目录。\n\n')
     for record in sorted(records, key=lambda r: r['seq']):
         data = record['data']
         if data.get('reason') == GENERIC_MONITOR_REASON and data.get('item') in status.get('items', {}):
@@ -319,14 +319,16 @@ def render_report(repository, run_id):
         body += '<tr><td>' + text(ITEMS.get(key, key)) + '</td><td>' + text(item.get('planned_s')) + '</td><td>' + text(round(item.get('effective_s', 0), 2)) + '</td><td class="' + text(item_result) + '">' + text(item_result) + '</td><td>' + text(reasons[key]) + '<br>' + text(item_scope(key, item)) + '</td></tr>'
     body += '</table><p><small>CPU/DDR/存储等为合成负载。日志或时长不足不能判通过。</small></p>'
     curves = metric_curves(records)
-    body += '<h2>采样曲线</h2><div class="grid">' + ''.join(chart(key, points, snapshot.get('max_sample_gap_s', 40)) for key, points in curves.items()) + '</div>'
+    cloud_interval = status.get('logging', {}).get('cloud_metric_interval_s')
+    gap_limit = max(snapshot.get('max_sample_gap_s', 40), cloud_interval * 2) if cloud_interval else snapshot.get('max_sample_gap_s', 40)
+    body += '<h2>采样曲线</h2><p>云端保留关键事件和精简指标；详细日志保存在执行任务电脑的 logs/master_aging 目录。</p><div class="grid">' + ''.join(chart(key, points, gap_limit) for key, points in curves.items()) + '</div>'
     body += event_timeline(records, reasons)
     for title, value in (('硬件与固件', status.get('hardware')), ('环境记录', snapshot.get('environment')),
                          ('电池阶段与积分', status.get('battery')), ('存储写入账本', status.get('write_ledger')),
                          ('运行配置快照', snapshot), ('清理结果', {'confirmed': status.get('cleanup_confirmed'), 'errors': status.get('cleanup_errors')})):
         body += '<details class="card"><summary>' + text(title) + '</summary><pre>' + text(evidence_text(value)) + '</pre></details>'
-    body += '<p><a href="metrics.csv">原始指标 CSV</a> · <a href="records.json">完整事件与采样 JSON</a> · <a href="summary.json">结论 JSON</a></p>'
-    body += '<h2>执行日志</h2><p><a href="execution.log">查看执行日志（含 4G 原始响应）</a>'
+    body += '<p><a href="metrics.csv">指标摘要 CSV</a> · <a href="records.json">事件与指标摘要 JSON</a> · <a href="summary.json">结论 JSON</a></p>'
+    body += '<h2>执行日志</h2><p><a href="execution.log">查看云端日志摘要</a>'
     body += ' · <a href="controller.log">连接与部署日志</a></p><ul>'
     for artifact in repository.artifacts(run_id):
         name = artifact['name']
@@ -348,8 +350,10 @@ def render_batch(repository, batch_id):
         environment = snapshot.get('environment', {})
         records = repository.records(row['run_id'], kind='metric')
         origin = records[0]['monotonic'] if records else 0
+        cloud_interval = json.loads(row['status']).get('logging', {}).get('cloud_metric_interval_s')
+        gap_limit = max(snapshot.get('max_sample_gap_s', 40), cloud_interval * 2) if cloud_interval else snapshot.get('max_sample_gap_s', 40)
         for label, points in metric_curves(records).items():
-            batch_curves[label].append((row['sn'], [(x - origin, y) for x, y in points], snapshot.get('max_sample_gap_s', 40)))
+            batch_curves[label].append((row['sn'], [(x - origin, y) for x, y in points], gap_limit))
         result = row['result'] or 'INCOMPLETE'
         totals[result] = totals.get(result, 0) + 1
         relative = '../../run/' + row['run_id'] + '/report.html'

@@ -11,12 +11,16 @@ from ..adapters.environment import DeploymentCancelled
 from ..domain.models import conclusion, digest, new_id, utc_now
 from ..domain.policies import validate_plan
 from ..infrastructure.repository import StorageUnavailable, RunOwned
+from ..infrastructure.local_logs import LocalLogs
+from ..infrastructure.log_summary import CLOUD_INTERVAL_S, cloud_status, state_signature
 
 
 class RunService:
     """每个设备一条串行控制通道；跨设备并行，事件通过线程安全队列交给 GUI。"""
-    def __init__(self, repository, transport_factory=SSHTransport):
+    def __init__(self, repository, transport_factory=SSHTransport, local_logs=None):
         self.repository = repository
+        self.local_logs = local_logs if local_logs is not None else LocalLogs()
+        self._cloud_status = {}
         self.controller_id = new_id()
         self.transport_factory = transport_factory
         self.events = queue.Queue(maxsize=2048)
@@ -80,6 +84,7 @@ class RunService:
                 raise ValueError('该运行正在连接或执行')
             if any(s['device']['sn'] == device['sn'] for s in self.active.values()):
                 raise ValueError('同一 SN 已有本地运行，先停止或恢复原运行')
+            self.local_logs.metadata(run_id, 'context.json', {'device': device, 'batch_id': batch_id})
             state = {'device': device, 'batch_id': batch_id, 'status': {}, 'confirmation_queued': False,
                      'initial_status': deepcopy(initial_status or {}),
                      'stop': threading.Event(), 'commands': queue.Queue(),
@@ -138,25 +143,40 @@ class RunService:
             if control:
                 control['status'] = deepcopy(status)
                 self._queue_power_confirmation(control)
-        self.repository.save_status(run_id, status)
+        try:
+            local_changed = self.local_logs.status(run_id, status)
+        except OSError as exc:
+            raise LocalLogUnavailable('本地详细日志写入失败：' + str(exc)) from exc
+        if local_changed:
+            self.notify(run_id, status)
+        signature = state_signature(status)
+        payload = cloud_status(status)
+        previous = self._cloud_status.get(run_id)
+        now = time.monotonic()
+        changed = previous is None or signature != previous['signature']
+        if changed or (payload != previous['payload'] and now - previous['at'] >= CLOUD_INTERVAL_S):
+            self.repository.save_status(run_id, payload, log_transition=changed)
+            self._cloud_status[run_id] = {'signature': signature, 'payload': payload, 'at': now}
         if not status.get('launch_requested') and not status.get('run_id') and status['state'] in ('BLOCKED', 'FINISHED'):
             self.repository.mark_synced(run_id)
-        self.notify(run_id, status)
 
-    def _ingest(self, transport, run_id):
-        offset = self.repository.get(run_id)['record_offset']
+    def _ingest(self, transport, run_id, cloud=True):
+        # 数据库失败后从较早的游标重读；本地 append 幂等，不丢失待上传摘要。
+        try:
+            offset = self.local_logs.cursor(run_id)['offset']
+            if cloud:
+                offset = min(offset, self.repository.get(run_id)['record_offset'])
+        except OSError as exc:
+            raise LocalLogUnavailable('本地日志游标读取失败：' + str(exc)) from exc
         while True:
             records, offset, more = transport.records(run_id, offset)
             if records:
-                last = self.repository.last_seq(run_id)
-                for record in records:
-                    if record.get('run_id') != run_id:
-                        raise ValueError('记录运行身份不匹配')
-                    if record['seq'] > last:
-                        if record['seq'] != last + 1:
-                            raise ValueError('设备日志序号缺段')
-                        last = record['seq']
-                self.repository.ingest(run_id, records, offset)
+                try:
+                    self.local_logs.append(run_id, records, offset)
+                except OSError as exc:
+                    raise LocalLogUnavailable('本地详细日志写入失败：' + str(exc)) from exc
+                if cloud:
+                    self.repository.ingest(run_id, records, offset)
             if not more:
                 break
 
@@ -170,6 +190,8 @@ class RunService:
         confirmed_reboot = False
         confirmation_poll_until = 0
         claimed = False
+        last_claim = 0
+        ingested_seq = None
         try:
             while not gate.acquire(timeout=0.2):
                 if self.detaching.is_set() or control['stop'].is_set():
@@ -193,8 +215,10 @@ class RunService:
                     if claimed and launched and transport and control['stop'].is_set() and not stop_sent:
                         transport.action('stop', run_id)
                         stop_sent = True
-                    self.repository.claim(run_id, self.controller_id)
-                    claimed = True
+                    if not claimed or time.monotonic() - last_claim >= 60:
+                        self.repository.claim(run_id, self.controller_id)
+                        claimed = True
+                        last_claim = time.monotonic()
                     if transport is None:
                         transport = self.transport_factory(device)
                         def progress(message):
@@ -223,8 +247,11 @@ class RunService:
                             if control['stop'].is_set() or self.detaching.is_set():
                                 raise DeploymentCancelled('环境准备期间已取消，未启动老化负载')
                             request = {'run_id': run_id, 'device': dict(device, fingerprint=info['fingerprint']), 'plan': plan}
-                            self.repository.save_manifest(run_id, {'run_id': run_id, 'device': info,
-                                'created_at': utc_now(), 'config_hash': digest(plan), 'agent_sha256': transport.agent.rsplit('-', 1)[-1][:-4]})
+                            manifest = {'run_id': run_id, 'device': info,
+                                'created_at': utc_now(), 'config_hash': digest(plan), 'agent_sha256': transport.agent.rsplit('-', 1)[-1][:-4]}
+                            self.local_logs.metadata(run_id, 'manifest.json', manifest)
+                            self.local_logs.metadata(run_id, 'config_snapshot.json', plan)
+                            self.repository.save_manifest(run_id, manifest)
                             # 在提交启动之前持久化意图。命令响应丢失后只查询原 run_id。
                             last_status.update(state='READY', hardware=info, launch_requested=True,
                                                environment_message='环境准备完成，正在启动老化预检')
@@ -282,34 +309,45 @@ class RunService:
                     else:
                         # 运行状态先交给界面，日志补采较慢时不阻塞确认结果显示。
                         self._store(run_id, last_status)
-                        self._ingest(transport, run_id)
+                        if ingested_seq != status.get('seq'):
+                            self._ingest(transport, run_id)
+                            ingested_seq = status.get('seq')
                     failures = 0
                     if last_status['state'] in ('FINISHED', 'BLOCKED'):
                         try:
-                            transport.collect(run_id, self.repository)
+                            transport.collect(run_id, self.local_logs)
                             last_status.pop('attachment_error', None)
                             self._store(run_id, last_status)
-                        except StorageUnavailable:
+                        except (StorageUnavailable, LocalLogUnavailable):
                             raise
                         except Exception as exc:
                             last_status['attachment_error'] = str(exc)
                             self._store(run_id, last_status)
-                        if self.repository.last_seq(run_id) != status.get('seq', 0):
+                        if self.local_logs.cursor(run_id)['seq'] != status.get('seq', 0):
                             last_status.update(result='FAIL' if last_status.get('result') == 'FAIL' else 'INCOMPLETE',
                                                error='最终日志缺段，不能确认数据完整')
                             self._store(run_id, last_status)
-                        if not last_status.get('attachment_error') and self.repository.last_seq(run_id) == status.get('seq', 0):
+                        if not last_status.get('attachment_error') and self.local_logs.cursor(run_id)['seq'] == status.get('seq', 0):
                             self.repository.mark_synced(run_id)
                         return
                 except RunOwned:
                     raise
                 except StorageUnavailable as exc:
-                    # 不推进游标、不回退本地文件，保持设备采样，重连后幂等补采。
+                    # 本地完整日志可领先云端；云端游标仍须事务提交后才能推进。
                     failures += 1
                     self.notify(run_id, dict(last_status, storage_error=str(exc)))
+                    if launched and transport:
+                        try:
+                            self._ingest(transport, run_id, cloud=False)
+                        except Exception as local_exc:
+                            self.notify(run_id, dict(last_status, storage_error=str(exc),
+                                                     local_log_error=str(local_exc)))
                     if not launched and transport:
                         transport.close()
                         transport = None
+                except LocalLogUnavailable as exc:
+                    failures += 1
+                    self.notify(run_id, dict(last_status, local_log_error=str(exc)))
                 except DeploymentCancelled as exc:
                     last_status.update(state='FINISHED', result='ABORTED', error=str(exc), cleanup_confirmed=True)
                     self._store(run_id, last_status)
@@ -348,7 +386,11 @@ class RunService:
             try:
                 self._store(run_id, last_status)
             except StorageUnavailable as storage_error:
-                self.notify(run_id, dict(last_status, storage_error=str(storage_error)))
+                last_status['storage_error'] = str(storage_error)
+                self.notify(run_id, last_status)
+            except LocalLogUnavailable as local_error:
+                last_status['local_log_error'] = str(local_error)
+                self.notify(run_id, last_status)
         finally:
             if transport:
                 transport.close()
@@ -378,3 +420,7 @@ class RunService:
     def busy(self):
         with self._lock:
             return bool(self.active)
+
+
+class LocalLogUnavailable(RuntimeError):
+    """本地磁盘不可写时保留设备日志，重试成功前不宣称日志补采完成。"""
