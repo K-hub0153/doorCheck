@@ -3,6 +3,7 @@ from copy import deepcopy
 import ipaddress
 import json
 import queue
+import time
 
 from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtGui import QColor, QDesktopServices
@@ -16,6 +17,7 @@ from ..adapters.vsm import check_environment, check_platform, manual_device
 from ..application.run_service import RunService
 from ..domain.models import ITEMS
 from ..domain.policies import planned_seconds, validate_plan
+from ..domain.time_display import china_time
 from ..infrastructure.config import load_config
 from ..infrastructure.repository import Repository
 from ..infrastructure.report_server import ReportServer
@@ -55,6 +57,8 @@ class MainWindow(QMainWindow):
         self.log_dialogs = {}
         self.jobs, self.work_pool = [], ThreadPoolExecutor(max_workers=4, thread_name_prefix='aging-discovery')
         self.probing, self.job_messages = set(), queue.Queue()
+        self.recovering, self.recovery_checked, self.pending_stops = set(), set(), set()
+        self.recovery_retry = {}
         self.scan_progress = queue.Queue(maxsize=1)
         self.scanning = False
         self.closing = False
@@ -205,7 +209,7 @@ class MainWindow(QMainWindow):
         self.statistics.setWordWrap(True)
         history_layout.addWidget(self.statistics)
         self.history = QTableWidget(0, 6)
-        self.history.setHorizontalHeaderLabels(['创建时间', 'SN', '连接地址', '状态', '结论', '运行 ID'])
+        self.history.setHorizontalHeaderLabels(['创建时间（北京时间）', 'SN', '连接地址', '状态', '结论', '运行 ID'])
         self.history.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.history.setSelectionMode(QAbstractItemView.SingleSelection)
         self.history.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -259,12 +263,87 @@ class MainWindow(QMainWindow):
 
     def found(self, device):
         ip = device['ip']
+        previous = self.devices.get(ip)
+        if (previous and previous['sn'] != device['sn']
+                and (self.service.device_busy(previous['sn']) or previous['sn'] in self.recovering
+                     or previous['sn'] in self.pending_stops)):
+            self.log('%s 的地址已被其他设备占用，保留原运行；请恢复到正确的设备地址' % ip)
+            return
+        # DHCP 地址变化时按真实 SN 合并，保留原运行与复选框，避免出现两张卡片。
+        for old_ip, previous in list(self.devices.items()):
+            if old_ip != ip and previous['sn'] == device['sn']:
+                checked = self.device_list.cards[old_ip].check.isChecked()
+                was_current = self.device_list.current_ip == old_ip
+                device = dict(previous, **device)
+                self.devices.pop(old_ip)
+                self.device_list.remove(old_ip)
+                self.devices[ip] = device
+                for run_id, address in list(self.run_devices.items()):
+                    if address == old_ip:
+                        self.run_devices[run_id] = ip
+                self.device_list.upsert(device)
+                self.device_list.cards[ip].check.setChecked(checked)
+                if was_current:
+                    self.device_list.activate(ip)
+                self.recovery_checked.discard(device['sn'])
+                break
+        previous = self.devices.get(ip)
+        if previous and previous['sn'] != device['sn']:
+            for run_id, address in list(self.run_devices.items()):
+                if address == ip:
+                    self.run_devices.pop(run_id)
+            self.devices[ip] = {}
         new = ip not in self.devices
         self.devices.setdefault(ip, {}).update(device)
         self.device_list.upsert(self.devices[ip])
         self.update_selection_count()
         if new:
             self.log('发现：%s (%s)' % (device.get('sn', ''), ip))
+        self.recover_device(self.devices[ip])
+
+    def recover_device(self, device, force=False):
+        sn = device['sn']
+        if (self.closing or sn in self.recovering
+                or device.get('identity_source') in ('hostname', 'unverified')
+                or (not force and sn in self.recovery_checked)):
+            return
+        self.recovering.add(sn)
+        self.recovery_checked.add(sn)
+        self.recovery_retry.pop(sn, None)
+        requested = deepcopy(device)
+
+        def completed(row):
+            self.recovering.discard(sn)
+            current = next((d for d in self.devices.values() if d['sn'] == sn), None)
+            stop = sn in self.pending_stops
+            self.pending_stops.discard(sn)
+            if not row or current is None:
+                if stop:
+                    self.log('%s：没有需要停止的云端运行' % sn)
+                return
+            run_id = row['run_id']
+            current['run_id'] = run_id
+            self.run_devices[run_id] = current['ip']
+            self.statuses[run_id] = json.loads(row['status'])
+            if stop:
+                self.service.stop(run_id)
+                self.power_stopping.add(run_id)
+            self.device_list.upsert(current)
+            self.update_device_card(run_id)
+            if self.device_list.current_ip == current['ip']:
+                self.show_details(current['ip'])
+            self.log('%s：已关联云端原运行 %s，正在恢复连接和补采%s' %
+                     (sn, run_id, '，连接后停止' if stop else ''))
+            if current['ip'] != requested['ip']:
+                self.recover_device(current, force=True)
+            self.load_history()
+
+        def failed(exc):
+            self.recovering.discard(sn)
+            self.recovery_retry[sn] = time.monotonic() + 10
+            self.log('%s：查询/恢复云端运行失败，将自动重试：%s' % (sn, exc))
+
+        self.job(lambda: self.service.recover_device(requested), completed, failed)
 
     def selected(self):
         return [device for ip, device in self.devices.items() if self.device_list.cards[ip].check.isChecked()]
@@ -295,12 +374,15 @@ class MainWindow(QMainWindow):
             run_id = device.get('run_id')
             status = self.statuses.get(run_id, {})
             # 运行和补采中的设备必须先停止；列表删除不操作云端历史数据。
-            if (ip in self.probing or self.service.device_busy(device['sn'])
+            if (ip in self.probing or device['sn'] in self.recovering or device['sn'] in self.pending_stops
+                    or self.service.device_busy(device['sn'])
                     or (run_id and status.get('state') not in ('FINISHED', 'BLOCKED'))):
                 busy.append(device.get('sn') or ip)
                 continue
             removed.append(device.get('sn') or ip)
             self.devices.pop(ip)
+            self.recovery_checked.discard(device['sn'])
+            self.recovery_retry.pop(device['sn'], None)
             for identity, address in list(self.run_devices.items()):
                 if address == ip:
                     self.run_devices.pop(identity)
@@ -336,10 +418,13 @@ class MainWindow(QMainWindow):
                 self.finish_manual_add()
                 return
             existing = {device['sn'] for device in self.devices.values()}
+            for device in self.devices.values():
+                if device['sn'] in dialog.sns:
+                    self.recover_device(device, force=True)
             sns = [sn for sn in dialog.sns if sn not in existing]
             if not sns:
                 self.finish_manual_add()
-                QMessageBox.information(self, '手动添加', '输入的主控均已在设备列表中。')
+                QMessageBox.information(self, '手动添加', '输入的主控均已在设备列表中，已重新检查云端原运行。')
                 return
             self.manual_button.setText('验证连接…')
             self.log('正在通过本地 VSM 验证 %s 台主控的连接、SN 和 root 权限' % len(sns))
@@ -421,20 +506,13 @@ class MainWindow(QMainWindow):
                 dialog = DeviceSelectionDialog(devices, self)
                 if dialog.exec_() == QDialog.Accepted:
                     selected = dialog.selected_devices()
-                    # 空闲时用本次结果替换列表；运行或补采时保留原设备与运行映射。
-                    if (not self.service.busy() and not self.jobs and selected
-                            and not any(is_vsm(device) for device in self.devices.values())):
-                        self.devices.clear()
-                        self.device_list.clear()
-                        self.run_devices.clear()
-                        self.device_info.setText('请选择设备查看详情')
-                        self.metrics.select(None)
-                        self.detail.clear()
                     for device in selected:
                         if any(d['sn'] == device['sn'] and is_vsm(d) for d in self.devices.values()):
                             continue
                         self.found(device)
-                        self.device_list.cards[device['ip']].check.setChecked(True)
+                        if self.devices.get(device['ip'], {}).get('sn') == device['sn']:
+                            self.device_list.cards[device['ip']].check.setChecked(True)
+                            self.recover_device(self.devices[device['ip']], force=True)
             def failed(exc):
                 self.finish_scan()
                 self.scan_label.setText('扫描失败，请重试')
@@ -577,6 +655,8 @@ class MainWindow(QMainWindow):
                 raise ValueError('请勾选要运行的设备')
             if any(device['ip'] in self.probing for device in devices):
                 raise ValueError('所选设备正在读取信息，请等待完成后开始老化')
+            if any(device['sn'] in self.recovering or device['sn'] in self.recovery_retry for device in devices):
+                raise ValueError('正在核对所选设备的云端原运行，请等待恢复完成后操作')
             if not self.quality_mode:
                 self.reload_plan()
             if not self.plan_valid:
@@ -585,26 +665,46 @@ class MainWindow(QMainWindow):
                     return
             ids = self.service.start(deepcopy(devices), self.plan)
             for run_id, device in zip(ids, devices):
+                for old_id, address in list(self.run_devices.items()):
+                    if address == device['ip']:
+                        self.run_devices.pop(old_id)
                 self.run_devices[run_id] = device['ip']
                 self.devices[device['ip']]['run_id'] = run_id
+                self.statuses[run_id] = {'state': 'PREFLIGHT', 'items': {}, 'result': None}
+                self.update_device_card(run_id)
+                if self.device_list.current_ip == device['ip']:
+                    self.show_details(device['ip'])
             self.load_history()
             self.log('已提交 %s 台设备，正在检查环境并自动部署缺失依赖，完成后开始老化' % len(ids))
         except Exception as exc:
             self.error(exc)
 
     def stop_selected(self):
-        for device in self.selected():
-            if device.get('run_id'):
-                self.service.stop(device['run_id'])
-                self.power_stopping.add(device['run_id'])
+        devices = self.selected()
+        if not devices:
+            self.show_toast('请勾选需要停止的设备')
+            return
+        self.stop_devices(devices)
         self.refresh_power_confirmation()
         self.log('已请求停止选中设备；离线设备会在重连后接收，设备本地保护继续生效')
 
+    def stop_devices(self, devices):
+        for device in devices:
+            if device.get('run_id') and self.service.device_busy(device['sn']):
+                self.service.stop(device['run_id'])
+                self.power_stopping.add(device['run_id'])
+            elif device.get('identity_source') in ('hostname', 'unverified'):
+                self.log('%s：需先读取设备信息确认真实 SN，再恢复并停止原运行' % device['sn'])
+            else:
+                self.pending_stops.add(device['sn'])
+                self.recover_device(device, force=True)
+
     def stop_all(self):
         self.service.shutdown()
+        self.stop_devices(list(self.devices.values()))
         self.power_stopping.update(self.run_devices)
         self.refresh_power_confirmation()
-        self.log('已请求停止本工具控制的全部活动运行')
+        self.log('已请求停止本工具及设备列表中的全部活动运行；正在恢复的设备连接后自动停止')
 
     def waiting_power_confirmations(self):
         waiting = {}
@@ -691,7 +791,9 @@ class MainWindow(QMainWindow):
         temperature = ('%.1f℃' % max(temps)) if temps else '温度未采到'
         busy = latest.get('cpu', {}).get('busy_pct')
         busy_text = ('%.1f%%' % busy) if busy is not None else '未采到'
-        live = reason if status['state'] in ('DEPLOYING', 'READY') else 'CPU %s · %s\n%s' % (busy_text, temperature, remaining)
+        live = reason if status['state'] in ('DEPLOYING', 'READY', 'RECONNECTING') else 'CPU %s · %s\n%s' % (busy_text, temperature, remaining)
+        if status.get('interruption'):
+            live += '\n' + status['interruption']['reason']
         for key, item in status.get('items', {}).items():
             if item.get('result') in ('FAIL', 'INCOMPLETE', 'BLOCKED'):
                 live += '\n%s %s：%s' % (ITEMS.get(key, key), item['result'], item.get('stop_reason') or '未提供具体原因')
@@ -754,7 +856,7 @@ class MainWindow(QMainWindow):
         self.statistics.setText('总计 %s · %s' % (len(rows), ' · '.join('%s %s' % item for item in counts.items())))
         self.history.setRowCount(len(rows))
         for index, row in enumerate(rows):
-            values = [row['created_at'], row['sn'], row['ip'], row['state'], row['result'] or '', row['run_id']]
+            values = [china_time(row['created_at']), row['sn'], row['ip'], row['state'], row['result'] or '', row['run_id']]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(STATES.get(value, value) or '') if col == 3 else str(value or ''))
                 if col in (3, 4):
@@ -827,11 +929,12 @@ class MainWindow(QMainWindow):
                     return
                 address = str(ipaddress.IPv4Address(address.strip()))
                 device = {'ip': address, 'sn': row['sn']}
-            if address not in self.devices:
-                self.found(device)
+            self.service.resume(run_id, device=device)
+            self.recovery_checked.add(device['sn'])
+            self.found(dict(device, run_id=run_id))
             self.run_devices[run_id] = address
-            self.devices[address]['run_id'] = run_id
-            self.service.resume(run_id, address)
+            self.statuses[run_id] = json.loads(row['status'])
+            self.update_device_card(run_id)
             self.log('正在恢复补采：' + run_id)
         except Exception as exc:
             self.error(exc)
@@ -841,6 +944,13 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, '操作未完成', str(error))
 
     def tick(self):
+        for sn, due in list(self.recovery_retry.items()):
+            if not self.closing and time.monotonic() >= due:
+                device = next((d for d in self.devices.values() if d['sn'] == sn), None)
+                if device:
+                    self.recover_device(device, force=True)
+                else:
+                    self.recovery_retry.pop(sn, None)
         while True:
             try:
                 self.log(self.job_messages.get_nowait())

@@ -49,7 +49,7 @@ def state_signature(status):
     """状态/异常变化即时上传；有效秒数、采样序号变化不产生重复控制日志。"""
     return (tuple((key, status.get(key)) for key in ('state', 'result', 'error',
             'connection_error', 'environment_message', 'safety_stop', 'attachment_error',
-            'launch_requested', 'cleanup_confirmed', 'stop_pending')),
+            'launch_requested', 'cleanup_confirmed', 'stop_pending', 'interruption', 'evidence_error')),
             tuple((key, item.get('result'), item.get('stop_reason'))
                   for key, item in sorted(status.get('items', {}).items())),
             tuple((key, status.get('battery', {}).get(key))

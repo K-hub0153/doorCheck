@@ -2,7 +2,6 @@
 import base64
 import csv
 import io
-from datetime import datetime, timezone
 from html import escape
 import json
 import math
@@ -14,6 +13,7 @@ from urllib.parse import quote
 from ..domain.models import ITEMS
 from ..domain.execution_log import format_record
 from ..domain.diagnostics import GENERIC_MONITOR_REASON, LTE_SCOPE, item_reason, item_scope
+from ..domain.time_display import china_time
 
 STYLE = '''body{font:15px system-ui,sans-serif;color:#263449;background:#f3f6fa;margin:0}
 main{max-width:1200px;margin:auto;padding:32px}h1{font-size:26px}h2{font-size:20px;margin-top:32px}
@@ -64,15 +64,7 @@ def evidence_text(value):
 
 
 def local_time(value):
-    try:
-        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        local = moment.astimezone()
-        offset = local.strftime('%z')
-        return local.strftime('%Y-%m-%d %H:%M:%S') + ' ' + offset[:3] + ':' + offset[3:]
-    except (AttributeError, TypeError, ValueError):
-        return value
+    return china_time(value)
 
 
 def event_summary(record):
@@ -114,7 +106,7 @@ def event_timeline(records, item_reasons=None):
     for record in ordered:
         origins.setdefault(record.get('boot_id'), record.get('monotonic'))
     events = [record for record in ordered if record['kind'] != 'metric']
-    body = '<h2>事件时间线</h2><p><small>时间按查看电脑的本地时区显示，并标注 UTC 偏移；累计用时从同次设备启动的首条记录起算，不等于项目有效时长。事件按设备序号排列。</small></p>'
+    body = '<h2>事件时间线</h2><p><small>时间统一显示为北京时间（UTC+8）；累计用时从同次设备启动的首条记录起算，不等于项目有效时长。事件按设备序号排列。</small></p>'
     if not events:
         return body + '<div class="card">暂无事件记录</div>'
     body += '<div class="table-scroll"><table class="timeline"><thead><tr><th>时间 / 累计用时</th><th>项目</th><th>事件 / 结果</th><th>说明</th></tr></thead><tbody>'
@@ -309,8 +301,11 @@ def render_report(repository, run_id):
     result = row['result'] or 'INCOMPLETE'
     body = '<h1>主控设备老化报告</h1><p>SN：' + text(row['sn']) + ' · <b class="' + text(result) + '">' + text(result) + '</b></p>'
     body += '<div class="card">批次：' + text(row['batch_id']) + '<br>运行：' + text(run_id)
-    body += '<br>创建：' + text(local_time(row['created_at'])) + '<br>结束：' + text(local_time(status.get('finished_at'))) + '<br>状态：' + text(row['state']) + '<br>墙钟运行秒数：' + text(status.get('wall_s')) + '<br>数据存储：MySQL 集中存储</div>'
-    for key in ('error', 'connection_error', 'safety_stop', 'attachment_error', 'report_error'):
+    body += '<br>创建（北京时间）：' + text(local_time(row['created_at'])) + '<br>结束（北京时间）：' + text(local_time(status.get('finished_at'))) + '<br>状态：' + text(row['state']) + '<br>墙钟运行秒数：' + text(status.get('wall_s')) + '<br>数据存储：MySQL 集中存储</div>'
+    if status.get('interruption'):
+        evidence = status['interruption']
+        body += '<p>中断确认（北京时间）：' + text(local_time(evidence.get('detected_at'))) + '；最后记录（北京时间）：' + text(local_time(evidence.get('last_observed_at'))) + '。实际中断时刻未知，结束时间为重连后的确认时间，离线期间不计入有效时长。</p>'
+    for key in ('error', 'connection_error', 'safety_stop', 'attachment_error', 'evidence_error', 'report_error'):
         if status.get(key):
             body += '<p><b>' + text(key) + '：</b>' + text(status[key]) + '</p>'
     body += '<h2>项目判定</h2><table><tr><th>项目</th><th>计划秒数</th><th>有效秒数</th><th>结果</th><th>停止原因 / 范围</th></tr>'
@@ -325,7 +320,8 @@ def render_report(repository, run_id):
     body += event_timeline(records, reasons)
     for title, value in (('硬件与固件', status.get('hardware')), ('环境记录', snapshot.get('environment')),
                          ('电池阶段与积分', status.get('battery')), ('存储写入账本', status.get('write_ledger')),
-                         ('运行配置快照', snapshot), ('清理结果', {'confirmed': status.get('cleanup_confirmed'), 'errors': status.get('cleanup_errors')})):
+                         ('运行配置快照', snapshot), ('中断证据', status.get('interruption')),
+                         ('清理结果', {'confirmed': status.get('cleanup_confirmed'), 'errors': status.get('cleanup_errors')})):
         body += '<details class="card"><summary>' + text(title) + '</summary><pre>' + text(evidence_text(value)) + '</pre></details>'
     body += '<p><a href="metrics.csv">指标摘要 CSV</a> · <a href="records.json">事件与指标摘要 JSON</a> · <a href="summary.json">结论 JSON</a></p>'
     body += '<h2>执行日志</h2><p><a href="execution.log">查看云端日志摘要</a>'

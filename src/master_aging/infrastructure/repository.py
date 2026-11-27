@@ -3,12 +3,14 @@ from contextlib import contextmanager
 import hashlib
 import base64
 import json
+from copy import deepcopy
 
 import pymysql
 
 from .config import database_settings
 from .log_summary import CLOUD_INTERVAL_S, cloud_record, cloud_status, important_metric, compact
 from ..domain.models import utc_now
+from ..domain.interruption import finish_interrupted
 
 
 class StorageUnavailable(RuntimeError):
@@ -16,7 +18,7 @@ class StorageUnavailable(RuntimeError):
 
 
 class RunOwned(RuntimeError):
-    """另一台控制端仍持有运行租约。"""
+    """另一台控制端仍在准备和提交新任务启动。"""
 
 
 REQUIRED_TABLES = (
@@ -37,6 +39,31 @@ def encode(value):
     if len(payload.encode('utf-8')) > 65535:
         raise ValueError('单条结构化记录超过 TEXT 的 65535 字节上限，已拒绝写入，原始数据未截断')
     return payload
+
+
+def merge_run_status(previous, incoming):
+    """多个工具可补采同一任务；较旧样本和局部断线不能覆盖设备新状态。"""
+    terminal = ('FINISHED', 'BLOCKED')
+    if incoming.get('interruption') and incoming['state'] == 'FINISHED':
+        if previous.get('state') in terminal and not previous.get('interruption'):
+            return deepcopy(previous)  # 已落盘的正常终态优先于其他工具的事后中断推断。
+        if (previous.get('seq') or 0) > (incoming.get('seq') or 0):
+            # 断电前的云端采样可能比设备落盘更新；保留这些进度后再结束未完成项目。
+            merged = finish_interrupted(previous, incoming['interruption'])
+            for key, item in incoming.get('items', {}).items():
+                merged['items'].setdefault(key, deepcopy(item))
+            for key in ('attachment_error', 'evidence_error'):
+                if incoming.get(key):
+                    merged[key] = incoming[key]
+            return merged
+    older = (incoming.get('seq') or 0) < (previous.get('seq') or 0)
+    regresses_final = previous.get('state') in terminal and incoming['state'] not in terminal
+    local_disconnect = (bool(previous.get('run_id')) and incoming['state'] == 'RECONNECTING'
+                        and previous.get('state') != 'RECONNECTING')
+    merged = deepcopy(previous if older or regresses_final or local_disconnect else incoming)
+    if merged.get('state') not in terminal and (previous.get('stop_pending') or incoming.get('stop_pending')):
+        merged['stop_pending'] = True
+    return merged
 
 
 class Repository:
@@ -89,10 +116,10 @@ class Repository:
                 db.execute('SELECT run_id FROM master_aging_device WHERE sn=%s FOR UPDATE', (device['sn'],))
                 previous = db.fetchone()['run_id']
                 if previous:
-                    db.execute('SELECT sync_complete FROM master_aging_run WHERE run_id=%s', (previous,))
+                    db.execute('SELECT state,sync_complete FROM master_aging_run WHERE run_id=%s', (previous,))
                     row = db.fetchone()
-                    if row and not row['sync_complete']:
-                        raise ValueError('设备 %s 存在未结束或未补采完成的运行，请先恢复原运行' % device['sn'])
+                    if row and row['state'] not in ('FINISHED', 'BLOCKED'):
+                        raise ValueError('设备 %s 存在未结束的运行，请先恢复并结束原运行' % device['sn'])
             db.execute('INSERT INTO master_aging_batch (batch_id,created_at) VALUES (%s,%s)', (batch_id, now))
             for run_id, device, plan in entries:
                 status = {'state': 'PREFLIGHT', 'items': {}, 'result': None}
@@ -105,6 +132,11 @@ class Repository:
     def save_status(self, run_id, status, log_transition=True):
         status = cloud_status(status)
         with self.connection() as db:
+            db.execute('SELECT run_status FROM master_aging_run WHERE run_id=%s FOR UPDATE', (run_id,))
+            saved = db.fetchone()
+            if not saved:
+                raise ValueError('运行不存在')
+            status = merge_run_status(json.loads(saved['run_status']), status)
             db.execute('UPDATE master_aging_run SET state=%s,result=%s,run_status=%s WHERE run_id=%s',
                        (status['state'], status.get('result'), encode(status), run_id))
             for key, item in status.get('items', {}).items():
@@ -119,6 +151,19 @@ class Repository:
             if log_transition:
                 db.execute('INSERT INTO master_aging_ctrl_log (run_id,created_at,message) VALUES (%s,%s,%s)',
                            (run_id, utc_now(), message))
+        return status
+
+    def request_stop(self, run_id):
+        """准备阶段也可随时登记停止，实际启动者在启动前消费此请求。"""
+        with self.connection() as db:
+            db.execute('SELECT run_status FROM master_aging_run WHERE run_id=%s FOR UPDATE', (run_id,))
+            saved = db.fetchone()
+            if not saved:
+                raise ValueError('运行不存在')
+            status = json.loads(saved['run_status'])
+            if status['state'] not in ('FINISHED', 'BLOCKED') and not status.get('stop_pending'):
+                status['stop_pending'] = True
+                db.execute('UPDATE master_aging_run SET run_status=%s WHERE run_id=%s', (encode(status), run_id))
 
     def update_ip(self, run_id, ip):
         with self.connection() as db:
@@ -142,7 +187,7 @@ class Repository:
             db.execute('SELECT controller_id FROM master_aging_run WHERE run_id=%s', (run_id,))
             row = db.fetchone()
             if not row or row['controller_id'] != controller_id:
-                raise RunOwned('该运行正在另一台工具上控制；请先退出原控制端，异常退出后最多等待 5 分钟')
+                raise RunOwned('原任务仍在另一台工具上准备启动，正在等待其提交状态；停止请求会交给原准备流程')
 
     def release(self, run_id, controller_id):
         with self.connection() as db:
@@ -227,6 +272,18 @@ class Repository:
         with self.connection() as db:
             db.execute('SELECT * FROM master_aging_run WHERE run_id=%s', (run_id,))
             return self._run_row(db.fetchone())
+
+    def unfinished_for_sn(self, sn):
+        """优先恢复活动任务；已结束的任务只自动恢复设备当前关联的一次。"""
+        with self.connection() as db:
+            db.execute('''SELECT * FROM master_aging_run WHERE sn=%s AND sync_complete=0
+                          AND (state NOT IN ('FINISHED','BLOCKED') OR run_id=(
+                              SELECT run_id FROM master_aging_device WHERE sn=%s))
+                          ORDER BY created_at DESC,run_id LIMIT 2''', (sn, sn))
+            rows = db.fetchall()
+            if len(rows) > 1:
+                raise ValueError('设备 %s 存在多个未同步运行，请在历史记录中选择原运行恢复' % sn)
+            return self._run_row(rows[0]) if rows else None
 
     @staticmethod
     def _run_row(row):

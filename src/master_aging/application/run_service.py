@@ -8,7 +8,8 @@ import time
 
 from ..adapters.transport import create_transport, is_vsm
 from ..adapters.environment import DeploymentCancelled
-from ..domain.models import conclusion, digest, new_id, utc_now
+from ..domain.models import digest, new_id, utc_now
+from ..domain.interruption import finish_interrupted
 from ..domain.policies import validate_plan
 from ..infrastructure.repository import StorageUnavailable, RunOwned
 from ..infrastructure.local_logs import LocalLogs
@@ -26,6 +27,7 @@ class RunService:
         self.events = queue.Queue(maxsize=2048)
         self.pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix='master-aging')
         self._lock = threading.Lock()
+        self._recovery_lock = threading.Lock()
         self.active = {}
         self.power_confirmed_batches = set()
         self.detaching = threading.Event()
@@ -38,6 +40,10 @@ class RunService:
             pass
 
     def start(self, devices, plan):
+        with self._recovery_lock:
+            return self._start(devices, plan)
+
+    def _start(self, devices, plan):
         plan = deepcopy(validate_plan(plan))
         plan.pop('max_parallel_devices', None)
         unverified = [device['ip'] for device in devices
@@ -53,11 +59,10 @@ class RunService:
             raise ValueError('工具正在退出，不能开始新运行')
         with self._lock:
             busy = {s['device']['sn'] for s in self.active.values()}
-            if busy:
-                raise ValueError('当前批次仍在运行或补采，请结束后再开始下一批')
-        unfinished = {row['sn'] for row in self.repository.runs(unfinished=True)}
+        unfinished = {row['sn'] for row in self.repository.runs(unfinished=True)
+                      if row['state'] not in ('FINISHED', 'BLOCKED')}
         if any(device['sn'] in busy | unfinished for device in devices):
-            raise ValueError('所选设备存在未结束运行，请先恢复补采并停止原运行')
+            raise ValueError('所选设备仍在运行、等待重连或收尾补采，请结束原运行后再测试')
         # 本批勾选多少台就同时执行多少台，不再通过计划字段限制或排队。
         previous_pool = self.pool
         self.pool = ThreadPoolExecutor(max_workers=len(devices), thread_name_prefix='master-aging')
@@ -88,24 +93,60 @@ class RunService:
             state = {'device': device, 'batch_id': batch_id, 'status': {}, 'confirmation_queued': False,
                      'initial_status': deepcopy(initial_status or {}),
                      'stop': threading.Event(), 'commands': queue.Queue(),
-                     'wake': threading.Event(), 'future_done': threading.Event()}
+                     'wake': threading.Event(), 'reconnect': threading.Event(), 'future_done': threading.Event()}
+            if (initial_status or {}).get('stop_pending'):
+                state['stop'].set()
             self.active[run_id] = state
             return state
 
-    def resume(self, run_id, ip=None):
+    def recover_device(self, device):
+        """扫描或手动添加后，仅接回该 SN 的原任务，不创建新批次。"""
+        if device.get('identity_source') in ('hostname', 'unverified'):
+            return None
+        row = self.repository.unfinished_for_sn(device['sn'])
+        if row:
+            self.resume(row['run_id'], device=device)
+        return row
+
+    def resume(self, run_id, ip=None, device=None, stop=False):
+        # 同一次发现、历史恢复、停止按钮可能同时触发；每个运行只注册一个工作线程。
+        with self._recovery_lock:
+            return self._resume(run_id, ip, device, stop)
+
+    def _resume(self, run_id, ip, device, stop):
+        if self.detaching.is_set():
+            raise ValueError('工具正在退出，不能恢复运行')
         row = self.repository.get(run_id)
         if not row or row['sync_complete']:
             raise ValueError('运行已结束或不存在')
-        address = ip or row['ip']
-        if is_vsm({'ip': row['ip']}):
-            from ..adapters.vsm import check_platform, manual_device
-            check_platform()
-            device = manual_device(row['sn'])
+        if device is not None:
+            device = deepcopy(device)
+            if device['sn'] != row['sn']:
+                raise ValueError('恢复设备的 SN 与原运行不一致')
         else:
-            device = {'sn': row['sn'], 'ip': str(ipaddress.IPv4Address(address))}
+            address = ip or row['ip']
+            if is_vsm({'ip': address}):
+                from ..adapters.vsm import check_platform, manual_device
+                check_platform()
+                device = manual_device(row['sn'])
+            else:
+                device = {'sn': row['sn'], 'ip': str(ipaddress.IPv4Address(address))}
+        with self._lock:
+            control = self.active.get(run_id)
+            if control:
+                if any(control['device'].get(key) != device.get(key) for key in ('ip', 'port', 'transport')):
+                    control['device'] = device
+                    control['reconnect'].set()
+                if stop:
+                    control['stop'].set()
+                control['wake'].set()
+                return row
         plan = json.loads(row['snapshot'])
         state = self._register(run_id, device, row['batch_id'], json.loads(row['status']))
+        if stop:
+            state['stop'].set()
         self.pool.submit(self._run, run_id, device, plan, state, threading.Semaphore(1), True)
+        return row
 
     def stop(self, run_id):
         with self._lock:
@@ -158,13 +199,18 @@ class RunService:
         signature = state_signature(status)
         payload = cloud_status(status)
         previous = self._cloud_status.get(run_id)
+        stored = previous.get('stored', status) if previous else status
         now = time.monotonic()
         changed = previous is None or signature != previous['signature']
         if changed or (payload != previous['payload'] and now - previous['at'] >= CLOUD_INTERVAL_S):
-            self.repository.save_status(run_id, payload, log_transition=changed)
-            self._cloud_status[run_id] = {'signature': signature, 'payload': payload, 'at': now}
+            stored = self.repository.save_status(run_id, payload, log_transition=changed)
+            if stored.get('stop_pending') and control:
+                control['stop'].set()
+                control['wake'].set()
+            self._cloud_status[run_id] = {'signature': signature, 'payload': payload, 'stored': stored, 'at': now}
         if not status.get('launch_requested') and not status.get('run_id') and status['state'] in ('BLOCKED', 'FINISHED'):
             self.repository.mark_synced(run_id)
+        return stored
 
     def _ingest(self, transport, run_id, cloud=True):
         # 数据库失败后从较早的游标重读；本地 append 幂等，不丢失待上传摘要。
@@ -186,6 +232,68 @@ class RunService:
             if not more:
                 break
 
+    def _interrupted(self, run_id, previous, remote, plan, current_boot):
+        # 以云端/设备中较新的原任务进度收尾，不增加采样序号或有效秒数。
+        saved = json.loads(self.repository.get(run_id)['status'])
+        if saved.get('state') in ('FINISHED', 'BLOCKED'):
+            return saved
+        candidates = (previous, saved, remote) if remote['state'] not in ('MISSING', 'CORRUPT') else (previous, saved)
+        latest = deepcopy(max(reversed(candidates), key=lambda value: value.get('seq') or 0))
+        # 已上传的失败证据不能因设备较新的状态文件缺项而消失。
+        for source in candidates:
+            for key, item in source.get('items', {}).items():
+                if item.get('result') == 'FAIL':
+                    target = latest.setdefault('items', {}).setdefault(key, deepcopy(item))
+                    target.update(result='FAIL', stop_reason=item.get('stop_reason'))
+        old_boot = (previous.get('boot_id') or previous.get('hardware', {}).get('boot_id')
+                    or remote.get('boot_id'))
+        rebooted = bool(old_boot and current_boot and old_boot != current_boot)
+        reason = ('已确认主控重启，原老化运行中断，不能恢复连续时长' if rebooted else
+                  '已确认老化执行进程退出，原老化运行中断')
+        evidence = {'kind': 'DEVICE_REBOOT' if rebooted else 'AGENT_EXITED',
+                    'reason': reason, 'detected_at': utc_now(),
+                    'previous_boot_id': old_boot, 'current_boot_id': current_boot,
+                    'last_observed_at': latest.get('updated_at'),
+                    'device_state': remote['state'], 'device_seq': remote.get('seq'),
+                    'agent_alive': remote.get('agent_alive'), 'status_error': remote.get('status_error'),
+                    'failure_time_known': False}
+        return finish_interrupted(latest, evidence, plan.get('items'))
+
+    def _finish_evidence(self, transport, run_id, status):
+        # 先纠正云端的运行状态。文件损坏、丢失或补采失败不能使任务仍显示“老化中”。
+        stored = self._store(run_id, status)
+        if isinstance(stored, dict):
+            status.clear()
+            status.update(deepcopy(stored))
+        try:
+            self._ingest(transport, run_id)
+            status.pop('evidence_error', None)
+        except (StorageUnavailable, LocalLogUnavailable):
+            raise
+        except Exception as exc:
+            status['evidence_error'] = '日志补采未完成：' + str(exc)
+        try:
+            transport.collect(run_id, self.local_logs)
+            status.pop('attachment_error', None)
+        except (StorageUnavailable, LocalLogUnavailable):
+            raise
+        except Exception as exc:
+            status['attachment_error'] = str(exc)
+        complete = self.local_logs.cursor(run_id)['seq'] == (status.get('seq') or 0)
+        if not complete:
+            status['evidence_error'] = '最终日志缺段，不能确认数据完整'
+        if status.get('evidence_error') and status.get('result') != 'FAIL':
+            status['result'] = 'INCOMPLETE'
+        # 缺失的原状态可能有尚未上传的记录，即使已知 seq 为 0 也不能宣称完整。
+        interruption = status.get('interruption', {})
+        lost_status = (interruption.get('device_state') in ('MISSING', 'CORRUPT')
+                       or bool(interruption.get('status_error')))
+        if lost_status:
+            status['evidence_error'] = '设备原状态丢失或损坏，仅保留已获取证据，无法确认日志完整'
+        self._store(run_id, status)
+        if complete and not lost_status and not status.get('evidence_error') and not status.get('attachment_error'):
+            self.repository.mark_synced(run_id)
+
     def _run(self, run_id, device, plan, control, gate, recovering):
         transport = None
         stop_sent = False
@@ -193,7 +301,7 @@ class RunService:
         launched = recovering and bool(last_status.get('launch_requested') or last_status.get('run_id'))
         acquired = False
         failures = 0
-        confirmed_reboot = False
+        current_boot = None
         confirmation_poll_until = 0
         claimed = False
         last_claim = 0
@@ -204,7 +312,9 @@ class RunService:
                     break
             else:
                 acquired = True
-            if not acquired or (control['stop'].is_set() and not launched):
+            if recovering and self.detaching.is_set():
+                return
+            if not acquired or (control['stop'].is_set() and not launched and not recovering):
                 last_status.update(state='FINISHED', result='ABORTED', error='运行前取消')
                 self._store(run_id, last_status)
                 return
@@ -216,37 +326,78 @@ class RunService:
                 # 先清除唤醒，再处理命令；处理期间到达的新命令不会丢失唤醒。
                 control['wake'].clear()
                 validated_status = None
+                remote_status = None
                 try:
-                    # 已持有控制权时，人工停止优先，不因数据库短暂断线延迟发往设备。
-                    if claimed and launched and transport and control['stop'].is_set() and not stop_sent:
-                        transport.action('stop', run_id)
-                        stop_sent = True
-                    if not claimed or time.monotonic() - last_claim >= 60:
-                        self.repository.claim(run_id, self.controller_id)
-                        claimed = True
-                        last_claim = time.monotonic()
+                    if control['reconnect'].is_set():
+                        with self._lock:
+                            device = deepcopy(control['device'])
+                            control['reconnect'].clear()
+                        if transport:
+                            transport.close()
+                            transport = None
+                        stop_sent = False
+                    if recovering:
+                        # 先看原运行是否已启动：已启动的恢复/停止完全不获取控制端租约。
+                        current = self.repository.get(run_id)
+                        if current['sync_complete']:
+                            last_status = json.loads(current['status'])
+                            return
+                        last_status = json.loads(current['status'])
+                        launched = bool(last_status.get('launch_requested') or last_status.get('run_id'))
+                        if last_status.get('stop_pending'):
+                            control['stop'].set()
+                    if not launched:
+                        if recovering and control['stop'].is_set():
+                            self.repository.request_stop(run_id)
+                        if not claimed or time.monotonic() - last_claim >= 60:
+                            self.repository.claim(run_id, self.controller_id)
+                            claimed = True
+                            last_claim = time.monotonic()
+                        if recovering:
+                            # 获得准备阶段租约后再次读取，防止原工具刚好已提交启动。
+                            current = self.repository.get(run_id)
+                            last_status = json.loads(current['status'])
+                            launched = bool(last_status.get('launch_requested') or last_status.get('run_id'))
+                            if current['sync_complete']:
+                                return
+                            if last_status.get('stop_pending'):
+                                control['stop'].set()
+                    if recovering:
+                        if not launched:
+                            # 持有租约且确认未提交启动，恢复操作仅结束原准备阶段。
+                            last_status.update(state='FINISHED', result='ABORTED', cleanup_confirmed=True,
+                                error='原运行未提交启动，已结束准备阶段；可重新选择设备开始新任务')
+                            self._store(run_id, last_status)
+                            return
+                        recovering = False
+                    if control['stop'].is_set() and not last_status.get('stop_pending'):
+                        last_status['stop_pending'] = True
+                        self._store(run_id, last_status)
                     if transport is None:
                         transport = self.transport_factory(device)
                         def progress(message):
                             nonlocal last_claim
-                            # 连接排队可能较久；进度心跳续租，避免等待时控制权过期。
-                            if time.monotonic() - last_claim >= 60:
+                            # 仅尚未启动的新任务持有准备租约；运行中任务的连接不排他。
+                            if not launched and time.monotonic() - last_claim >= 60:
                                 self.repository.claim(run_id, self.controller_id)
                                 last_claim = time.monotonic()
                             if not launched:
                                 last_status.update(state='DEPLOYING', environment_message=message)
                                 self._store(run_id, last_status)
                         transport.progress = progress
-                        transport.cancelled = lambda: not launched and (control['stop'].is_set() or self.detaching.is_set())
+                        transport.cancelled = lambda: self.detaching.is_set() or (not launched and control['stop'].is_set())
                         progress('正在连接设备并检查运行环境')
                         info = transport.probe(bootstrap=not launched)
                         if info['sn'] != device['sn']:
                             raise ValueError('重连设备 SN 不一致')
                         if last_status.get('hardware', {}).get('fingerprint') and info['fingerprint'] != last_status['hardware']['fingerprint']:
                             raise ValueError('重连设备指纹不一致')
-                        confirmed_reboot = bool(last_status.get('boot_id') and info.get('boot_id')
-                                                and last_status['boot_id'] != info['boot_id'])
+                        current_boot = info.get('boot_id')
                         self.repository.update_ip(run_id, device['ip'])
+                        if launched and control['stop'].is_set():
+                            remote_status = transport.action('status', run_id)
+                            if remote_status.get('run_id') != run_id:
+                                raise ValueError('设备状态运行身份不匹配')
                         if not launched:
                             if info['chip'] == 'unknown' or info['chip'] != info['sn_chip']:
                                 raise ValueError('真实硬件与 SN 机型无法核验一致，未部署老化依赖')
@@ -255,6 +406,9 @@ class RunService:
                             info = transport.prepare(plan)
                             if info['sn'] != device['sn'] or info['fingerprint'] != fingerprint:
                                 raise ValueError('环境部署后设备身份发生变化，未启动老化')
+                            pending = self.repository.get(run_id)
+                            if json.loads(pending['status']).get('stop_pending'):
+                                control['stop'].set()
                             if control['stop'].is_set() or self.detaching.is_set():
                                 raise DeploymentCancelled('环境准备期间已取消，未启动老化负载')
                             request = {'run_id': run_id, 'device': dict(device, fingerprint=info['fingerprint']), 'plan': plan}
@@ -267,8 +421,32 @@ class RunService:
                             last_status.update(state='READY', hardware=info, launch_requested=True,
                                                environment_message='环境准备完成，正在启动老化预检')
                             self._store(run_id, last_status)
+                            if control['stop'].is_set() or self.detaching.is_set():
+                                last_status['launch_requested'] = False
+                                raise DeploymentCancelled('启动提交前已取消，未启动老化负载')
                             launched = True
                             transport.launch(request)
+                    status = remote_status if remote_status is not None else transport.action('status', run_id)
+                    if status.get('run_id') != run_id:
+                        raise ValueError('设备状态运行身份不匹配')
+                    if status.get('config_hash') and status['config_hash'] != digest(plan):
+                        raise ValueError('设备配置快照摘要与数据库不一致')
+                    current_boot = status.get('current_boot_id') or current_boot
+                    original_boot = last_status.get('boot_id') or last_status.get('hardware', {}).get('boot_id') or status.get('boot_id')
+                    rebooted = bool(original_boot and current_boot and original_boot != current_boot)
+                    terminal = status['state'] in ('FINISHED', 'BLOCKED')
+                    if last_status.get('interruption') and last_status['state'] in ('FINISHED', 'BLOCKED'):
+                        self._finish_evidence(transport, run_id, last_status)
+                        return
+                    if not terminal and (rebooted or status.get('agent_alive') is False):
+                        last_status = self._interrupted(run_id, last_status, status, plan, current_boot)
+                        self._finish_evidence(transport, run_id, last_status)
+                        return
+                    if status['state'] in ('MISSING', 'CORRUPT'):
+                        raise ValueError('设备上未找到原运行或状态损坏，尚不能确认进程退出，不重复发起负载')
+                    if (not terminal and original_boot and status.get('boot_id')
+                            and status['boot_id'] != original_boot):
+                        raise ValueError('状态 boot_id 不一致')
                     if control['stop'].is_set() and not stop_sent:
                         transport.action('stop', run_id)
                         stop_sent = True
@@ -281,42 +459,19 @@ class RunService:
                             # 人工每次运行只确认一次，发送失败必须保留命令待重连补发。
                             control['commands'].put(confirmation)
                             raise
-                    status = transport.action('status', run_id)
                     if last_status.get('hardware') and not status.get('hardware'):
                         status['hardware'] = last_status['hardware']
                     elif last_status.get('hardware', {}).get('environment_deployment'):
                         status['hardware']['environment_deployment'] = last_status['hardware']['environment_deployment']
-                    if status.get('run_id') != run_id:
-                        raise ValueError('设备状态运行身份不匹配')
-                    if status['state'] == 'MISSING':
-                        if confirmed_reboot:
-                            last_status.update(state='FINISHED', result='FAIL' if conclusion(last_status.get('items', {})) == 'FAIL' else 'INCOMPLETE',
-                                               cleanup_confirmed=False, error='已确认设备重启，原运行目录丢失，不能恢复连续时长')
-                            self._store(run_id, last_status)
-                            self.repository.mark_synced(run_id)
-                            return
-                        raise ValueError('设备上未找到原运行，保留启动不确定性，不重复发起负载')
-                    if status.get('config_hash') and status['config_hash'] != digest(plan):
-                        raise ValueError('设备配置快照摘要与数据库不一致')
-                    if last_status.get('boot_id') and status.get('boot_id') != last_status['boot_id']:
-                        raise ValueError('状态 boot_id 不一致')
                     validated_status = status
                     if (status.get('battery', {}).get('confirmed')
                             or status.get('items', {}).get('battery', {}).get('result') is not None
                             or status['state'] in ('FINISHED', 'BLOCKED')):
                         confirmation_poll_until = 0
                     last_status = status
-                    if status.get('agent_alive') is False:
-                        last_status.update(state='FINISHED', result='INCOMPLETE', error='设备重启或 supervisor 已退出，禁止重复启动')
-                        for item in last_status.get('items', {}).values():
-                            if item.get('result') is None:
-                                item.update(result='INCOMPLETE', stop_reason='设备执行中断')
-                        last_status['cleanup_confirmed'] = False
-                        if conclusion(last_status.get('items', {})) == 'FAIL':
-                            last_status['result'] = 'FAIL'
                     if last_status['state'] in ('FINISHED', 'BLOCKED'):
-                        self._ingest(transport, run_id)
-                        self._store(run_id, last_status)
+                        self._finish_evidence(transport, run_id, last_status)
+                        return
                     else:
                         # 运行状态先交给界面，日志补采较慢时不阻塞确认结果显示。
                         self._store(run_id, last_status)
@@ -324,25 +479,17 @@ class RunService:
                             self._ingest(transport, run_id)
                             ingested_seq = status.get('seq')
                     failures = 0
-                    if last_status['state'] in ('FINISHED', 'BLOCKED'):
-                        try:
-                            transport.collect(run_id, self.local_logs)
-                            last_status.pop('attachment_error', None)
-                            self._store(run_id, last_status)
-                        except (StorageUnavailable, LocalLogUnavailable):
-                            raise
-                        except Exception as exc:
-                            last_status['attachment_error'] = str(exc)
-                            self._store(run_id, last_status)
-                        if self.local_logs.cursor(run_id)['seq'] != status.get('seq', 0):
-                            last_status.update(result='FAIL' if last_status.get('result') == 'FAIL' else 'INCOMPLETE',
-                                               error='最终日志缺段，不能确认数据完整')
-                            self._store(run_id, last_status)
-                        if not last_status.get('attachment_error') and self.local_logs.cursor(run_id)['seq'] == status.get('seq', 0):
-                            self.repository.mark_synced(run_id)
-                        return
-                except RunOwned:
-                    raise
+                except RunOwned as exc:
+                    # 仅原任务尚在准备阶段时存在排他启动者；已启动任务不会进入此分支。
+                    recovering = True
+                    claimed = False
+                    if transport:
+                        transport.close()
+                        transport = None
+                    self.notify(run_id, dict(last_status, state='RECONNECTING',
+                        storage_error=str(exc), stop_pending=control['stop'].is_set()))
+                    control['wake'].wait(5)
+                    continue
                 except StorageUnavailable as exc:
                     # 本地完整日志可领先云端；云端游标仍须事务提交后才能推进。
                     failures += 1
@@ -360,6 +507,8 @@ class RunService:
                     failures += 1
                     self.notify(run_id, dict(last_status, local_log_error=str(exc)))
                 except DeploymentCancelled as exc:
+                    if launched and self.detaching.is_set():
+                        return  # 退出控制端，保留原设备运行状态供下次恢复。
                     last_status.update(state='FINISHED', result='ABORTED', error=str(exc), cleanup_confirmed=True)
                     self._store(run_id, last_status)
                     return

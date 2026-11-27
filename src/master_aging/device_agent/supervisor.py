@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -33,12 +34,19 @@ def state_locked(method):
 
 
 def atomic_json(path, value):
-    temporary = path.with_suffix('.tmp')
-    with temporary.open('w', encoding='utf-8') as stream:
-        json.dump(value, stream, ensure_ascii=False, allow_nan=False)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(str(temporary), str(path))
+    temporary = None
+    try:
+        # 不同工具可能同时发送幂等停止/确认请求，临时文件须独立，避免互相覆盖。
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix=path.name + '.', suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(value, stream, ensure_ascii=False, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(str(temporary), str(path))
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     fd = os.open(str(path.parent), os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -973,6 +981,45 @@ class Supervisor:
             self.save()
 
 
+def read_run_status(directory, run_id):
+    """控制命令读取实时存活证据；历史 status.json 本身不代表进程仍在运行。"""
+    boot = collectors.read('/proc/sys/kernel/random/boot_id')
+    try:
+        status = json.loads((directory / 'status.json').read_text())
+        if not isinstance(status, dict) or 'state' not in status:
+            raise ValueError('运行状态结构无效')
+    except (FileNotFoundError, ValueError) as exc:
+        # 启动命令刚创建目录时给 supervisor 留出初始化窗口；窗口内不能认定异常退出。
+        initializing = directory.exists() and time.time() - directory.stat().st_mtime < 30
+        status = {'run_id': run_id, 'state': 'READY' if initializing else
+                  ('MISSING' if isinstance(exc, FileNotFoundError) else 'CORRUPT'),
+                  'result': None, 'status_error': str(exc), 'agent_alive': None}
+        if not initializing:
+            # 独占锁空闲可证明当前没有本工具的 supervisor；不凭文件丢失猜测存活。
+            with (directory.parent / 'device.lock').open('a+') as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    status['agent_alive'] = False
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+    else:
+        if status.get('run_id') != run_id:
+            raise ValueError('运行状态身份不一致')
+        if status['state'] not in ('FINISHED', 'BLOCKED'):
+            try:
+                process = Path('/proc/%s' % status.get('pid'))
+                arguments = (process / 'cmdline').read_bytes().split(b'\x00')
+                state = (process / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+                status['agent_alive'] = (boot == status.get('boot_id') and state not in ('Z', 'X')
+                                         and b'run' in arguments and run_id.encode() in arguments)
+            except FileNotFoundError:
+                status['agent_alive'] = False
+    status['current_boot_id'] = boot
+    return status
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=('probe', 'launch', 'run', 'status', 'stop', 'confirm'))
@@ -1022,22 +1069,7 @@ def main():
             supervisor.save()
             supervisor.run()
     elif args.action == 'status':
-        status_path = directory / 'status.json'
-        if not status_path.exists():
-            initializing = directory.exists() and time.time() - directory.stat().st_mtime < 30
-            print(json.dumps({'run_id': args.run_id, 'state': 'READY' if initializing else 'MISSING',
-                              'agent_alive': initializing, 'result': None}, ensure_ascii=False))
-            return
-        status = json.loads(status_path.read_text())
-        if status['state'] not in ('FINISHED', 'BLOCKED'):
-            boot = collectors.read('/proc/sys/kernel/random/boot_id')
-            try:
-                arguments = Path('/proc/%s/cmdline' % status.get('pid')).read_bytes().split(b'\x00')
-                status['agent_alive'] = (boot == status['boot_id'] and b'run' in arguments
-                                         and args.run_id.encode() in arguments)
-            except OSError:
-                status['agent_alive'] = False
-        print(json.dumps(status, ensure_ascii=False))
+        print(json.dumps(read_run_status(directory, args.run_id), ensure_ascii=False))
     elif args.action == 'stop':
         atomic_json(directory / 'stop.json', {'operator': args.operator, 'utc': utc_now()})
         print('{"accepted": true}')
