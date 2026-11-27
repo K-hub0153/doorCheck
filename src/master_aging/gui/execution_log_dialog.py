@@ -5,10 +5,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtGui import QDesktopServices
-from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QTabWidget, QVBoxLayout
+from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QTabWidget, QVBoxLayout
 
 from ..domain.execution_log import format_record
 from ..infrastructure.local_logs import LocalLogs
+from .log_view import LogView
 
 
 class ExecutionLogDialog(QDialog):
@@ -55,10 +56,7 @@ class ExecutionLogDialog(QDialog):
 
     @staticmethod
     def viewer():
-        widget = QPlainTextEdit()
-        widget.setReadOnly(True)
-        widget.setMaximumBlockCount(5000)
-        return widget
+        return LogView()
 
     def fetch(self, last_seq, controller_id, signatures):
         directory = self.local_logs.directory(self.run_id, create=False)

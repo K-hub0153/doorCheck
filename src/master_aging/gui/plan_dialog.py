@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QD
                              QVBoxLayout, QWidget)
 from ..domain.models import ITEMS
 from ..domain.policies import validate_plan
+from ..domain.diagnostics import lte_thresholds
 from ..infrastructure.config import save_config
 from .styles import STYLE
 
@@ -76,10 +77,15 @@ class PlanDialog(QDialog):
         options.addLayout(execution)
         cpu_form = self.project_group(options, 'CPU 负载', 'cpu')
         self.cpu_target = self.integer(plan['items']['cpu']['target_busy_pct'], 1, 100)
-        cpu_form.addRow('目标利用率（%）', self.cpu_target)
+        cpu_form.addRow('忙碌率通过下限（%）', self.cpu_target)
+        self.cpu_grace = self.decimal(plan['items']['cpu']['grace_s'], 0, 600)
+        cpu_form.addRow('启动宽限（秒）', self.cpu_grace)
         ddr_form = self.project_group(options, 'DDR 负载', 'ddr')
         self.ddr_ratio = self.integer(plan['items']['ddr']['max_memory_pct'], 1, 70)
         ddr_form.addRow('内存使用比例（%）', self.ddr_ratio)
+        self.ddr_reserve = self.decimal(plan['items']['ddr']['reserve_mib'], 128, 1048576)
+        ddr_form.addRow('系统保留内存（MiB）', self.ddr_reserve)
+        ddr_form.addRow(QLabel('预期：内存正确性校验无错误；实际分配内存须驻留并锁页，不发生交换。'))
         storage_form = self.project_group(options, 'SSD/eMMC 读写', 'storage')
         storage = plan['items']['storage']
         self.storage_targets = QLineEdit(', '.join(storage.get('targets') or []))
@@ -94,13 +100,34 @@ class PlanDialog(QDialog):
         storage_form.addRow('每盘写入上限（GiB）', self.storage_budget)
         storage_form.addRow('每轮测试容量（MiB）', self.storage_chunk)
         storage_form.addRow('写入轮数', self.storage_rounds)
+        storage_form.addRow(QLabel('预期：完成全部写入轮数，direct I/O 读回校验一致，无 I/O 错误。'))
         battery_form = self.project_group(options, '电池判定', 'battery')
         self.completion = QComboBox()
         self.completion.addItem('按设定时长完成', 'fixed_duration')
         self.completion.addItem('等待充放电停止节点（设定时长为上限）', 'stop_node')
         self.completion.setCurrentIndex(max(0, self.completion.findData(plan['items']['battery']['completion_mode'])))
         battery_form.addRow('完成方式', self.completion)
-        options.addWidget(QLabel('4G 自动识别模组，周期检测信号。\n要求：RSRP ≥ -90 dBm、RSRQ ≥ -13 dB、SINR ≥ 5 dB。'))
+        battery = plan['items']['battery']
+        self.stop_current = self.decimal(battery['stop_current_ma'], 0, 100000)
+        self.stop_samples = self.integer(battery['stop_confirm_samples'], 1, 60)
+        self.read_failures = self.integer(battery['max_read_failures'], 1, 60)
+        battery_form.addRow('停止节点电流绝对值 ≤（mA）', self.stop_current)
+        battery_form.addRow('停止节点连续确认样本数', self.stop_samples)
+        battery_form.addRow('连续读取失败上限', self.read_failures)
+        battery_form.addRow(QLabel('停止节点仍需核验 SOC / 电池状态；固定时长模式持续监测至时长达标。'))
+        lte_form = self.project_group(options, '4G 信号预期下限', 'lte')
+        limits = lte_thresholds(plan['items']['lte'])
+        self.lte_fields = {}
+        for key, label, low, high in (('rsrp', 'RSRP ≥（dBm）', -140, -44),
+                                      ('rsrq', 'RSRQ ≥（dB）', -40, 0),
+                                      ('sinr', 'SINR ≥（dB）', -30, 50)):
+            widget = QDoubleSpinBox()
+            widget.setRange(low, high)
+            widget.setDecimals(1)
+            widget.setValue(limits[key])
+            self.lte_fields[key] = widget
+            lte_form.addRow(label, widget)
+        lte_form.addRow(QLabel('预检和运行期间使用同一门限；任一指标缺失或低于下限均不通过。'))
         options.addStretch()
         protection = plan.get('protection', {})
         controls = QFormLayout(safety)
@@ -172,6 +199,14 @@ class PlanDialog(QDialog):
         return QFormLayout(group)
 
     @staticmethod
+    def decimal(value, low, high):
+        widget = QDoubleSpinBox()
+        widget.setRange(low, high)
+        widget.setDecimals(2)
+        widget.setValue(value)
+        return widget
+
+    @staticmethod
     def integer(value, low, high):
         widget = QSpinBox()
         widget.setRange(low, high)
@@ -194,7 +229,12 @@ class PlanDialog(QDialog):
             plan['sample_interval_s'] = self.interval.value()
             plan['max_sample_gap_s'] = max(plan['max_sample_gap_s'], self.interval.value() * 2)
             plan['items']['cpu']['target_busy_pct'] = self.cpu_target.value()
+            plan['items']['cpu']['grace_s'] = self.cpu_grace.value()
             plan['items']['ddr']['max_memory_pct'] = self.ddr_ratio.value()
+            plan['items']['ddr']['reserve_mib'] = self.ddr_reserve.value()
+            plan['items']['lte']['thresholds'] = {key: widget.value() for key, widget in self.lte_fields.items()}
+            plan['items']['battery'].update(stop_current_ma=self.stop_current.value(),
+                stop_confirm_samples=self.stop_samples.value(), max_read_failures=self.read_failures.value())
             storage = plan['items']['storage']
             storage['targets'] = [target.strip() for target in self.storage_targets.text().split(',') if target.strip()]
             storage['write_budget_gib'] = self.storage_budget.value()

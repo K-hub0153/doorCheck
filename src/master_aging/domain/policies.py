@@ -3,6 +3,7 @@ import json
 import math
 import re
 from .models import ITEMS
+from .diagnostics import lte_thresholds
 
 
 def number(value, low, high, name, integer=False):
@@ -64,6 +65,11 @@ def validate_plan(plan):
             raise ValueError('首期存储校验要求已验证的 direct I/O，不自动降级为缓存模式')
     if 'lte' in enabled:
         lte = items['lte']
+        limits = lte.get('thresholds', {})
+        if not isinstance(limits, dict) or set(limits) - {'rsrp', 'rsrq', 'sinr'}:
+            raise ValueError('4G 信号门限必须包含 RSRP、RSRQ、SINR 数值')
+        for key, low, high in (('rsrp', -140, -44), ('rsrq', -40, 0), ('sinr', -30, 50)):
+            number(lte_thresholds(lte)[key], low, high, '4G ' + key.upper() + ' 下限')
         # 留空使用内置模组表；运行时核验串口占用，不要求蜂窝联网配置。
         port = lte.get('at_port')
         if port not in (None, '') and (not isinstance(port, str) or not re.fullmatch(r'/dev/tty(?:USB|ACM)\d+', port)):

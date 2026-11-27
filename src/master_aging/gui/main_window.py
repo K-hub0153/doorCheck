@@ -27,6 +27,7 @@ from .metrics_panel import MetricsPanel
 from .device_list_panel import DeviceListPanel
 from .discovery_dialogs import DeviceSelectionDialog, InterfaceDialog
 from .manual_device_dialog import ManualDeviceDialog
+from .log_view import LogView
 from .styles import STYLE, STATES, status_color
 
 
@@ -120,6 +121,7 @@ class MainWindow(QMainWindow):
         selection_row.setContentsMargins(10, 0, 10, 0)
         self.button('全选', self.select_all, selection_row, 'secondary')
         self.button('清空选择', self.clear_selection, selection_row, 'secondary')
+        self.button('删除选中', self.remove_selected, selection_row, 'danger')
         left_layout.addLayout(selection_row)
         self.selection_label = QLabel('共 0 台 · 已选 0 台')
         self.selection_label.setObjectName('muted')
@@ -129,6 +131,8 @@ class MainWindow(QMainWindow):
         self.device_list.activated.connect(self.show_details)
         self.device_list.activated.connect(self.show_power_confirmation)
         self.device_list.selection_changed.connect(self.update_selection_count)
+        self.device_list.remove_requested.connect(lambda ip: self.remove_devices([ip]))
+        self.device_list.copied.connect(lambda sn: self.show_toast('已复制 SN：' + sn))
         left_layout.addWidget(self.device_list, 1)
         splitter.addWidget(left)
 
@@ -215,9 +219,7 @@ class MainWindow(QMainWindow):
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
         self.tabs.addTab(self.detail, '运行详情')
-        self.messages = QPlainTextEdit()
-        self.messages.setReadOnly(True)
-        self.messages.setMaximumBlockCount(1000)
+        self.messages = LogView()
         self.tabs.addTab(self.messages, '操作日志')
         footer = QHBoxLayout()
         hint = QLabel('历史、日志与附件统一保存至 MySQL · 报告按需查看')
@@ -277,6 +279,42 @@ class MainWindow(QMainWindow):
     def clear_selection(self):
         for card in self.device_list.cards.values():
             card.check.setChecked(False)
+
+    def remove_selected(self):
+        self.remove_devices([device['ip'] for device in self.selected()])
+
+    def remove_devices(self, addresses):
+        if not addresses:
+            self.show_toast('请勾选要删除的设备')
+            return
+        removed, busy = [], []
+        for ip in addresses:
+            device = self.devices.get(ip)
+            if device is None:
+                continue
+            run_id = device.get('run_id')
+            status = self.statuses.get(run_id, {})
+            # 运行和补采中的设备必须先停止；列表删除不操作云端历史数据。
+            if (ip in self.probing or self.service.device_busy(device['sn'])
+                    or (run_id and status.get('state') not in ('FINISHED', 'BLOCKED'))):
+                busy.append(device.get('sn') or ip)
+                continue
+            removed.append(device.get('sn') or ip)
+            self.devices.pop(ip)
+            for identity, address in list(self.run_devices.items()):
+                if address == ip:
+                    self.run_devices.pop(identity)
+            self.device_list.remove(ip)
+        if not self.devices:
+            self.device_info.setText('请选择设备查看详情')
+            self.metrics.select(None)
+            self.detail.clear()
+        if removed:
+            self.log('已从设备列表删除 %s 台：%s；历史记录保留' % (len(removed), '、'.join(removed)))
+        if busy:
+            self.log('以下设备正在读取信息、运行或补采，请结束后删除：' + '、'.join(busy))
+        self.show_toast('已删除 %s 台%s' % (len(removed), '，%s 台正在运行或读取，已保留' % len(busy) if busy else ''))
+        self.update_selection_count()
 
     def manual_add(self):
         try:

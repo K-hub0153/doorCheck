@@ -39,6 +39,11 @@ items:
     enabled: true
     duration_min: 4320
     at_port: ''
+    # 预检、持续监测和报告共用此信号通过下限。
+    thresholds:
+      rsrp: -90
+      rsrq: -13
+      sinr: 5
   battery:
     enabled: true
     # 接适配器持续监测；充满后继续监测至时长达标，不做放电循环。

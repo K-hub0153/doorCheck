@@ -22,6 +22,11 @@ QPushButton:disabled { background: #e0e0e0; color: #9e9e9e; }
 QFrame#deviceCard { background: white; border: 1px solid #dce4ec; border-radius: 8px; }
 QFrame#deviceCard[active="true"] { background: #e3f2fd; border: 2px solid #2196f3; }
 QLabel#cardSn { font-size: 13px; font-weight: bold; }
+QToolButton#deviceAction { background: transparent; border: none; padding: 0; border-radius: 4px; }
+QToolButton#deviceAction:hover { background: #dcecf8; }
+QToolButton#deviceAction:pressed { background: #c6dff2; }
+QToolButton#deviceAction[action="delete"]:hover { background: #ffebee; }
+QToolButton#deviceAction[action="delete"]:pressed { background: #ffcdd2; }
 QScrollArea, QTabWidget::pane { background: white; border: none; }
 QTabBar::tab { background: #eef2f6; color: #607080; padding: 11px 18px; border-bottom: 3px solid transparent; }
 QTabBar::tab:selected { color: #1976d2; background: white; border-bottom: 3px solid #2196f3; }

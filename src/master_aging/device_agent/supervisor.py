@@ -17,7 +17,7 @@ import time
 
 from ..domain.models import conclusion, digest, utc_now
 from ..domain.execution_log import format_record
-from ..domain.diagnostics import LTE_SCOPE, monitor_reason
+from ..domain.diagnostics import lte_scope, monitor_reason
 from ..domain.policies import validate_plan
 from . import collectors, lte, recovery, runners
 
@@ -439,7 +439,7 @@ class Supervisor:
                 self.emit('event', {'item': 'battery', 'phase': self.battery['phase'],
                                     'reason': '请为本批全部设备' + operation + '，整批确认一次', 'token': 0})
             elif key == 'lte':
-                item['scope'] = LTE_SCOPE
+                item['scope'] = lte_scope(self.plan['items']['lte'])
             if item.get('result') is None:
                 self.emit('event', {'item': key, 'state': 'WAIT_OPERATOR' if key == 'battery' else 'RUNNING',
                                     'reason': '项目已启动，等待首次电源确认' if key == 'battery' else '项目已启动',

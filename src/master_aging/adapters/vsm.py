@@ -10,16 +10,26 @@ import select
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from types import SimpleNamespace
 
 from .ssh_transport import SSHTransport
+from .environment import DeploymentCancelled
 from ..infrastructure.config import vsm_settings
 
 
 class VSMUnavailable(RuntimeError):
-    pass
+    def __init__(self, message, retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+# 只限制本地客户端登录握手；已建立的会话、环境部署和设备负载不持有此锁。
+_LOGIN_LOCK = threading.Lock()
+_LOGIN_GAP = 0.5
+_next_login = 0.0
 
 
 def check_platform():
@@ -84,10 +94,52 @@ class VSMTransport(SSHTransport):
         self.vsm_settings = vsm_settings()
         self.process = None
         self.master_fd = None
+        self._login_output = bytearray()
+        self._connecting = False
 
     def connect(self):
+        global _next_login
         self.close()
         args = local_command(self.vsm_settings)
+        for attempt in range(3):
+            self.report('等待 VSM 连接队列（连接后并行部署）')
+            next_report = time.monotonic() + 30
+            while not _LOGIN_LOCK.acquire(timeout=0.2):
+                self._check_cancelled()
+                if time.monotonic() >= next_report:
+                    self.report('仍在等待 VSM 连接队列，可停止取消')
+                    next_report = time.monotonic() + 30
+            try:
+                self._pause(max(0, _next_login - time.monotonic()))
+                self._check_cancelled()
+                self.report('正在建立 VSM 连接（第 %s/3 次）' % (attempt + 1))
+                self._connect_once(args)
+            except (VSMUnavailable, TimeoutError) as exc:
+                self.close()
+                if not getattr(exc, 'retryable', True) or attempt == 2:
+                    raise
+                self.report('VSM 临时连接失败，稍后重试：' + str(exc))
+            else:
+                self.report('VSM 连接已建立，开始并行检查和部署环境')
+                return
+            finally:
+                _next_login = time.monotonic() + _LOGIN_GAP
+                _LOGIN_LOCK.release()
+            self._pause(2 ** attempt)
+
+    def _check_cancelled(self):
+        if self.cancelled():
+            raise DeploymentCancelled('VSM 连接已取消，未启动老化负载')
+
+    def _pause(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self._check_cancelled()
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+    def _connect_once(self, args):
+        self._connecting = True
+        self._login_output.clear()
         import pty
         import tty
         import fcntl
@@ -102,7 +154,7 @@ class VSMTransport(SSHTransport):
                                             stdout=slave, stderr=slave, close_fds=True)
         except OSError:
             self.close()
-            raise VSMUnavailable('本地 VSM 客户端启动失败，请检查客户端架构和执行权限。') from None
+            raise VSMUnavailable('本地 VSM 客户端启动失败，请检查客户端架构和执行权限。', retryable=False) from None
         finally:
             os.close(slave)
         try:
@@ -130,32 +182,71 @@ class VSMTransport(SSHTransport):
                 raise ValueError('VSM 连接的主控 SN 与输入 SN 不一致，已拒绝添加或执行。')
             self.command(['sh', '-c', 'command -v base64 >/dev/null && command -v dd >/dev/null'])
             self.client = VSMFiles(self)
+            self._connecting = False
+            self._login_output.clear()
         except Exception:
             self.close()
             raise
 
     def _write(self, data, deadline):
         while data:
+            self._check_cancelled()
             if time.monotonic() >= deadline:
                 raise TimeoutError('VSM 输入超时')
             _, ready, _ = select.select([], [self.master_fd], [], 0.2)
             if ready:
-                sent = os.write(self.master_fd, data[:4096])
+                try:
+                    sent = os.write(self.master_fd, data[:4096])
+                except OSError:
+                    # 客户端可能已输出失败原因并退出；先取走 PTY 缓冲区。
+                    self._drain_login_output()
+                    raise self._connection_error() from None
                 data = data[sent:]
 
     def _read(self, deadline):
-        if self.process.poll() is not None:
-            raise VSMUnavailable('本地 VSM 已退出，无法访问主控，请检查网络、账号权限和设备在线状态。')
+        self._check_cancelled()
         ready, _, _ = select.select([self.master_fd], [], [], max(0, min(0.2, deadline - time.monotonic())))
         if not ready:
+            if self.process.poll() is not None:
+                raise self._connection_error()
             return b''
         try:
             data = os.read(self.master_fd, 65536)
         except OSError:
-            raise VSMUnavailable('VSM 与主控的连接已断开。') from None
+            raise self._connection_error() from None
         if not data:
-            raise VSMUnavailable('VSM 与主控的连接已断开。')
+            raise self._connection_error()
+        if self._connecting:
+            self._login_output.extend(data)
+            del self._login_output[:-65536]
         return data
+
+    def _drain_login_output(self):
+        if not self._connecting:
+            return
+        while select.select([self.master_fd], [], [], 0)[0]:
+            try:
+                data = os.read(self.master_fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            self._login_output.extend(data)
+            del self._login_output[:-65536]
+
+    def _connection_error(self):
+        # 只记录已知错误类别，不将含账号、口令或令牌的客户端原文写入云端。
+        output = self._login_output.decode('utf-8', 'replace').lower()
+        if '没有该设备的权限' in output or 'permission denied' in output:
+            return VSMUnavailable('VSM 账号没有该设备的访问权限。', retryable=False)
+        if any(value in output for value in ('username or password', '密码错误', '认证失败', 'authentication failed')):
+            return VSMUnavailable('VSM 账号认证失败，请检查登录配置。', retryable=False)
+        if 'wdren系统异常' in output or 'request wdr login no success' in output:
+            return VSMUnavailable('VSM 登录服务临时异常（WDR 登录未成功）。')
+        if 'too many' in output or 'rate limit' in output:
+            return VSMUnavailable('VSM 登录请求受到频率或连接数限制。')
+        code = self.process.poll() if self.process else None
+        return VSMUnavailable('VSM 连接已断开' + ('（客户端退出码 %s）' % code if code is not None else '') + '，请检查网络和设备在线状态。')
 
     def command(self, args, timeout=25):
         if self.master_fd is None:

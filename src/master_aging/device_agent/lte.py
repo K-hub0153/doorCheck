@@ -6,7 +6,7 @@ import termios
 import time
 from pathlib import Path
 
-from ..domain.diagnostics import LTE_SCOPE, monitor_reason
+from ..domain.diagnostics import lte_scope, lte_thresholds, monitor_reason
 
 
 def at(fd, text):
@@ -57,17 +57,16 @@ def read_at(port, text):
 def sample(settings):
     # 纯解析模块在部署时随 zipapp 发布，PC 运行时使用同一份源文件。
     try:
-        from lte_decode import (DEFAULT_AT_PORT, LTE_THRESHOLDS,
-                                load_modules, identify_module, decode, judge)
+        from lte_decode import (DEFAULT_AT_PORT, load_modules, identify_module, decode)
     except ImportError:
         from src.master_control.core.lte_signal import (
-            DEFAULT_AT_PORT, LTE_THRESHOLDS,
-            load_modules, identify_module, decode, judge)
+            DEFAULT_AT_PORT, load_modules, identify_module, decode)
     override = settings.get('at_port') or None
     modules = load_modules(at_port=override)
     raw = {'ati_port': override or DEFAULT_AT_PORT, 'ati': '', 'attempts': []}
-    result = {'ok': False, 'raw': raw, 'signal': {}, 'thresholds': dict(LTE_THRESHOLDS),
-              'scope': LTE_SCOPE}
+    limits = lte_thresholds(settings)
+    result = {'ok': False, 'raw': raw, 'signal': {}, 'thresholds': limits,
+              'scope': lte_scope(settings)}
     try:
         raw['ati'] = read_at(override or DEFAULT_AT_PORT, 'ATI')
     except (OSError, RuntimeError, termios.error) as exc:
@@ -101,8 +100,11 @@ def sample(settings):
             result['reason'] = '模组厂商识别失败（' + '; '.join(reasons) + '）'
             return result
         note = 'ATI 未识别，按响应格式判定'
-    signal_ok, checks, reason = judge(decoded.metrics)
     values = {m.key: m.value for m in decoded.metrics}
+    missing = [key.upper() for key in limits if values.get(key) is None]
+    checks = {key: values[key] >= limit for key, limit in limits.items()} if not missing else {}
+    signal_ok = not missing and all(checks.values())
+    reason = '缺少判定字段: ' + ', '.join(missing) if missing else ''
     result.update(ok=decoded.ok and signal_ok, module=spec.name, model=model,
                   at_port=spec.at_port, identify_note=note, checks=checks,
                   signal=values,

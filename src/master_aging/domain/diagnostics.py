@@ -1,6 +1,19 @@
 """监测项目共用的诊断文字；根据采样证据描述异常，不推断硬件根因。"""
 
-LTE_SCOPE = '周期检测 4G 信号：RSRP ≥ -90 dBm、RSRQ ≥ -13 dB、SINR ≥ 5 dB'
+LTE_DEFAULT_THRESHOLDS = {'rsrp': -90, 'rsrq': -13, 'sinr': 5}
+
+
+def lte_thresholds(config=None):
+    return dict(LTE_DEFAULT_THRESHOLDS, **((config or {}).get('thresholds') or {}))
+
+
+def lte_scope(config=None):
+    limits = lte_thresholds(config)
+    return '周期检测 4G 信号：RSRP ≥ %g dBm、RSRQ ≥ %g dB、SINR ≥ %g dB' % (
+        limits['rsrp'], limits['rsrq'], limits['sinr'])
+
+
+LTE_SCOPE = lte_scope()
 GENERIC_MONITOR_REASON = '连续监测发现异常，详见原始样本；归因待复核'
 
 
@@ -36,4 +49,6 @@ def item_reason(key, item, records=(), config=None):
 
 
 def item_scope(key, item):
-    return LTE_SCOPE if key == 'lte' else item.get('scope', '')
+    if key == 'lte' and (item.get('scope') or '').startswith('沿用产测'):
+        return LTE_SCOPE
+    return item.get('scope') or (LTE_SCOPE if key == 'lte' else '')

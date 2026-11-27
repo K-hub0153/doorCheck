@@ -228,6 +228,11 @@ class RunService:
                     if transport is None:
                         transport = self.transport_factory(device)
                         def progress(message):
+                            nonlocal last_claim
+                            # 连接排队可能较久；进度心跳续租，避免等待时控制权过期。
+                            if time.monotonic() - last_claim >= 60:
+                                self.repository.claim(run_id, self.controller_id)
+                                last_claim = time.monotonic()
                             if not launched:
                                 last_status.update(state='DEPLOYING', environment_message=message)
                                 self._store(run_id, last_status)
@@ -426,6 +431,10 @@ class RunService:
     def busy(self):
         with self._lock:
             return bool(self.active)
+
+    def device_busy(self, sn):
+        with self._lock:
+            return any(control['device']['sn'] == sn for control in self.active.values())
 
 
 class LocalLogUnavailable(RuntimeError):
