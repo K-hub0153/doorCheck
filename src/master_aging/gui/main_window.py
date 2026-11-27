@@ -11,7 +11,8 @@ from PyQt5.QtWidgets import (QAbstractItemView, QDialog, QFrame, QGridLayout, QH
                              QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QTabWidget,
                              QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 from ..adapters.discovery import Discovery
-from ..adapters.ssh_transport import SSHTransport
+from ..adapters.transport import create_transport, is_vsm
+from ..adapters.vsm import check_environment, check_platform, manual_device
 from ..application.run_service import RunService
 from ..domain.models import ITEMS
 from ..domain.policies import planned_seconds, validate_plan
@@ -25,6 +26,7 @@ from ..infrastructure.local_logs import application_logger, log_root
 from .metrics_panel import MetricsPanel
 from .device_list_panel import DeviceListPanel
 from .discovery_dialogs import DeviceSelectionDialog, InterfaceDialog
+from .manual_device_dialog import ManualDeviceDialog
 from .styles import STYLE, STATES, status_color
 
 
@@ -104,6 +106,7 @@ class MainWindow(QMainWindow):
         scan_row = QHBoxLayout()
         scan_row.setContentsMargins(10, 2, 10, 0)
         self.scan_button = self.button('子网扫描', self.scan, scan_row)
+        self.manual_button = self.button('手动添加', self.manual_add, scan_row)
         left_layout.addLayout(scan_row)
         self.scan_label = QLabel('自动识别本机局域网')
         self.scan_label.setObjectName('muted')
@@ -198,7 +201,7 @@ class MainWindow(QMainWindow):
         self.statistics.setWordWrap(True)
         history_layout.addWidget(self.statistics)
         self.history = QTableWidget(0, 6)
-        self.history.setHorizontalHeaderLabels(['创建时间', 'SN', 'IP', '状态', '结论', '运行 ID'])
+        self.history.setHorizontalHeaderLabels(['创建时间', 'SN', '连接地址', '状态', '结论', '运行 ID'])
         self.history.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.history.setSelectionMode(QAbstractItemView.SingleSelection)
         self.history.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -275,6 +278,75 @@ class MainWindow(QMainWindow):
         for card in self.device_list.cards.values():
             card.check.setChecked(False)
 
+    def manual_add(self):
+        try:
+            check_platform()
+        except Exception as exc:
+            self.error(exc)
+            return
+        self.manual_button.setEnabled(False)
+        self.manual_button.setText('检查 VSM…')
+        def failed(exc):
+            self.finish_manual_add()
+            self.error(exc)
+        def ready(_):
+            if self.closing:
+                self.finish_manual_add()
+                return
+            dialog = ManualDeviceDialog(self)
+            if dialog.exec_() != QDialog.Accepted:
+                self.finish_manual_add()
+                return
+            existing = {device['sn'] for device in self.devices.values()}
+            sns = [sn for sn in dialog.sns if sn not in existing]
+            if not sns:
+                self.finish_manual_add()
+                QMessageBox.information(self, '手动添加', '输入的主控均已在设备列表中。')
+                return
+            self.manual_button.setText('验证连接…')
+            self.log('正在通过本地 VSM 验证 %s 台主控的连接、SN 和 root 权限' % len(sns))
+            def validate():
+                devices, errors = [], []
+                for sn in sns:
+                    if self.closing:
+                        break
+                    device = manual_device(sn)
+                    transport = create_transport(device)
+                    try:
+                        transport.connect()
+                        devices.append(device)
+                        self.job_messages.put('%s：VSM 连接成功，已确认 root 权限' % sn)
+                    except Exception as exc:
+                        errors.append('%s：%s' % (sn, exc))
+                    finally:
+                        transport.close()
+                return devices, errors
+            def complete(result):
+                self.finish_manual_add()
+                devices, errors = result
+                # 验证期间可能完成了局域网扫描，按 SN 再次去重。
+                known = {device['sn'] for device in self.devices.values()}
+                count = 0
+                for device in devices:
+                    if device['sn'] in known:
+                        continue
+                    self.found(device)
+                    self.device_list.cards[device['ip']].check.setChecked(True)
+                    count += 1
+                self.log('手动添加完成：成功 %s 台，失败 %s 台' % (count, len(errors)))
+                if errors:
+                    box = QMessageBox(QMessageBox.Warning, '部分主控无法添加',
+                                      '成功添加 %s 台，失败 %s 台。\n%s' %
+                                      (count, len(errors), '\n'.join(errors[:5])), parent=self)
+                    box.setDetailedText('\n'.join(errors))
+                    box.exec_()
+            self.job(validate, complete, failed)
+        self.job(check_environment, ready, failed)
+
+    def finish_manual_add(self):
+        self.manual_button.setText('手动添加')
+        self.manual_button.setEnabled(True)
+
     def scan(self):
         if self.scanning:
             return
@@ -312,7 +384,8 @@ class MainWindow(QMainWindow):
                 if dialog.exec_() == QDialog.Accepted:
                     selected = dialog.selected_devices()
                     # 空闲时用本次结果替换列表；运行或补采时保留原设备与运行映射。
-                    if not self.service.busy() and not self.jobs and selected:
+                    if (not self.service.busy() and not self.jobs and selected
+                            and not any(is_vsm(device) for device in self.devices.values())):
                         self.devices.clear()
                         self.device_list.clear()
                         self.run_devices.clear()
@@ -320,6 +393,8 @@ class MainWindow(QMainWindow):
                         self.metrics.select(None)
                         self.detail.clear()
                     for device in selected:
+                        if any(d['sn'] == device['sn'] and is_vsm(d) for d in self.devices.values()):
+                            continue
                         self.found(device)
                         self.device_list.cards[device['ip']].check.setChecked(True)
             def failed(exc):
@@ -349,7 +424,7 @@ class MainWindow(QMainWindow):
         self.update_probe_button()
         self.log('正在读取设备信息：%s (%s)' % (device.get('sn', ''), ip))
         def read():
-            transport = SSHTransport(device, progress=lambda message: self.job_messages.put('%s：%s' % (ip, message)))
+            transport = create_transport(device, progress=lambda message: self.job_messages.put('%s：%s' % (ip, message)))
             try:
                 return dict(transport.probe(), ip=device['ip'])
             finally:
@@ -391,7 +466,7 @@ class MainWindow(QMainWindow):
         if not devices and self.device_list.current_ip in self.devices:
             devices = [self.devices[self.device_list.current_ip]]
         if not devices:
-            QMessageBox.information(self, '读取设备信息', '请先扫描并添加设备，再点击设备卡片或勾选需要读取的设备。')
+            QMessageBox.information(self, '读取设备信息', '请先扫描或手动添加设备，再点击设备卡片或勾选需要读取的设备。')
             return
         for device in devices:
             self.probe(device)
@@ -613,7 +688,7 @@ class MainWindow(QMainWindow):
             self.metrics.select(device.get('run_id'))
             status = self.statuses.get(device.get('run_id'), device)
             state = status.get('result') or STATES.get(status.get('state'), status.get('state', '待配置'))
-            self.device_info.setText('SN: %s    IP: %s    状态: %s' % (device.get('sn', '待读取'), ip, state))
+            self.device_info.setText('SN: %s    连接: %s    状态: %s' % (device.get('sn', '待读取'), ip, state))
             hint = self.battery_hint(status)
             if hint:
                 self.device_info.setText(self.device_info.text() + '\n' + hint)
@@ -704,12 +779,18 @@ class MainWindow(QMainWindow):
             row = self.repository.get(run_id)
             if row['sync_complete']:
                 raise ValueError('这条运行已结束且数据已同步，无需恢复补采')
-            address, accepted = QInputDialog.getText(self, '恢复设备连接', '当前设备 IPv4（IP 变化时可修改，重连后核验真实身份）', text=row['ip'])
-            if not accepted:
-                return
-            address = str(ipaddress.IPv4Address(address.strip()))
+            if is_vsm(row):
+                check_platform()
+                device = manual_device(row['sn'])
+                address = device['ip']
+            else:
+                address, accepted = QInputDialog.getText(self, '恢复设备连接', '当前设备 IPv4（IP 变化时可修改，重连后核验真实身份）', text=row['ip'])
+                if not accepted:
+                    return
+                address = str(ipaddress.IPv4Address(address.strip()))
+                device = {'ip': address, 'sn': row['sn']}
             if address not in self.devices:
-                self.found({'ip': address, 'sn': row['sn']})
+                self.found(device)
             self.run_devices[run_id] = address
             self.devices[address]['run_id'] = run_id
             self.service.resume(run_id, address)
@@ -757,6 +838,8 @@ class MainWindow(QMainWindow):
                 previous_reason = previous.get('local_log_error') or previous.get('storage_error') or previous.get('error') or previous.get('connection_error') or previous.get('safety_stop') or previous.get('environment_message') or ''
                 if (status['state'], reason) != (previous.get('state'), previous_reason):
                     self.log('%s：%s %s' % (self.devices[ip]['sn'], STATES.get(status['state'], status['state']), reason))
+                    if is_vsm(self.devices[ip]) and status['state'] == 'BLOCKED' and status.get('error'):
+                        self.error('%s：%s' % (self.devices[ip]['sn'], status['error']))
                 if status.get('battery', {}).get('confirmed') and not previous.get('battery', {}).get('confirmed'):
                     self.log('%s：设备已收到电源确认，电池老化开始计时' % self.devices[ip]['sn'])
                 if status.get('hardware') and status['hardware'] != previous.get('hardware'):

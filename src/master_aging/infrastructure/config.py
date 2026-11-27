@@ -69,3 +69,14 @@ def ssh_settings():
     with (app_dir() / 'config/master_control/config.yaml').open(encoding='utf-8') as stream:
         settings = yaml.safe_load(stream).get('ssh', {})
     return {key: settings[key] for key in ('username', 'password', 'timeout') if key in settings}
+
+
+def vsm_settings():
+    """VSM 配置只包含本地命令；凭据不写入计划、设备记录或日志。"""
+    path = app_dir() / 'config/master_aging/vsm.yaml'
+    settings = {}
+    if path.exists():
+        with path.open(encoding='utf-8') as stream:
+            settings = yaml.safe_load(stream) or {}
+    return {'command': os.environ.get('MASTER_AGING_VSM_COMMAND') or settings.get('command', ''),
+            'timeout': max(5, min(120, int(settings.get('timeout', 45))))}

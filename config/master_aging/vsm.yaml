@@ -1,0 +1,5 @@
+# macOS 手动添加：留空时从 /bin/zsh -lic 读取 vsm 别名或 PATH 中的 vsm。
+# 也可填写完整命令（含登录参数），或通过 MASTER_AGING_VSM_COMMAND 覆盖。
+# 本机凭据请勿提交到版本库；命令不会进入运行快照或日志。
+command: ''
+timeout: 45

@@ -7,10 +7,7 @@ from .paths import get_app_dir
 
 def get_executable_dir():
     """获取可执行文件所在目录"""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    return get_app_dir()
 
 
 class Logger:

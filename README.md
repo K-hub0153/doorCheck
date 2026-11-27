@@ -26,7 +26,19 @@ python main.py
 python build.py
 ```
 
-产物位于 `dist/`，名称为 `智能设备产测工具_<版本号>`（Windows 为 `.exe`，macOS 同时生成 `.app`）。`config/`、`certs/` 随程序分发；共享字体嵌入程序。脚本支持重复打包，覆盖同版本产物。
+产物位于 `dist/`：Windows 生成 `智能设备产测工具_<版本号>.exe`，macOS 生成 `.app` 和带 CPU 架构后缀的 `.dmg` 安装包。打开 DMG，将应用拖入 Applications 后启动。必须在目标操作系统构建；macOS 产物使用构建机的 CPU 架构（Apple Silicon / Intel 分别构建）。脚本支持覆盖同版本产物。
+
+Windows 的 `config/`、`certs/` 随 exe 一起分发。macOS 将默认配置嵌入应用，首次启动复制到 `~/Library/Application Support/Weidian/DeviceFactoryTool/`；后续启动保留用户配置，并补充新增配置文件。日志也保存在该目录下。DMG 使用本地临时签名，未进行 Apple Developer ID 签名和公证；正式对外分发时需使用自己的开发者证书签名并公证。
+
+## 主控老化：手动添加（仅 macOS）
+
+保留原有「子网扫描」，新增「手动添加」。点击后先检查本地 VSM 是否可运行，Windows 或环境不满足时弹窗提示。粘贴多个 SN（英文逗号或换行分隔），或导入 `.xlsx` / `.xlsm`。Excel 优先读取 `SN`、`设备SN`、`主控SN` 或 `序列号` 列；无表头时读取第一列，支持多个工作表，自动去重。旧 `.xls` 文件请另存为 `.xlsx`。
+
+工具逐台验证 VSM 连接、真实 `/etc/serial-id` 与输入 SN 是否一致、`id -u` 是否为 `0`。仅验证成功的主控加入列表，失败设备在弹窗中列出原因。支持 wdse、hisi、orangepi 主控，SN 最长 128 个字符，兼容现有数据库结构。添加仅执行连接和身份检查，点击「开始选中设备」后才按原计划部署环境并老化。部署、压测、电源确认、停止、日志采集与报告逻辑复用原流程；每次重连重新校验 SN 和 root，历史 VSM 运行可通过「恢复补采」重连。
+
+请先在本机终端确认 `vsm <SN>` 可用。应用支持读取 zsh 的 `vsm` 别名或 PATH 中的客户端；也可在 `config/master_aging/vsm.yaml` 填写含登录参数的完整 `command`，或设置 `MASTER_AGING_VSM_COMMAND` 环境变量。macOS 安装后的配置位于上述用户目录。需要客户端可执行、登录参数完整、主控在线且账号允许 root 访问，设备须提供 `base64`、`dd`。本机登录凭据不会写入计划、设备记录或日志，请勿将个人凭据提交到版本库。
+
+离线回归检查：`python -m unittest discover -s tools/master_aging -v`。
 
 ## 项目结构
 

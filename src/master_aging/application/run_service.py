@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 
-from ..adapters.ssh_transport import SSHTransport
+from ..adapters.transport import create_transport, is_vsm
 from ..adapters.environment import DeploymentCancelled
 from ..domain.models import conclusion, digest, new_id, utc_now
 from ..domain.policies import validate_plan
@@ -17,7 +17,7 @@ from ..infrastructure.log_summary import CLOUD_INTERVAL_S, cloud_status, state_s
 
 class RunService:
     """每个设备一条串行控制通道；跨设备并行，事件通过线程安全队列交给 GUI。"""
-    def __init__(self, repository, transport_factory=SSHTransport, local_logs=None):
+    def __init__(self, repository, transport_factory=create_transport, local_logs=None):
         self.repository = repository
         self.local_logs = local_logs if local_logs is not None else LocalLogs()
         self._cloud_status = {}
@@ -96,7 +96,13 @@ class RunService:
         row = self.repository.get(run_id)
         if not row or row['sync_complete']:
             raise ValueError('运行已结束或不存在')
-        device = {'sn': row['sn'], 'ip': str(ipaddress.IPv4Address(ip or row['ip']))}
+        address = ip or row['ip']
+        if is_vsm({'ip': row['ip']}):
+            from ..adapters.vsm import check_platform, manual_device
+            check_platform()
+            device = manual_device(row['sn'])
+        else:
+            device = {'sn': row['sn'], 'ip': str(ipaddress.IPv4Address(address))}
         plan = json.loads(row['snapshot'])
         state = self._register(run_id, device, row['batch_id'], json.loads(row['status']))
         self.pool.submit(self._run, run_id, device, plan, state, threading.Semaphore(1), True)

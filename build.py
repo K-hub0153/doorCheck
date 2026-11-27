@@ -10,6 +10,7 @@ import platform
 import subprocess
 import shutil
 import yaml
+import plistlib
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -241,10 +242,14 @@ class BuildScript:
         cmd = [
             sys.executable, "-m", "PyInstaller",
             "--noconfirm",
-            "--onefile",
+            "--onedir" if self.system == "Darwin" else "--onefile",
             "--windowed",
             "--name", app_name_with_version,
         ]
+        if self.system == "Darwin":
+            cmd.extend(["--osx-bundle-identifier", "com.weidian.devicefactorytool"])
+            for resource, target in self.external_dirs:
+                cmd.extend(["--add-data", f"{self.project_root / resource}:{target}"])
 
         # 添加图标
         icon_path = self.project_root / "src" / "ui" / "icon" / "vdian.ico"
@@ -319,6 +324,9 @@ class BuildScript:
     def copy_external_resources(self) -> bool:
         """将 certs、config 等外部资源复制到 dist 目录"""
         self.print_step(3, 4, "复制外部资源到 dist 目录...")
+        if self.system == "Darwin":
+            self.print_success('config/certs 已嵌入 .app，首次启动复制到用户 Application Support 目录')
+            return True
 
         for src, dst in self.external_dirs:
             src_path = self.project_root / src
@@ -354,10 +362,7 @@ class BuildScript:
         if self.system == "Windows":
             return self.dist_dir / f"{app_name_with_version}.exe"
         elif self.system == "Darwin":  # macOS
-            app_file = self.dist_dir / f"{app_name_with_version}.app"
-            if app_file.exists():
-                return app_file
-            return self.dist_dir / app_name_with_version
+            return self.dist_dir / f"{app_name_with_version}_{platform.machine()}.dmg"
         else:  # Linux
             return self.dist_dir / app_name_with_version
 
@@ -376,22 +381,27 @@ class BuildScript:
 
         self.print_header("打包成功！")
 
-        print(f"可执行文件: {output_file}")
+        print(f"安装包: {output_file}" if self.system == 'Darwin' else f"可执行文件: {output_file}")
         print(f"文件大小: {size_mb:.2f} MB")
         print(f"版本号: {self.version}")
         print()
 
         print("dist 目录内容:")
         app_name_with_version = f"{self.app_name}_{self.version}"
-        print(f"  OK {app_name_with_version}{'.exe' if self.system == 'Windows' else ''}")
+        print(f"  OK {output_file.name}")
         for src, dst in self.external_dirs:
             dst_path = self.dist_dir / dst
             if dst_path.exists():
                 print(f"  OK {dst}/ - {self._get_dir_info(dst_path)}")
-        print(f"  OK 日志将输出到 dist/logs/")
+        if self.system != 'Darwin':
+            print(f"  OK 日志将输出到 dist/logs/")
         print()
 
-        if self.system in ["Darwin", "Linux"]:
+        if self.system == "Darwin":
+            print('  - 打开 DMG，将 .app 拖入 Applications 后启动')
+            print('  - 配置和日志：~/Library/Application Support/Weidian/DeviceFactoryTool/')
+            print('  - 手动添加主控需本机已安装并配置 VSM')
+        elif self.system == "Linux":
             print("注意事项:")
             print("  - 需要 sudo 权限运行（用于TFTP服务器）")
             print(f"  - 运行命令: sudo {output_file}")
@@ -400,6 +410,38 @@ class BuildScript:
             print("  - 需要管理员权限运行")
             print("  - 右键 -> 以管理员身份运行")
 
+        return True
+
+    def create_macos_installer(self) -> bool:
+        """生成可拖拽安装的 DMG；VSM 使用目标电脑本地配置，不打包个人凭据。"""
+        if self.system != 'Darwin':
+            return True
+        app = self.dist_dir / f'{self.app_name}_{self.version}.app'
+        if not app.is_dir():
+            self.print_error('未生成 macOS .app')
+            return False
+        plist_path = app / 'Contents' / 'Info.plist'
+        with plist_path.open('rb') as stream:
+            info = plistlib.load(stream)
+        info.update(CFBundleShortVersionString=self.version, CFBundleVersion=self.version,
+                    NSHighResolutionCapable=True)
+        with plist_path.open('wb') as stream:
+            plistlib.dump(info, stream)
+        subprocess.run(['/usr/bin/codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
+        staging = self.build_dir / 'macos-installer'
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        subprocess.run(['/usr/bin/ditto', str(app), str(staging / app.name)], check=True)
+        (staging / 'Applications').symlink_to('/Applications')
+        (staging / '安装说明.txt').write_text(
+            '将应用拖入 Applications，随后启动。\n'
+            '配置、日志位于 ~/Library/Application Support/Weidian/DeviceFactoryTool/。\n'
+            '手动添加主控需预先安装并配置本地 VSM（支持 zsh vsm 别名）。\n', encoding='utf-8')
+        subprocess.run(['/usr/bin/hdiutil', 'create', '-ov', '-format', 'UDZO',
+                        '-volname', self.app_name, '-srcfolder', str(staging),
+                        str(self.get_output_file())], check=True)
+        self.print_success('macOS DMG 安装包已生成')
         return True
 
     def _get_dir_info(self, dir_path: Path) -> str:
@@ -466,7 +508,10 @@ class BuildScript:
             return False
 
         # 复制外部资源到 dist 目录
-        self.copy_external_resources()
+        if not self.copy_external_resources():
+            return False
+        if not self.create_macos_installer():
+            return False
 
         # 显示结果
         success = self.show_results()
