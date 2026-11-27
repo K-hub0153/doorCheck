@@ -2,13 +2,40 @@ from copy import deepcopy
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                              QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                             QScrollArea, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
+                             QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
                              QVBoxLayout, QWidget)
 from ..domain.models import ITEMS
 from ..domain.policies import validate_plan
 from ..domain.diagnostics import lte_thresholds
 from ..infrastructure.config import save_config
 from .styles import STYLE
+
+
+class SettingsForm(QFormLayout):
+    """各项目共用列宽和间距，显式覆盖不同平台的表单对齐默认值。"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        self.setContentsMargins(16, 22, 16, 16)
+        self.setHorizontalSpacing(20)
+        self.setVerticalSpacing(12)
+
+    def addRow(self, *args):
+        if len(args) == 2 and isinstance(args[0], str):
+            label = QLabel(args[0])
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label.setFixedWidth(230)
+            label.setWordWrap(True)
+            field = args[1]
+            field.setMinimumHeight(34)
+            if isinstance(field, (QSpinBox, QDoubleSpinBox)):
+                field.setMaximumWidth(200)
+                field.setAlignment(Qt.AlignLeft)
+            args = (label, field)
+        super().addRow(*args)
 
 
 class PlanDialog(QDialog):
@@ -71,10 +98,13 @@ class PlanDialog(QDialog):
         self.cabinet = QLineEdit(str(env.get('cabinet_id') or ''))
         form.addRow('老化柜编号', self.cabinet)
         options = QVBoxLayout(settings)
-        execution = QFormLayout()
+        settings.setObjectName('planSettingsPage')
+        settings.setAttribute(Qt.WA_StyledBackground, True)
+        options.setContentsMargins(16, 16, 16, 20)
+        options.setSpacing(16)
+        execution = self.project_group(options, '数据采集')
         self.interval = self.integer(plan['sample_interval_s'], 1, 60)
         execution.addRow('数据采集间隔（秒）', self.interval)
-        options.addLayout(execution)
         cpu_form = self.project_group(options, 'CPU 负载', 'cpu')
         self.cpu_target = self.integer(plan['items']['cpu']['target_busy_pct'], 1, 100)
         cpu_form.addRow('忙碌率通过下限（%）', self.cpu_target)
@@ -85,7 +115,7 @@ class PlanDialog(QDialog):
         ddr_form.addRow('内存使用比例（%）', self.ddr_ratio)
         self.ddr_reserve = self.decimal(plan['items']['ddr']['reserve_mib'], 128, 1048576)
         ddr_form.addRow('系统保留内存（MiB）', self.ddr_reserve)
-        ddr_form.addRow(QLabel('预期：内存正确性校验无错误；实际分配内存须驻留并锁页，不发生交换。'))
+        self.settings_note(ddr_form, '预期：内存正确性校验无错误；实际分配内存须驻留并锁页，不发生交换。')
         storage_form = self.project_group(options, 'SSD/eMMC 读写', 'storage')
         storage = plan['items']['storage']
         self.storage_targets = QLineEdit(', '.join(storage.get('targets') or []))
@@ -100,7 +130,7 @@ class PlanDialog(QDialog):
         storage_form.addRow('每盘写入上限（GiB）', self.storage_budget)
         storage_form.addRow('每轮测试容量（MiB）', self.storage_chunk)
         storage_form.addRow('写入轮数', self.storage_rounds)
-        storage_form.addRow(QLabel('预期：完成全部写入轮数，direct I/O 读回校验一致，无 I/O 错误。'))
+        self.settings_note(storage_form, '预期：完成全部写入轮数，direct I/O 读回校验一致，无 I/O 错误。')
         battery_form = self.project_group(options, '电池判定', 'battery')
         self.completion = QComboBox()
         self.completion.addItem('按设定时长完成', 'fixed_duration')
@@ -114,7 +144,7 @@ class PlanDialog(QDialog):
         battery_form.addRow('停止节点电流绝对值 ≤（mA）', self.stop_current)
         battery_form.addRow('停止节点连续确认样本数', self.stop_samples)
         battery_form.addRow('连续读取失败上限', self.read_failures)
-        battery_form.addRow(QLabel('停止节点仍需核验 SOC / 电池状态；固定时长模式持续监测至时长达标。'))
+        self.settings_note(battery_form, '停止节点仍需核验 SOC / 电池状态；固定时长模式持续监测至时长达标。')
         lte_form = self.project_group(options, '4G 信号预期下限', 'lte')
         limits = lte_thresholds(plan['items']['lte'])
         self.lte_fields = {}
@@ -127,7 +157,7 @@ class PlanDialog(QDialog):
             widget.setValue(limits[key])
             self.lte_fields[key] = widget
             lte_form.addRow(label, widget)
-        lte_form.addRow(QLabel('预检和运行期间使用同一门限；任一指标缺失或低于下限均不通过。'))
+        self.settings_note(lte_form, '预检和运行期间使用同一门限；任一指标缺失或低于下限均不通过。')
         options.addStretch()
         protection = plan.get('protection', {})
         controls = QFormLayout(safety)
@@ -191,12 +221,23 @@ class PlanDialog(QDialog):
         tabs.addTab(area, title)
         return page
 
-    def project_group(self, layout, title, key):
+    def project_group(self, layout, title, key=None):
         group = QGroupBox(title)
-        group.setEnabled(self.checks[key].isChecked())
-        self.checks[key].toggled.connect(group.setEnabled)
+        group.setObjectName('planSection')
+        if key is not None:
+            group.setEnabled(self.checks[key].isChecked())
+            self.checks[key].toggled.connect(group.setEnabled)
         layout.addWidget(group)
-        return QFormLayout(group)
+        return SettingsForm(group)
+
+    @staticmethod
+    def settings_note(form, text):
+        label = QLabel(text)
+        label.setObjectName('planHelp')
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        form.addRow(label)
 
     @staticmethod
     def decimal(value, low, high):

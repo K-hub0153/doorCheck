@@ -37,6 +37,10 @@ QPlainTextEdit { background: #fafbfd; border: 1px solid #e3e9ef; border-radius: 
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: white; border: 1px solid #cfd8dc; border-radius: 4px; padding: 5px; }
 QGroupBox { border: 1px solid #dfe5eb; border-radius: 5px; margin-top: 12px; padding-top: 12px; }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+QWidget#planSettingsPage { background: #f5f7fa; }
+QGroupBox#planSection { background: white; border: 1px solid #dfe5eb; border-radius: 8px; margin-top: 10px; padding-top: 10px; }
+QGroupBox#planSection::title { subcontrol-origin: margin; subcontrol-position: top left; left: 16px; padding: 0 6px; color: #37474f; font-weight: bold; }
+QLabel#planHelp { color: #6b7e88; font-size: 12px; background: #f5f8fb; border-radius: 4px; padding: 8px 10px; }
 QStatusBar { background: #eef2f6; color: #607080; border-top: 1px solid #dce4ec; }
 QSplitter::handle { background: #edf1f5; width: 8px; }
 QProgressBar { border: none; background: #e3f2fd; border-radius: 3px; text-align: center; min-height: 18px; color: #1565c0; }
