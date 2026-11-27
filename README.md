@@ -26,7 +26,21 @@ python main.py
 python build.py
 ```
 
-产物位于 `dist/`：Windows 生成 `智能设备产测工具_<版本号>.exe`，macOS 生成 `.app` 和带 CPU 架构后缀的 `.dmg` 安装包。打开 DMG，将应用拖入 Applications 后启动。必须在目标操作系统构建；macOS 产物使用构建机的 CPU 架构（Apple Silicon / Intel 分别构建）。脚本支持覆盖同版本产物。
+产物位于 `dist/`：Windows 生成 `智能设备产测工具_<版本号>.exe`。macOS 默认一次构建两个原生安装包，分别供 Intel 和 Apple Silicon 使用，无需在使用者电脑上安装 Rosetta：
+
+- `智能设备产测工具_<版本号>_x86_64.dmg`：Intel Mac。
+- `智能设备产测工具_<版本号>_arm64.dmg`：M 芯片 Mac。
+
+macOS 双架构构建推荐在 M 芯片 Mac 上执行，需要 [python.org](https://www.python.org/downloads/macos/) 的 universal2 Python；构建 Intel 包还需要构建机安装 Rosetta 2。Homebrew 的单架构 Python 无法用于双架构构建。脚本自动在 `.build-envs/macos-arm64/` 和 `.build-envs/macos-x86_64/` 创建隔离环境，首次联网安装各自架构的依赖；依赖声明不变时复用环境。两个 `.app` 分别保存在 `dist/arm64/` 和 `dist/x86_64/`，两个 DMG 放在 `dist/` 根目录。打开对应 DMG，将应用拖入 Applications 后启动。脚本会检查包内所有 macOS 二进制的架构，避免 Qt、Python 扩展或 ffmpeg 架构不匹配。
+
+也可以仅使用当前环境构建指定架构（依赖须已安装为对应架构）：
+
+```bash
+python build.py --macos-arch arm64       # M 芯片
+arch -x86_64 python build.py --macos-arch x86_64  # Intel
+```
+
+如果已经准备好 Python、PyQt5、Pillow、cryptography 等全部二进制依赖的双架构版本，可以执行 `python build.py --macos-arch universal2`，生成一个原生通用包。PyPI 上的 Qt 等通常分别提供单架构 wheel，默认双包构建无需手工合并这些依赖。脚本支持覆盖同版本产物。
 
 Windows 的 `config/`、`certs/` 随 exe 一起分发。macOS 将默认配置嵌入应用，首次启动复制到 `~/Library/Application Support/Weidian/DeviceFactoryTool/`；后续启动保留用户配置，并补充新增配置文件。日志也保存在该目录下。DMG 使用本地临时签名，未进行 Apple Developer ID 签名和公证；正式对外分发时需使用自己的开发者证书签名并公证。
 

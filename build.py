@@ -4,23 +4,30 @@
 支持 Windows、macOS、Linux 跨平台打包
 """
 
+import argparse
 import sys
 import os
 import platform
 import subprocess
 import shutil
-import yaml
+import hashlib
+import json
 import plistlib
 from pathlib import Path
 from typing import Optional, List, Tuple
 
 
 class BuildScript:
-    def __init__(self):
+    def __init__(self, macos_arch: Optional[str] = None):
         self.system = platform.system()
+        self.macos_arch = macos_arch or platform.machine()
         self.project_root = Path(__file__).parent.absolute()
         self.dist_dir = self.project_root / "dist"
         self.build_dir = self.project_root / "build"
+        if self.system == 'Darwin':
+            # 两个架构保留独立的 app、中间文件和 PyInstaller spec。
+            self.dist_dir /= self.macos_arch
+            self.build_dir /= self.macos_arch
         self.app_name = "智能设备产测工具"
         self.version = self._load_version()
 
@@ -83,6 +90,7 @@ class BuildScript:
         """从 config.yaml 读取版本号"""
         config_file = self.project_root / "config" / "config.yaml"
         try:
+            import yaml
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
                 version = config.get('app', {}).get('version', '1.0')
@@ -234,6 +242,55 @@ class BuildScript:
 
         return all_exist
 
+    @staticmethod
+    def macos_binary_arches(path: Path):
+        """只检查 Mach-O，忽略随应用分发的设备端 ELF、脚本和普通资源。"""
+        with path.open('rb') as stream:
+            magic = stream.read(4)
+        if magic not in (b'\xfe\xed\xfa\xce', b'\xce\xfa\xed\xfe',
+                         b'\xfe\xed\xfa\xcf', b'\xcf\xfa\xed\xfe',
+                         b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
+                         b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'):
+            return None
+        result = subprocess.run(['/usr/bin/lipo', '-archs', str(path)],
+                                check=True, capture_output=True, text=True)
+        return set(result.stdout.split())
+
+    def check_macos_architecture(self) -> bool:
+        if self.system != 'Darwin':
+            return True
+        required = {'arm64', 'x86_64'} if self.macos_arch == 'universal2' else {self.macos_arch}
+        # 先检查解释器和 Qt，避免耗时打包后才发现当前环境不支持目标架构。
+        import PyQt5.QtCore
+        for path in (Path(sys.executable), Path(PyQt5.QtCore.__file__)):
+            actual = self.macos_binary_arches(path)
+            if actual is None or not required.issubset(actual):
+                self.print_error(f'{path} 的架构为 {actual}，目标需要 {required}')
+                self.print_error('必须使用包含目标架构的 Python 和二进制依赖，不能仅修改安装包名称。')
+                return False
+        self.print_success(f'macOS 目标架构: {self.macos_arch}')
+        return True
+
+    def validate_macos_bundle(self, app: Path) -> bool:
+        """检查整个包，避免只有启动器是双架构，Qt/扩展/ffmpeg 却无法运行。"""
+        required = {'arm64', 'x86_64'} if self.macos_arch == 'universal2' else {self.macos_arch}
+        checked = set()
+        invalid = []
+        for path in app.rglob('*'):
+            if not path.is_file() or path.resolve() in checked:
+                continue
+            checked.add(path.resolve())
+            actual = self.macos_binary_arches(path)
+            if actual is not None and not required.issubset(actual):
+                invalid.append(f'{path.relative_to(app)}: {", ".join(sorted(actual))}')
+        if invalid:
+            self.print_error(f'以下二进制不支持目标架构 {self.macos_arch}:')
+            for message in invalid:
+                self.print_error(message)
+            return False
+        self.print_success('macOS 包内二进制架构校验通过')
+        return True
+
     def build_pyinstaller_command(self) -> List[str]:
         """构建 pyinstaller 命令"""
         # 带版本号的文件名
@@ -247,6 +304,10 @@ class BuildScript:
             "--name", app_name_with_version,
         ]
         if self.system == "Darwin":
+            cmd.extend(["--target-arch", self.macos_arch])
+            cmd.extend(["--distpath", str(self.dist_dir),
+                        "--workpath", str(self.build_dir / 'pyinstaller'),
+                        "--specpath", str(self.build_dir)])
             cmd.extend(["--osx-bundle-identifier", "com.weidian.devicefactorytool"])
             for resource, target in self.external_dirs:
                 cmd.extend(["--add-data", f"{self.project_root / resource}:{target}"])
@@ -362,7 +423,7 @@ class BuildScript:
         if self.system == "Windows":
             return self.dist_dir / f"{app_name_with_version}.exe"
         elif self.system == "Darwin":  # macOS
-            return self.dist_dir / f"{app_name_with_version}_{platform.machine()}.dmg"
+            return self.project_root / 'dist' / f"{app_name_with_version}_{self.macos_arch}.dmg"
         else:  # Linux
             return self.dist_dir / app_name_with_version
 
@@ -398,6 +459,7 @@ class BuildScript:
         print()
 
         if self.system == "Darwin":
+            print(f'  - CPU 架构：{self.macos_arch}')
             print('  - 打开 DMG，将 .app 拖入 Applications 后启动')
             print('  - 配置和日志：~/Library/Application Support/Weidian/DeviceFactoryTool/')
             print('  - 手动添加主控需本机已安装并配置 VSM')
@@ -419,6 +481,8 @@ class BuildScript:
         app = self.dist_dir / f'{self.app_name}_{self.version}.app'
         if not app.is_dir():
             self.print_error('未生成 macOS .app')
+            return False
+        if not self.validate_macos_bundle(app):
             return False
         plist_path = app / 'Contents' / 'Info.plist'
         with plist_path.open('rb') as stream:
@@ -463,7 +527,8 @@ class BuildScript:
 
         app_name_with_version = f"{self.app_name}_{self.version}"
         files_to_clean = [
-            self.project_root / f"{app_name_with_version}.spec",
+            (self.build_dir if self.system == 'Darwin' else self.project_root)
+            / f"{app_name_with_version}.spec",
         ]
 
         for dir_path in dirs_to_clean:
@@ -482,6 +547,15 @@ class BuildScript:
                 except Exception as e:
                     self.print_warning(f"无法删除 {file_path}: {e}")
 
+        # macOS 按架构清理子目录后，只移除已经为空的 build 根目录。
+        build_root = self.project_root / 'build'
+        try:
+            if build_root.is_dir() and not any(build_root.iterdir()):
+                build_root.rmdir()
+                self.print_success('已删除空目录: build/')
+        except OSError as e:
+            self.print_warning(f'无法删除空目录 {build_root}: {e}')
+
     def build(self) -> bool:
         """执行完整的构建流程"""
         self.print_header(f"门锁产测工具打包脚本 ({self.system})")
@@ -492,6 +566,8 @@ class BuildScript:
 
         # 检查依赖
         if not self.check_dependencies():
+            return False
+        if not self.check_macos_architecture():
             return False
 
         # 检查必要文件
@@ -522,12 +598,65 @@ class BuildScript:
         return success
 
 
+def build_macos_architectures(architectures) -> bool:
+    """使用隔离环境分别构建；Apple Silicon 上的 Intel 构建需要 Rosetta 2。"""
+    root = Path(__file__).resolve().parent
+    python = Path(sys.executable).resolve()
+    required = set(architectures)
+    actual = BuildScript.macos_binary_arches(python)
+    if actual is None or not required.issubset(actual):
+        print('构建两个架构需要 python.org 提供的 universal2 Python，当前解释器为：', python,
+              file=sys.stderr)
+        print('请使用该 Python 执行 build.py，或用 --macos-arch 仅构建当前架构。', file=sys.stderr)
+        return False
+    # 先检查两种架构都能启动，避免构建到一半才发现 Rosetta 不可用。
+    for arch in architectures:
+        try:
+            subprocess.run(['/usr/bin/arch', '-' + arch, str(python), '-c',
+                            'import platform; assert platform.machine() == ' + repr(arch)], check=True)
+        except subprocess.CalledProcessError:
+            print(f'无法运行 {arch} Python；M 芯片 Mac 上构建 Intel 包需先安装 Rosetta 2。',
+                  file=sys.stderr)
+            return False
+    requirement_file = root / 'requirements.txt'
+    for arch in architectures:
+        print(f'\n准备 {arch} 独立构建环境...', flush=True)
+        env_dir = root / '.build-envs' / ('macos-' + arch)
+        env_python = env_dir / 'bin' / 'python'
+        if not env_python.exists():
+            subprocess.run(['/usr/bin/arch', '-' + arch, str(python), '-m', 'venv', str(env_dir)],
+                           check=True)
+        prefix = ['/usr/bin/arch', '-' + arch, str(env_python)]
+        # 依赖不变时离线复用环境；不同架构的 wheel 始终安装在各自环境中。
+        fingerprint = hashlib.sha256(requirement_file.read_bytes() +
+                                     json.dumps(list(sys.version_info[:3])).encode()).hexdigest()
+        marker = env_dir / 'requirements.sha256'
+        if not marker.exists() or marker.read_text() != fingerprint:
+            # 一些库已停止发布最新版 Intel wheel；优先选可用 wheel，
+            # 避免仅打包应用却意外依赖 Rust/C 编译工具链。
+            subprocess.run(prefix + ['-m', 'pip', 'install', '--prefer-binary',
+                                     '-r', str(requirement_file)], check=True)
+            marker.write_text(fingerprint)
+        subprocess.run(prefix + [str(root / 'build.py'), '--macos-arch', arch],
+                       cwd=root, check=True)
+    print('\n两个原生 macOS 安装包均已生成：dist/*_arm64.dmg 和 dist/*_x86_64.dmg')
+    return True
+
+
 def main():
     """主函数"""
-    builder = BuildScript()
+    parser = argparse.ArgumentParser(description='智能设备产测工具打包脚本')
+    parser.add_argument('--macos-arch', choices=('both', 'arm64', 'x86_64', 'universal2'),
+                        help='macOS 默认分别构建 Intel 和 M 芯片包；universal2 需自备双架构依赖')
+    args = parser.parse_args()
+    if args.macos_arch and platform.system() != 'Darwin':
+        parser.error('--macos-arch 仅适用于 macOS')
 
     try:
-        success = builder.build()
+        if platform.system() == 'Darwin' and args.macos_arch in (None, 'both'):
+            success = build_macos_architectures(('arm64', 'x86_64'))
+        else:
+            success = BuildScript(macos_arch=args.macos_arch).build()
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
         print("\n\n用户取消打包")
